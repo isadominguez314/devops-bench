@@ -134,7 +134,7 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
 # catalog; the harness registers these per-run (see :func:`_build_model_override`).
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
-_CATALOG_OVERRIDES: frozenset[str] = frozenset({"gemini-3.5-flash"})
+_CATALOG_OVERRIDES: frozenset[str] = frozenset({"gemini-3.5-flash", "gemini-2.5-pro", "gemini-3.1-pro-preview"})
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
 # built-in provider rather than merging, so without ``api`` oc falls back to the

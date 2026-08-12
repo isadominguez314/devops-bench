@@ -168,6 +168,18 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
+    if spec.backend == "vertex":
+        overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+        if "GCP_PROJECT_ID" in os.environ:
+            overlay["GOOGLE_CLOUD_PROJECT"] = os.environ["GCP_PROJECT_ID"]
+        loc = os.environ.get("LOCATION") or os.environ.get("GCP_LOCATION") or "us-central1"
+        # Vertex AI requires a region (us-central1), but the benchmark often sets
+        # these to a zone (us-central1-a) for cluster provisioning. Strip the zone suffix.
+        if loc.count("-") == 2:
+            loc = "-".join(loc.split("-")[:2])
+        overlay["GOOGLE_CLOUD_LOCATION"] = loc
+    elif spec.backend == "gca":
+        overlay["GOOGLE_GENAI_USE_GCA"] = "true"
     if config.model:
         overlay["GEMINI_MODEL"] = config.model
     if config.extra_env:
