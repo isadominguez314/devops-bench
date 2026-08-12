@@ -61,3 +61,15 @@ variable "repo_path" {
   description = "Local bare git repo (GitOps source of truth). Empty (default) derives a per-run-unique path from cluster_name so concurrent runs on the shared bastion don't collide (see locals)."
   default     = ""
 }
+
+variable "host_kubecontext" {
+  type        = string
+  description = "Host Kubernetes context to use"
+  default     = null
+}
+
+variable "host_kubeconfig_path" {
+  type        = string
+  description = "Path to host cluster kubeconfig file"
+  default     = "~/.kube/config"
+}

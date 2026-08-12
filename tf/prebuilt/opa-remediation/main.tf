@@ -55,13 +55,15 @@ module "cluster" {
   machine_type    = var.machine_type
   node_image      = var.node_image
   kubeconfig_path = var.kubeconfig_path
+  host_kubeconfig_path = var.host_kubeconfig_path
+  host_kubecontext    = var.host_kubecontext
 }
 
 # Outside-the-cluster setup: install Kyverno, apply audit policies, deploy the
 # violating workloads, and seed the GitOps repo. Runs during `tofu apply`,
 # before the agent starts.
 resource "null_resource" "setup" {
-  depends_on = [module.cluster]
+  depends_on = [module.cluster, local_sensitive_file.vcluster_kubeconfig]
 
   triggers = {
     cluster = module.cluster.cluster_name
@@ -75,10 +77,16 @@ resource "null_resource" "setup" {
       PROJECT_ID     = var.project_id
       CLUSTER_NAME   = module.cluster.cluster_name
       LOCATION       = var.location
-      KUBECONFIG     = pathexpand(var.kubeconfig_path)
+      KUBECONFIG     = var.infra_provider == "vcluster" ? local_sensitive_file.vcluster_kubeconfig[0].filename : pathexpand(var.kubeconfig_path)
       REPO_PATH      = pathexpand(local.repo_path)
       MANIFESTS_DIR  = "${path.module}/manifests"
     }
   }
 }
 
+
+resource "local_sensitive_file" "vcluster_kubeconfig" {
+  count    = var.infra_provider == "vcluster" ? 1 : 0
+  content  = module.cluster.kubeconfig
+  filename = "${path.module}/.kubeconfig-vcluster"
+}

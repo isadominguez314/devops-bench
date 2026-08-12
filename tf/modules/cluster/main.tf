@@ -44,3 +44,25 @@ module "kind" {
   node_count      = var.node_count
 }
 
+
+provider "kubernetes" {
+  config_path    = pathexpand(var.host_kubeconfig_path)
+  config_context = var.host_kubecontext
+}
+
+provider "helm" {
+  kubernetes {
+    config_path    = pathexpand(var.host_kubeconfig_path)
+    config_context = var.host_kubecontext
+  }
+}
+
+module "vcluster" {
+  source               = "../../prebuilt/vcluster"
+  count                = var.infra_provider == "vcluster" ? 1 : 0
+  cluster_name         = var.cluster_name
+  namespace            = "vcluster-${var.cluster_name}"
+  host_kubecontext     = var.host_kubecontext
+  host_kubeconfig_path = var.host_kubeconfig_path
+  service_type         = can(regex("^gke_", coalesce(var.host_kubecontext, ""))) ? "LoadBalancer" : "NodePort"
+}

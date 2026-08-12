@@ -17,8 +17,8 @@ variable "infra_provider" {
   description = "The target cloud provider (gcp, kind)"
 
   validation {
-    condition     = contains(["gcp", "kind"], var.infra_provider)
-    error_message = "infra_provider must be one of: 'gcp', 'kind'."
+    condition     = contains(["gcp", "kind", "vcluster"], var.infra_provider)
+    error_message = "infra_provider must be one of: 'gcp', 'kind', 'vcluster'."
   }
 }
 
@@ -104,3 +104,15 @@ variable "node_image" {
   default     = "kindest/node:v1.29.2"
 }
 
+
+variable "host_kubecontext" {
+  type        = string
+  description = "Host Kubernetes context to use (vcluster-only)"
+  default     = null
+}
+
+variable "host_kubeconfig_path" {
+  type        = string
+  description = "Path to host cluster kubeconfig file (vcluster-only)"
+  default     = "~/.kube/config"
+}
