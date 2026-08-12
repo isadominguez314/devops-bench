@@ -14,7 +14,7 @@
 
 variable "infra_provider" {
   type        = string
-  description = "The target cloud provider (gcp, kind)"
+  description = "The target cloud provider (gcp, kind, vcluster)"
 
   validation {
     condition     = contains(["gcp", "kind", "vcluster"], var.infra_provider)
@@ -115,4 +115,10 @@ variable "host_kubeconfig_path" {
   type        = string
   description = "Path to host cluster kubeconfig file (vcluster-only)"
   default     = "~/.kube/config"
+}
+
+variable "vcluster_service_type" {
+  type        = string
+  description = "Exposure mechanism for the vcluster (LoadBalancer, NodePort, etc.)"
+  default     = "LoadBalancer"
 }

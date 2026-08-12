@@ -88,5 +88,5 @@ resource "null_resource" "setup" {
 resource "local_sensitive_file" "vcluster_kubeconfig" {
   count    = var.infra_provider == "vcluster" ? 1 : 0
   content  = module.cluster.kubeconfig
-  filename = "${path.module}/.kubeconfig-vcluster"
+  filename = "${path.module}/.kubeconfig-vcluster-${module.cluster.cluster_name}"
 }

@@ -43,13 +43,19 @@ KYVERNO_VERSION="${KYVERNO_VERSION:-v1.12.7}"
 
 
 echo "==> Waiting for vCluster API server to be reachable..."
+api_ready=false
 for attempt in $(seq 1 24); do
   if kubectl get ns default &>/dev/null; then
+    api_ready=true
     break
   fi
   echo "    API server unreachable (attempt ${attempt}), retrying in 5s..."
   sleep 5
 done
+if [ "${api_ready}" != true ]; then
+  echo "ERROR: vCluster API server failed to become reachable" >&2
+  exit 1
+fi
 
 echo "==> Installing Kyverno ${KYVERNO_VERSION}..."
 # Server-side apply: the Kyverno CRDs are large and exceed the client-side

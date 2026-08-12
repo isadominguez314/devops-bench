@@ -64,5 +64,5 @@ module "vcluster" {
   namespace            = "vcluster-${var.cluster_name}"
   host_kubecontext     = var.host_kubecontext
   host_kubeconfig_path = var.host_kubeconfig_path
-  service_type         = can(regex("^gke_", coalesce(var.host_kubecontext, ""))) ? "LoadBalancer" : "NodePort"
+  service_type         = var.vcluster_service_type
 }
