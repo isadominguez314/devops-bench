@@ -33,7 +33,7 @@ variable "location" {
 variable "service_type" {
   type        = string
   description = "Kubernetes Service type for vcluster exposure (NodePort or LoadBalancer)"
-  default     = "NodePort"
+  default     = "LoadBalancer"
   validation {
     condition     = contains(["NodePort", "LoadBalancer"], var.service_type)
     error_message = "service_type must be NodePort or LoadBalancer."

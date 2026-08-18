@@ -58,7 +58,7 @@ provider "helm" {
 }
 
 module "vcluster" {
-  source               = "../../prebuilt/vcluster"
+  source               = "./vcluster"
   count                = var.infra_provider == "vcluster" ? 1 : 0
   cluster_name         = var.cluster_name
   namespace            = "vcluster-${var.cluster_name}"
