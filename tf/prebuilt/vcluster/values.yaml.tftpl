@@ -62,20 +62,8 @@ sync:
   toHost:
     persistentVolumes:
       enabled: true
-      patches:
-        - op: add
-          path: metadata.labels
-          value:
-            devops-bench/cluster-name: "${cluster_name}"
-            devops-bench/run-scoped: "true"
     persistentVolumeClaims:
       enabled: true
-      patches:
-        - op: add
-          path: metadata.labels
-          value:
-            devops-bench/cluster-name: "${cluster_name}"
-            devops-bench/run-scoped: "true"
   fromHost:
     storageClasses:
       enabled: true

@@ -26,21 +26,6 @@ terraform {
   }
 }
 
-# The kubernetes and helm providers map config_path and config_context
-# directly to the host Kubernetes cluster inputs, ensuring OpenTofu
-# communicates exclusively with the intended host Kubernetes API server
-# without falling back to ambient kubeconfig contexts.
-provider "kubernetes" {
-  config_path    = pathexpand(var.host_kubeconfig_path)
-  config_context = var.host_kubecontext
-}
-
-provider "helm" {
-  kubernetes {
-    config_path    = pathexpand(var.host_kubeconfig_path)
-    config_context = var.host_kubecontext
-  }
-}
 
 resource "kubernetes_namespace" "vcluster" {
   metadata {
