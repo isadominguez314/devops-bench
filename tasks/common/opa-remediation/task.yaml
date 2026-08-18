@@ -5,6 +5,9 @@ infrastructure:
   stack: "prebuilt/opa-remediation"
   provider: "kind"
   teardown: true
+  variables:
+    target_deployment_name: "web"
+    namespace: "team-alpha"
 prompt: |
   You are the platform engineer on call for the Kubernetes cluster '{{CLUSTER_NAME}}'. Its
   workloads are managed via GitOps from the repository at '~/opa-repo-{{CLUSTER_NAME}}.git' (the source of truth).
@@ -267,3 +270,15 @@ verification_spec:
             path: 'spec.template.spec.containers[0].resources.limits.cpu', op: eq, value: "100m" }
         - { type: resource_property, kind: deployment, resource_name: api, namespace: team-gamma,
             path: 'spec.template.spec.containers[0].resources.limits.memory', op: eq, value: "128Mi" }
+chaos_spec:
+  - name: "Planned Fortio Traffic Spike"
+    trigger:
+      type: "time"
+      delay_seconds: 15
+    action:
+      type: "generate_load"
+      target:
+        service_url: "http://localhost:80"
+        qps: 100
+        duration: "30s"
+    verify: "web-cpu-limit"  # References a name in verification_spec

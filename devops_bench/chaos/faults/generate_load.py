@@ -32,6 +32,7 @@ import shlex
 import textwrap
 import threading
 import time
+import urllib.parse
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -330,6 +331,11 @@ class GenerateLoadFault(Fault):
             # Parsed inside the guard so a malformed value fails this fault
             # instead of escaping ``inject``.
             local_port = int(env.get(_ENV_LOCAL_PORT) or _LOCAL_PORT)
+            remote_port = _LOCAL_PORT
+            if hasattr(self, "target") and getattr(self.target, "service_url", None):
+                parsed = urllib.parse.urlparse(self.target.service_url)
+                if parsed.port:
+                    remote_port = parsed.port
 
             # Open the fault's own tunnel only when a target deployment is named
             # and the caller did not opt out; otherwise run against the existing
@@ -357,7 +363,7 @@ class GenerateLoadFault(Fault):
                 forward = port_forward(
                     f"deployment/{deployment}",
                     local_port,
-                    remote_port=_LOCAL_PORT,
+                    remote_port=remote_port,
                     namespace=namespace,
                 )
                 local_url: str | None = f"http://localhost:{local_port}"

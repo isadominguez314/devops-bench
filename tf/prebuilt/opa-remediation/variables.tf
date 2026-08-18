@@ -91,3 +91,15 @@ variable "node_port" {
   description = "Static port override for local KinD testing (vcluster-only)"
   default     = null
 }
+
+variable "target_deployment_name" {
+  type        = string
+  description = "Target deployment for chaos/load injection"
+  default     = "web"
+}
+
+variable "namespace" {
+  type        = string
+  description = "Target namespace for chaos/load injection"
+  default     = "team-alpha"
+}
