@@ -13,23 +13,23 @@
 # limitations under the License.
 
 variable "infra_provider" {
-  description = "The cloud provider to use (gcp or kind)"
+  description = "The cloud provider to use (gcp, kind, or vcluster)"
   type        = string
 }
 
 variable "project_id" {
-  description = "The GCP project ID (empty for kind)"
+  description = "The GCP project ID (GCP-only)"
   type        = string
   default     = ""
 }
 
 variable "cluster_name" {
-  description = "The name of the GKE or KinD cluster"
+  description = "The name of the GKE, KinD, or vcluster cluster"
   type        = string
 }
 
 variable "location" {
-  description = "GCP zone/region or 'local'"
+  description = "GCP zone/region (GCP) or 'local' (KinD/vcluster)"
   type        = string
   default     = "local"
 }
@@ -52,7 +52,7 @@ variable "node_image" {
 
 variable "kubeconfig_path" {
   type        = string
-  description = "Path kind writes the kubeconfig to (read by the agent)."
+  description = "Path kind writes the kubeconfig to (KinD-only, read by the agent)."
   default     = "~/.kube/config"
 }
 
@@ -64,12 +64,13 @@ variable "repo_path" {
 
 variable "host_kubecontext" {
   type        = string
-  description = "Host Kubernetes context to use"
+  description = "Host Kubernetes context to use (vcluster-only)"
   default     = null
 }
 
 variable "host_kubeconfig_path" {
   type        = string
-  description = "Path to host cluster kubeconfig file"
+  description = "Path to host cluster kubeconfig file (vcluster-only)"
   default     = "~/.kube/config"
 }
+

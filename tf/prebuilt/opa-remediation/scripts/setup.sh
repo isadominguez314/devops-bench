@@ -42,7 +42,7 @@ MANIFESTS_DIR="$(cd "${MANIFESTS_DIR}" && pwd)"
 KYVERNO_VERSION="${KYVERNO_VERSION:-v1.12.7}"
 
 
-echo "==> Waiting for vCluster API server to be reachable..."
+echo "==> Waiting for Kubernetes API server to be reachable..."
 api_ready=false
 for attempt in $(seq 1 24); do
   if kubectl get ns default &>/dev/null; then
@@ -53,7 +53,7 @@ for attempt in $(seq 1 24); do
   sleep 5
 done
 if [ "${api_ready}" != true ]; then
-  echo "ERROR: vCluster API server failed to become reachable" >&2
+  echo "ERROR: Kubernetes API server failed to become reachable" >&2
   exit 1
 fi
 
