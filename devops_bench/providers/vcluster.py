@@ -149,6 +149,13 @@ def _is_allowlisted_context(context_name: str, kubeconfig_path: str) -> bool:
     )
 
 
+def _default_kubeconfig_path(cluster_name: str) -> str:
+    """Determine default target kubeconfig path for a virtual cluster."""
+    if get_bool("BENCH_PARALLEL", False) and get_env("KUBECONFIG"):
+        return get_env("KUBECONFIG")
+    return str(Path(tempfile.gettempdir()) / f"vcluster-{cluster_name}-kubeconfig.yaml")
+
+
 @PROVIDERS.register("vcluster")
 class VClusterProvider(Provider):
     """Provider for virtual Kubernetes clusters hosted on a standing host cluster."""
@@ -186,14 +193,7 @@ class VClusterProvider(Provider):
             )
         kubeconfig_yaml = kubeconfig_val
 
-        target_path = variables.get("kubeconfig_path")
-        if not target_path:
-            if get_bool("BENCH_PARALLEL", False) and get_env("KUBECONFIG"):
-                target_path = get_env("KUBECONFIG")
-            else:
-                target_path = str(
-                    Path(tempfile.gettempdir()) / f"vcluster-{cluster_name}-kubeconfig.yaml"
-                )
+        target_path = variables.get("kubeconfig_path") or _default_kubeconfig_path(cluster_name)
 
         raw_target = Path(target_path).expanduser()
         if raw_target.is_symlink():
@@ -288,11 +288,11 @@ class VClusterProvider(Provider):
             success: Whether the stack destroy completed successfully.
         """
         vars_dict = variables or {}
-        host_kubeconfig = vars_dict.get("host_kubeconfig_path") or os.environ.get(
+        host_kubeconfig = vars_dict.get("host_kubeconfig_path") or get_env(
             "HOST_KUBECONFIG", "~/.kube/config"
         )
         host_kubeconfig_path = str(Path(host_kubeconfig).expanduser().resolve())
-        host_context = vars_dict.get("host_kubecontext") or os.environ.get("HOST_KUBECONTEXT")
+        host_context = vars_dict.get("host_kubecontext") or get_env("HOST_KUBECONTEXT")
         if not host_context:
             try:
                 host_context = _get_current_context(host_kubeconfig_path)
@@ -377,13 +377,13 @@ class VClusterProvider(Provider):
         namespace = get_env("NAMESPACE") or f"vcluster-{variables['cluster_name']}"
         variables.setdefault("namespace", namespace)
 
-        host_kubeconfig = variables.get("host_kubeconfig_path") or os.environ.get(
+        host_kubeconfig = variables.get("host_kubeconfig_path") or get_env(
             "HOST_KUBECONFIG", "~/.kube/config"
         )
         host_kubeconfig_path = str(Path(host_kubeconfig).expanduser().resolve())
         variables["host_kubeconfig_path"] = host_kubeconfig_path
 
-        host_context = variables.get("host_kubecontext") or os.environ.get("HOST_KUBECONTEXT")
+        host_context = variables.get("host_kubecontext") or get_env("HOST_KUBECONTEXT")
         if not host_context:
             host_context = _get_current_context(host_kubeconfig_path)
         variables["host_kubecontext"] = host_context
@@ -405,13 +405,6 @@ class VClusterProvider(Provider):
             not kubeconfig_path
             or str(Path(kubeconfig_path).expanduser().resolve()) == default_kubeconfig
         ):
-            if get_bool("BENCH_PARALLEL", False) and get_env("KUBECONFIG"):
-                kubeconfig_path = get_env("KUBECONFIG")
-            else:
-                kubeconfig_path = str(
-                    Path(tempfile.gettempdir())
-                    / f"vcluster-{variables['cluster_name']}-kubeconfig.yaml"
-                )
-            variables["kubeconfig_path"] = kubeconfig_path
+            variables["kubeconfig_path"] = _default_kubeconfig_path(variables["cluster_name"])
 
         return variables
