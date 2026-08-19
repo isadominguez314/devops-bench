@@ -362,3 +362,21 @@ def test_get_deployer_tofu_gcp_stack(mocker, base_config):
     assert deployer.variables["cluster_name"] == base_config["cluster_name"]
     assert deployer.variables["location"] == base_config["location"]
     assert deployer.tf_dir == str(_TF_ROOT / "prebuilt/gcp")
+
+
+def test_get_deployer_bench_tf_root_override(tmp_path, mocker, base_config, monkeypatch):
+    custom_tf_root = tmp_path / "custom_tf"
+    stack_dir = custom_tf_root / "prebuilt" / "kind"
+    stack_dir.mkdir(parents=True)
+    monkeypatch.setenv("BENCH_TF_ROOT", str(custom_tf_root))
+    mocker.patch("devops_bench.deployers.tofu.Path.exists", return_value=True)
+
+    deployer = get_deployer(
+        {"deployer": "tofu", "stack": "prebuilt/kind"},
+        base_config["project_id"],
+        base_config["cluster_name"],
+        base_config["location"],
+    )
+    assert isinstance(deployer, TFDeployer)
+    assert deployer.variables["infra_provider"] == "kind"
+    assert deployer.tf_dir == str((custom_tf_root / "prebuilt/kind").resolve())

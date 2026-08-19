@@ -22,16 +22,13 @@ from typing import Any
 from devops_bench.core import ConfigError, get_bool, get_env
 from devops_bench.deployers.base import Deployer
 from devops_bench.deployers.noop import NoOpDeployer
-from devops_bench.deployers.tofu import TFDeployer
+from devops_bench.deployers.tofu import TFDeployer, _resolve_tf_root
 from devops_bench.providers import PROVIDERS, ResolveContext
 
 __all__ = ["get_deployer"]
 
 _DEFAULT_LOCATION = "us-central1-a"
 _DEFAULT_STACK = "prebuilt/kind"
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_TF_ROOT = _REPO_ROOT / "tf"
 
 
 def _select_provider(infra_config: dict[str, Any], stack: str) -> str:
@@ -63,8 +60,9 @@ def _select_provider(infra_config: dict[str, Any], stack: str) -> str:
         return explicit
     stack_path = Path(stack).expanduser()
     if not stack_path.is_absolute():
-        resolved = (_TF_ROOT / stack_path).resolve()
-        is_in_repo = _TF_ROOT.resolve() in resolved.parents or resolved == _TF_ROOT.resolve()
+        tf_root = _resolve_tf_root()
+        resolved = (tf_root / stack_path).resolve()
+        is_in_repo = tf_root in resolved.parents or resolved == tf_root
         if is_in_repo and resolved.name in PROVIDERS:
             return resolved.name
     raise ConfigError(
