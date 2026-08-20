@@ -45,17 +45,6 @@ module "kind" {
 }
 
 
-provider "kubernetes" {
-  config_path    = pathexpand(var.host_kubeconfig_path)
-  config_context = var.host_kubecontext
-}
-
-provider "helm" {
-  kubernetes {
-    config_path    = pathexpand(var.host_kubeconfig_path)
-    config_context = var.host_kubecontext
-  }
-}
 
 module "vcluster" {
   source               = "./vcluster"

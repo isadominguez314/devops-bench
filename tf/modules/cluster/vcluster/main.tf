@@ -70,12 +70,12 @@ resource "kubernetes_resource_quota" "vcluster_quota" {
 
   spec {
     hard = {
-      "limits.cpu"             = "7"
-      "limits.memory"          = "28Gi"
-      "requests.cpu"           = "7"
-      "requests.memory"        = "28Gi"
-      "requests.storage"       = "50Gi"
-      "persistentvolumeclaims" = "10"
+      "limits.cpu"             = var.quota_cpu
+      "limits.memory"          = var.quota_memory
+      "requests.cpu"           = var.quota_cpu
+      "requests.memory"        = var.quota_memory
+      "requests.storage"       = var.quota_storage
+      "persistentvolumeclaims" = var.quota_pvc
     }
   }
 }
@@ -96,16 +96,16 @@ resource "kubernetes_limit_range" "vcluster_limits" {
       # plane, CoreDNS, and a task's limit-less workloads brush the 7-CPU
       # quota ceiling; 500m keeps the same seed at roughly half of it.
       default = {
-        cpu    = "500m"
-        memory = "1Gi"
+        cpu    = var.limit_default_cpu
+        memory = var.limit_default_memory
       }
       default_request = {
-        cpu    = "200m"
-        memory = "512Mi"
+        cpu    = var.limit_request_cpu
+        memory = var.limit_request_memory
       }
       max = {
-        cpu    = "6"
-        memory = "24Gi"
+        cpu    = var.limit_max_cpu
+        memory = var.limit_max_memory
       }
     }
   }

@@ -22,6 +22,14 @@ terraform {
       source  = "tehcyx/kind"
       version = ">= 0.5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = ">= 2.25.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = ">= 2.12.0"
+    }
     null = {
       source  = "hashicorp/null"
       version = ">= 3.0.0"
@@ -35,6 +43,18 @@ provider "google" {
 }
 
 provider "kind" {}
+
+provider "kubernetes" {
+  config_path    = pathexpand(var.host_kubeconfig_path)
+  config_context = var.host_kubecontext
+}
+
+provider "helm" {
+  kubernetes {
+    config_path    = pathexpand(var.host_kubeconfig_path)
+    config_context = var.host_kubecontext
+  }
+}
 
 locals {
   # GitOps repo path on the shared bastion host. setup.sh rm -rf's + reseeds it,
@@ -91,5 +111,5 @@ resource "null_resource" "setup" {
 resource "local_sensitive_file" "vcluster_kubeconfig" {
   count    = var.infra_provider == "vcluster" ? 1 : 0
   content  = module.cluster.kubeconfig
-  filename = "${path.module}/.kubeconfig-vcluster-${module.cluster.cluster_name}"
+  filename = "/tmp/devops-bench-vcluster-${module.cluster.cluster_name}.kubeconfig"
 }

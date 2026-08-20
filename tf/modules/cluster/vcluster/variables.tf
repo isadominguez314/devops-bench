@@ -47,27 +47,6 @@ variable "host_kubecontext" {
   nullable    = true
 }
 
-variable "infra_provider" {
-  type        = string
-  description = "Infrastructure provider name"
-  default     = null
-  nullable    = true
-}
-
-variable "project_id" {
-  type        = string
-  description = "GCP Project ID if applicable"
-  default     = null
-  nullable    = true
-}
-
-variable "kubeconfig_path" {
-  type        = string
-  description = "Path where Python writes virtual kubeconfig"
-  default     = null
-  nullable    = true
-}
-
 variable "host_kubeconfig_path" {
   type        = string
   description = "Path to host cluster kubeconfig file"
@@ -79,6 +58,66 @@ variable "node_port" {
   description = "Static port override for local KinD testing via TF_VAR_node_port"
   default     = null
   nullable    = true
+}
+
+variable "quota_cpu" {
+  type        = string
+  description = "Host namespace ResourceQuota CPU limits and requests"
+  default     = "7"
+}
+
+variable "quota_memory" {
+  type        = string
+  description = "Host namespace ResourceQuota memory limits and requests"
+  default     = "28Gi"
+}
+
+variable "quota_storage" {
+  type        = string
+  description = "Host namespace ResourceQuota storage requests"
+  default     = "50Gi"
+}
+
+variable "quota_pvc" {
+  type        = string
+  description = "Host namespace ResourceQuota persistent volume claims limit"
+  default     = "10"
+}
+
+variable "limit_default_cpu" {
+  type        = string
+  description = "Host namespace LimitRange default container CPU limit"
+  default     = "500m"
+}
+
+variable "limit_default_memory" {
+  type        = string
+  description = "Host namespace LimitRange default container memory limit"
+  default     = "1Gi"
+}
+
+variable "limit_request_cpu" {
+  type        = string
+  description = "Host namespace LimitRange default container CPU request"
+  default     = "200m"
+}
+
+variable "limit_request_memory" {
+  type        = string
+  description = "Host namespace LimitRange default container memory request"
+  default     = "512Mi"
+}
+
+variable "limit_max_cpu" {
+  type        = string
+  description = "Host namespace LimitRange max container CPU limit"
+  default     = "6"
+}
+
+variable "limit_max_memory" {
+  type        = string
+  description = "Host namespace LimitRange max container memory limit"
+  default     = "24Gi"
 }
 
 variable "chart_repository" {
@@ -96,7 +135,7 @@ variable "chart_name_or_path" {
 variable "chart_version" {
   type        = string
   description = "Helm chart version for vcluster"
-  default     = "0.20.0"
+  default     = "0.36.1"
 }
 
 variable "service_cidr" {
