@@ -217,6 +217,22 @@ def test_vcluster_ensure_cluster_credentials_refuses_default_kubeconfig(
         )
 
 
+def test_vcluster_ensure_cluster_credentials_fchmod_failure(
+    mocker: MockerFixture,
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "vc-config-chmod-fail.yaml"
+    variables = {"kubeconfig_path": str(target_path)}
+    outputs = {"kubeconfig": "apiVersion: v1\nclusters: []\n"}
+
+    mocker.patch("os.fchmod", side_effect=OSError("Operation not permitted"))
+
+    with pytest.raises(ConfigError, match="Failed to set permissions on kubeconfig"):
+        VClusterProvider().ensure_cluster_credentials(
+            "test-cluster", "local", variables, outputs=outputs
+        )
+
+
 def test_vcluster_cleanup_deletes_orphaned_pvs(mocker: MockerFixture, tmp_path: Path) -> None:
     pv_json = json.dumps(
         {
