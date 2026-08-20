@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import tempfile
 from io import StringIO
@@ -81,24 +82,6 @@ def _is_local_server_url(server: str) -> bool:
     return False
 
 
-def _is_explicit_public_ip(server: str) -> bool:
-    """Check whether a Kubernetes server URL hostname is an explicit public IP address."""
-    if not server:
-        return False
-    try:
-        split_res = urlsplit(server)
-        hostname = split_res.hostname
-    except Exception:
-        return False
-    if not hostname:
-        return False
-    try:
-        ip = ipaddress.ip_address(hostname)
-        return not (ip.is_private or ip.is_loopback)
-    except ValueError:
-        return False
-
-
 def _get_current_context(kubeconfig_path: str) -> str:
     """Read the active current-context from a kubeconfig file."""
     path_obj = Path(kubeconfig_path).expanduser().resolve()
@@ -151,8 +134,6 @@ def _is_allowlisted_context(context_name: str, kubeconfig_path: str) -> bool:
 
 def _default_kubeconfig_path(cluster_name: str) -> str:
     """Determine default target kubeconfig path for a virtual cluster."""
-    if get_bool("BENCH_PARALLEL", False) and get_env("KUBECONFIG"):
-        return get_env("KUBECONFIG")
     return str(Path(tempfile.gettempdir()) / f"vcluster-{cluster_name}-kubeconfig.yaml")
 
 
@@ -304,29 +285,34 @@ class VClusterProvider(Provider):
         elif not cluster_info.name or not cluster_info.name.strip():
             _log.warning("Skipping VCluster PV cleanup: cluster_info.name is empty.")
         else:
-            label_selector = (
-                f"devops-bench/run-scoped=true,devops-bench/cluster-name={cluster_info.name}"
-            )
+            target_namespace = vars_dict.get("namespace") or f"vcluster-{cluster_info.name}"
             cmd = ["kubectl", f"--kubeconfig={host_kubeconfig_path}"]
             if host_context:
                 cmd.append(f"--context={host_context}")
-            get_cmd = cmd + [
-                "get",
-                "pv",
-                "-l",
-                label_selector,
-                "-o",
-                "jsonpath={.items[*].metadata.name}",
-            ]
+            get_cmd = cmd + ["get", "pv", "-o", "json"]
 
             res = run(get_cmd, capture=True, check=False)
             if res.returncode == 0 and res.stdout.strip():
-                pv_names = res.stdout.strip().split()
+                try:
+                    pv_data = json.loads(res.stdout)
+                    pv_names = [
+                        item["metadata"]["name"]
+                        for item in pv_data.get("items", [])
+                        if isinstance(item, dict)
+                        and item.get("spec", {}).get("claimRef", {}).get("namespace")
+                        == target_namespace
+                        and item.get("metadata", {}).get("name")
+                    ]
+                except Exception as exc:
+                    _log.warning("Failed to parse PV json output during cleanup: %s", exc)
+                    pv_names = []
+
                 if pv_names:
                     _log.info(
-                        "Deleting %d orphaned PersistentVolume(s) for cluster %s",
+                        "Deleting %d orphaned PersistentVolume(s) for cluster %s in namespace %s",
                         len(pv_names),
                         cluster_info.name,
+                        target_namespace,
                     )
                     del_cmd = cmd + ["delete", "pv", *pv_names]
                     run(del_cmd, capture=False, check=False)
