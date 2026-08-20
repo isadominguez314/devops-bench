@@ -46,17 +46,18 @@ locals {
 
 # GKE/KinD cluster. Kyverno + the workloads are installed by setup.sh.
 module "cluster" {
-  source               = "../../modules/cluster"
-  infra_provider       = var.infra_provider
-  project_id           = var.project_id
-  cluster_name         = var.cluster_name
-  location             = var.location
-  node_count           = var.node_count
-  machine_type         = var.machine_type
-  node_image           = var.node_image
-  kubeconfig_path      = var.kubeconfig_path
-  host_kubeconfig_path = var.host_kubeconfig_path
+  source                = "../../modules/cluster"
+  infra_provider        = var.infra_provider
+  project_id            = var.project_id
+  cluster_name          = var.cluster_name
+  location              = var.location
+  node_count            = var.node_count
+  machine_type          = var.machine_type
+  node_image            = var.node_image
+  kubeconfig_path       = var.kubeconfig_path
+  host_kubeconfig_path  = var.host_kubeconfig_path
   host_kubecontext      = var.host_kubecontext
+  vcluster_service_type = var.vcluster_service_type
   vcluster_service_cidr = var.vcluster_service_cidr
 }
 
