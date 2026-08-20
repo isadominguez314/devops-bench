@@ -33,14 +33,19 @@ controlPlane:
 exportKubeConfig:
   server: "https://${endpoint}"
 
+# No compute quota inside the virtual cluster. A quota tracking limits.* or
+# requests.* makes the virtual API server reject any pod that omits those
+# fields — which breaks (a) Kyverno's upstream manifests (no CPU limits on its
+# controllers) and (b) any task that deliberately seeds limit-less or
+# request-less workloads as live violations (opa-remediation's web/worker have
+# no resources block at all). Capacity is enforced where it actually matters,
+# on the host namespace: its LimitRange injects default requests/limits into
+# every synced pod and its ResourceQuota counts them (see
+# this module's main.tf). A task that wants an in-cluster quota as part of
+# its scenario seeds one itself (e.g. the resource_quota_exhaustion fault).
 policies:
   resourceQuota:
-    enabled: true
-    quota:
-      limits.cpu: "6"
-      limits.memory: "24Gi"
-      requests.cpu: "6"
-      requests.memory: "24Gi"
+    enabled: false
 
 rbac:
   role:

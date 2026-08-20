@@ -89,9 +89,15 @@ resource "kubernetes_limit_range" "vcluster_limits" {
   spec {
     limit {
       type = "Container"
+      # Defaults sized so a full task seed fits the namespace quota above.
+      # With the virtual cluster's own quota disabled (see values.yaml.tftpl),
+      # every limit-less container synced from the vcluster gets these — at
+      # 1 CPU each, Kyverno's four controllers plus the vcluster control
+      # plane, CoreDNS, and a task's limit-less workloads brush the 7-CPU
+      # quota ceiling; 500m keeps the same seed at roughly half of it.
       default = {
-        cpu    = "1"
-        memory = "2Gi"
+        cpu    = "500m"
+        memory = "1Gi"
       }
       default_request = {
         cpu    = "200m"
