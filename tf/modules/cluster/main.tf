@@ -65,6 +65,7 @@ module "vcluster" {
   location             = var.location != "" ? var.location : "local"
   host_kubecontext     = var.host_kubecontext
   host_kubeconfig_path = var.host_kubeconfig_path
-  service_type         = var.vcluster_service_type
+  service_type         = var.service_type
   service_cidr         = var.vcluster_service_cidr != "" ? var.vcluster_service_cidr : null
+  node_port            = var.node_port
 }

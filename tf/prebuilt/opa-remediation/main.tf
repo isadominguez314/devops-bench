@@ -57,8 +57,9 @@ module "cluster" {
   kubeconfig_path       = var.kubeconfig_path
   host_kubeconfig_path  = var.host_kubeconfig_path
   host_kubecontext      = var.host_kubecontext
-  vcluster_service_type = var.vcluster_service_type
+  service_type          = var.service_type
   vcluster_service_cidr = var.vcluster_service_cidr
+  node_port             = var.node_port
 }
 
 # Outside-the-cluster setup: install Kyverno, apply audit policies, deploy the

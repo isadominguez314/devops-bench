@@ -117,7 +117,7 @@ variable "host_kubeconfig_path" {
   default     = "~/.kube/config"
 }
 
-variable "vcluster_service_type" {
+variable "service_type" {
   type        = string
   description = "Exposure mechanism for the vcluster (LoadBalancer, NodePort, etc.)"
   default     = "LoadBalancer"
@@ -127,4 +127,10 @@ variable "vcluster_service_cidr" {
   type        = string
   description = "Host cluster's Service CIDR, forwarded to the vcluster chart. Empty keeps the chart default (10.96.0.0/12), which only matches hosts using the Kubernetes default range (e.g. kind); GKE hosts allocate from a different range and require this, or synced Services fail IP allocation and the syncer never syncs pods (blocked 'waiting for DNS service IP')."
   default     = ""
+}
+
+variable "node_port" {
+  type        = number
+  description = "Static port override for local KinD testing (vcluster-only)"
+  default     = null
 }

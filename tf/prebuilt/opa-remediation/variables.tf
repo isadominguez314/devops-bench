@@ -74,7 +74,7 @@ variable "host_kubeconfig_path" {
   default     = "~/.kube/config"
 }
 
-variable "vcluster_service_type" {
+variable "service_type" {
   type        = string
   description = "Exposure mechanism for the vcluster (see modules/cluster). The harness's vcluster provider resolves this per host: NodePort for local hosts, LoadBalancer for remote ones. Must be declared here so that resolved value survives; undeclared variables are dropped before reaching tofu."
   default     = "LoadBalancer"
@@ -84,4 +84,10 @@ variable "vcluster_service_cidr" {
   type        = string
   description = "Host cluster's Service CIDR for vcluster runs (see modules/cluster). The harness's vcluster provider auto-detects and injects this; empty keeps the chart default, which only suits kind-style hosts."
   default     = ""
+}
+
+variable "node_port" {
+  type        = number
+  description = "Static port override for local KinD testing (vcluster-only)"
+  default     = null
 }
