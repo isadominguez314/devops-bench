@@ -82,7 +82,7 @@ variable "service_type" {
 
 variable "vcluster_service_cidr" {
   type        = string
-  description = "Host cluster's Service CIDR for vcluster runs (see modules/cluster). The harness's vcluster provider auto-detects and injects this; empty keeps the chart default, which only suits kind-style hosts."
+  description = "Host cluster's Service CIDR for vcluster runs (see modules/cluster). Must be set explicitly on hosts that don't use the Kubernetes default range (e.g. GKE); empty keeps the chart default, which only suits kind-style hosts."
   default     = ""
 }
 
