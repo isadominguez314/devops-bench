@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 from pathlib import Path
@@ -143,7 +144,9 @@ def test_vcluster_resolve_variables_parallel_kubeconfig(
     monkeypatch.setenv("KUBECONFIG", run_kubeconfig)
 
     variables = VClusterProvider().resolve_variables(ctx, {})
-    assert variables["kubeconfig_path"] == run_kubeconfig
+    assert variables["kubeconfig_path"] == str(
+        Path(tempfile.gettempdir()) / "vcluster-test-cluster-kubeconfig.yaml"
+    )
 
 
 def test_vcluster_ensure_cluster_credentials(tmp_path: Path) -> None:
@@ -215,9 +218,27 @@ def test_vcluster_ensure_cluster_credentials_refuses_default_kubeconfig(
 
 
 def test_vcluster_cleanup_deletes_orphaned_pvs(mocker: MockerFixture, tmp_path: Path) -> None:
+    pv_json = json.dumps(
+        {
+            "items": [
+                {
+                    "metadata": {"name": "pv-1"},
+                    "spec": {"claimRef": {"namespace": "vcluster-test-cluster"}},
+                },
+                {
+                    "metadata": {"name": "pv-2"},
+                    "spec": {"claimRef": {"namespace": "vcluster-test-cluster"}},
+                },
+                {
+                    "metadata": {"name": "pv-other"},
+                    "spec": {"claimRef": {"namespace": "vcluster-other-cluster"}},
+                },
+            ]
+        }
+    )
     mock_run = mocker.patch("devops_bench.providers.vcluster.run")
     mock_run.side_effect = [
-        mocker.MagicMock(returncode=0, stdout="pv-1 pv-2\n"),
+        mocker.MagicMock(returncode=0, stdout=pv_json),
         mocker.MagicMock(returncode=0, stdout=""),
     ]
 
@@ -238,13 +259,18 @@ def test_vcluster_cleanup_deletes_orphaned_pvs(mocker: MockerFixture, tmp_path: 
     assert get_cmd[0] == "kubectl"
     assert "--kubeconfig=/fake/host-config" in get_cmd
     assert "--context=kind-host" in get_cmd
-    assert "devops-bench/run-scoped=true,devops-bench/cluster-name=test-cluster" in get_cmd
+    assert "get" in get_cmd
+    assert "pv" in get_cmd
+    assert "-o" in get_cmd
+    assert "json" in get_cmd
 
     del_cmd = mock_run.call_args_list[1].args[0]
     assert del_cmd[0] == "kubectl"
     assert "delete" in del_cmd
+    assert "pv" in del_cmd
     assert "pv-1" in del_cmd
     assert "pv-2" in del_cmd
+    assert "pv-other" not in del_cmd
 
 
 def test_vcluster_cleanup_deletes_scratch_kubeconfig(
