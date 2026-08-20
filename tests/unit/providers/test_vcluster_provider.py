@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 
@@ -201,7 +202,10 @@ def test_vcluster_ensure_cluster_credentials_missing_outputs_raises() -> None:
 def test_vcluster_ensure_cluster_credentials_refuses_default_kubeconfig(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ConfigError, match="Refusing to overwrite ~/.kube/config"):
+    with pytest.raises(
+        ConfigError,
+        match=re.escape("Refusing to overwrite ~/.kube/config"),
+    ):
         VClusterProvider().ensure_cluster_credentials(
             "c",
             "local",
