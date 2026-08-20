@@ -209,13 +209,18 @@ class VClusterProvider(Provider):
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
         try:
             fd = os.open(resolved_target, flags, 0o600)
-            os.fchmod(fd, 0o600)
         except OSError as exc:
             raise ConfigError(
                 f"Refusing to write kubeconfig to symlink or invalid path: {target_path} ({exc})"
             ) from exc
 
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            try:
+                os.fchmod(f.fileno(), 0o600)
+            except OSError as exc:
+                raise ConfigError(
+                    f"Failed to set permissions on kubeconfig {target_path}: {exc}"
+                ) from exc
             f.write(kubeconfig_yaml)
         _log.info("Wrote virtual cluster kubeconfig to %s (mode 0600)", resolved_target)
 
