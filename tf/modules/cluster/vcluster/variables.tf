@@ -101,7 +101,7 @@ variable "chart_version" {
 
 variable "service_cidr" {
   type        = string
-  description = "Optional custom service CIDR range for the virtual cluster. If omitted, the vcluster chart will automatically discover it from the host cluster."
+  description = "The host cluster's Service CIDR. NOT auto-discovered by this chart/distro combination (verified empirically 2026-08-19): when omitted, the virtual apiserver boots with the Kubernetes default 10.96.0.0/12, and on hosts using a different range (GKE: e.g. 34.118.224.0/20) synced Services fail IP allocation and the syncer blocks on 'waiting for DNS service IP', so no pod ever syncs. Required on GKE hosts; safe to omit only when the host itself uses the default range (kind)."
   default     = null
   nullable    = true
 }

@@ -65,4 +65,5 @@ module "vcluster" {
   host_kubecontext     = var.host_kubecontext
   host_kubeconfig_path = var.host_kubeconfig_path
   service_type         = var.vcluster_service_type
+  service_cidr         = var.vcluster_service_cidr != "" ? var.vcluster_service_cidr : null
 }

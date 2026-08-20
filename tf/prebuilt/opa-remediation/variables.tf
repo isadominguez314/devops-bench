@@ -74,3 +74,8 @@ variable "host_kubeconfig_path" {
   default     = "~/.kube/config"
 }
 
+variable "vcluster_service_cidr" {
+  type        = string
+  description = "Host cluster's Service CIDR for vcluster runs (see modules/cluster). The harness's vcluster provider auto-detects and injects this; empty keeps the chart default, which only suits kind-style hosts."
+  default     = ""
+}
