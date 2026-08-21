@@ -134,6 +134,15 @@ def _is_allowlisted_context(context_name: str, kubeconfig_path: str) -> bool:
 
 def _default_kubeconfig_path(cluster_name: str) -> str:
     """Determine default target kubeconfig path for a virtual cluster."""
+    env_kube = get_env("KUBECONFIG")
+    if env_kube:
+        try:
+            resolved_env = str(Path(env_kube).expanduser().resolve())
+            default_kube = str(Path("~/.kube/config").expanduser().resolve())
+            if resolved_env != default_kube:
+                return resolved_env
+        except Exception:
+            pass
     return str(Path(tempfile.gettempdir()) / f"vcluster-{cluster_name}-kubeconfig.yaml")
 
 
@@ -223,6 +232,7 @@ class VClusterProvider(Provider):
                 ) from exc
             f.write(kubeconfig_yaml)
         _log.info("Wrote virtual cluster kubeconfig to %s (mode 0600)", resolved_target)
+        os.environ["KUBECONFIG"] = str(resolved_target)
 
         return ClusterInfo.from_dict(
             {
