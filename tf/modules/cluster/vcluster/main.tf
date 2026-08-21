@@ -170,13 +170,19 @@ resource "null_resource" "wait_for_vcluster_secret" {
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
+      ctx_flag=""
+      if [ -n "${var.host_kubecontext}" ]; then
+        ctx_flag="--context=${var.host_kubecontext}"
+      fi
       for i in $(seq 1 30); do
-        secret_json=$(kubectl --kubeconfig="${pathexpand(var.host_kubeconfig_path)}" --context="${var.host_kubecontext}" get secret "vc-${var.cluster_name}" -n "${kubernetes_namespace.vcluster.metadata[0].name}" -o json 2>/dev/null || true)
+        secret_json=$(kubectl --kubeconfig="${pathexpand(var.host_kubeconfig_path)}" $ctx_flag get secret "vc-${var.cluster_name}" -n "${kubernetes_namespace.vcluster.metadata[0].name}" -o json 2>/dev/null || true)
         if echo "$secret_json" | grep -q '"config"'; then
           exit 0
         fi
         sleep 2
       done
+      echo "Timed out waiting for vcluster secret vc-${var.cluster_name} to be populated" >&2
+      exit 1
     EOT
   }
 }
