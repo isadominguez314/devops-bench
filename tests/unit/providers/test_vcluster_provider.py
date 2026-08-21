@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -144,6 +145,18 @@ def test_vcluster_resolve_variables_parallel_kubeconfig(
     monkeypatch.setenv("KUBECONFIG", run_kubeconfig)
 
     variables = VClusterProvider().resolve_variables(ctx, {})
+    assert variables["kubeconfig_path"] == str(Path(run_kubeconfig).resolve())
+
+
+def test_vcluster_resolve_variables_default_kubeconfig_falls_back_to_temp(
+    ctx: ResolveContext,
+    fake_kubeconfig: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOST_KUBECONFIG", fake_kubeconfig)
+    monkeypatch.setenv("KUBECONFIG", "~/.kube/config")
+
+    variables = VClusterProvider().resolve_variables(ctx, {})
     assert variables["kubeconfig_path"] == str(
         Path(tempfile.gettempdir()) / "vcluster-test-cluster-kubeconfig.yaml"
     )
@@ -169,6 +182,7 @@ def test_vcluster_ensure_cluster_credentials(tmp_path: Path) -> None:
     assert info.location == "local"
     assert info.project == "local-vcluster"
     assert info.kubeconfig_path == str(target_path.resolve())
+    assert os.environ.get("KUBECONFIG") == str(target_path.resolve())
 
     assert target_path.exists()
     assert "https://127.0.0.1:8443" in target_path.read_text(encoding="utf-8")
