@@ -238,7 +238,7 @@ class VClusterProvider(Provider):
             {
                 "name": cluster_name,
                 "location": location,
-                "project": "local-vcluster",
+                "project": variables.get("project_id") or "local-vcluster",
                 "kubeconfig_path": str(resolved_target),
             }
         )
@@ -260,7 +260,7 @@ class VClusterProvider(Provider):
         tf_data = get_env("TF_DATA_DIR")
 
         return (
-            resolved.parent == tmp_dir
+            (resolved.parent == tmp_dir and resolved.name.startswith(("vcluster-", "kubeconfig")))
             or (tmp_dir / "devops-bench-runs") in resolved.parents
             or (bool(bench_root) and Path(bench_root).resolve() in resolved.parents)
             or (

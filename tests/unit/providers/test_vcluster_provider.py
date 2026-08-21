@@ -419,9 +419,13 @@ def test_is_safe_scratch_path_branches(tmp_path: Path, monkeypatch: pytest.Monke
     # 3. Directories are never safe
     assert not VClusterProvider._is_safe_scratch_path(tmp_path)
 
-    # 4. Standard temp dir file is safe
+    # 4. Standard temp dir file with matching prefix is safe
     temp_file = Path(tempfile.gettempdir()) / "vcluster-test-file.yaml"
     assert VClusterProvider._is_safe_scratch_path(temp_file)
+
+    # 4b. Standard temp dir file WITHOUT matching prefix is not safe
+    non_prefixed_temp = Path(tempfile.gettempdir()) / "custom-user-file.yaml"
+    assert not VClusterProvider._is_safe_scratch_path(non_prefixed_temp)
 
     # 5. BENCH_RUN_STATE_ROOT child is safe
     state_root = tmp_path / "runs"
@@ -440,3 +444,17 @@ def test_is_safe_scratch_path_branches(tmp_path: Path, monkeypatch: pytest.Monke
     # 7. Unrelated external file is not safe
     custom_ext_file = tmp_path / "custom" / "my_config.yaml"
     assert not VClusterProvider._is_safe_scratch_path(custom_ext_file)
+
+
+def test_vcluster_ensure_cluster_credentials_custom_project_id(tmp_path: Path) -> None:
+    target_path = tmp_path / "vc-config.yaml"
+    variables = {
+        "kubeconfig_path": str(target_path),
+        "project_id": "my-gcp-project",
+    }
+    outputs = {"kubeconfig": "apiVersion: v1\nclusters: []\n"}
+
+    info = VClusterProvider().ensure_cluster_credentials(
+        "test-cluster", "us-central1-a", variables, outputs=outputs
+    )
+    assert info.project == "my-gcp-project"
