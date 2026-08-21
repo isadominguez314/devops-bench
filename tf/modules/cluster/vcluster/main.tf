@@ -23,6 +23,10 @@ terraform {
       source  = "hashicorp/helm"
       version = "~> 2.12"
     }
+    null = {
+      source  = "hashicorp/null"
+      version = ">= 3.0"
+    }
   }
 }
 
@@ -156,11 +160,32 @@ resource "helm_release" "vcluster" {
   ]
 }
 
+resource "null_resource" "wait_for_vcluster_secret" {
+  depends_on = [helm_release.vcluster]
+
+  triggers = {
+    release = helm_release.vcluster.id
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      for i in $(seq 1 30); do
+        secret_json=$(kubectl --kubeconfig="${pathexpand(var.host_kubeconfig_path)}" --context="${var.host_kubecontext}" get secret "vc-${var.cluster_name}" -n "${kubernetes_namespace.vcluster.metadata[0].name}" -o json 2>/dev/null || true)
+        if echo "$secret_json" | grep -q '"config"'; then
+          exit 0
+        fi
+        sleep 2
+      done
+    EOT
+  }
+}
+
 data "kubernetes_secret" "vcluster_kubeconfig" {
   metadata {
     name      = "vc-${var.cluster_name}"
     namespace = kubernetes_namespace.vcluster.metadata[0].name
   }
 
-  depends_on = [helm_release.vcluster]
+  depends_on = [null_resource.wait_for_vcluster_secret]
 }

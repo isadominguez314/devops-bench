@@ -24,7 +24,7 @@ output "cluster_location" {
 
 output "kubeconfig" {
   description = "Raw virtual cluster kubeconfig YAML string"
-  value       = data.kubernetes_secret.vcluster_kubeconfig.data["config"]
+  value       = try(data.kubernetes_secret.vcluster_kubeconfig.data["config"], try(base64decode(data.kubernetes_secret.vcluster_kubeconfig.binary_data["config"]), ""))
   sensitive   = true
 }
 
