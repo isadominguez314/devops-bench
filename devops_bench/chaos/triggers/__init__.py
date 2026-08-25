@@ -22,6 +22,6 @@ module loads only the trigger *class* (and ``core`` / ``pydantic``).
 from __future__ import annotations
 
 # Imported for the ``@TRIGGERS.register`` side effect that populates the registry.
-from devops_bench.chaos.triggers import time_delay  # noqa: F401
+from devops_bench.chaos.triggers import agent_action, time_delay  # noqa: F401
 
 __all__: list[str] = []

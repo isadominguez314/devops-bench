@@ -91,13 +91,13 @@ def test_dummy_trigger_resolves_via_registry_with_no_central_edit(
     class _DummyTrigger(Trigger):
         type: Literal["dummy"] = "dummy"
 
-        def wait(self, ctx: RunContext) -> None:
-            return None
+        def wait(self, ctx: RunContext, stop: threading.Event | None = None) -> bool:
+            return True
 
     assert "dummy" in TRIGGERS
     cls = TRIGGERS.get("dummy")
     assert cls is _DummyTrigger
-    _DummyTrigger().wait(RunContext(task_id="t"))  # smoke: no crash
+    assert _DummyTrigger().wait(RunContext(task_id="t")) is True  # smoke: no crash
 
 
 def test_dummy_fault_parses_through_chaos_spec_with_no_spec_edit(
@@ -139,8 +139,12 @@ def test_dummy_trigger_parses_through_chaos_spec_with_no_spec_edit(
         type: Literal["dummy"] = "dummy"
         label: str = ""
 
-        def wait(self, ctx: RunContext) -> None:  # pragma: no cover - parser-only test
-            return None
+        def wait(
+            self,
+            ctx: RunContext,
+            stop: threading.Event | None = None,
+        ) -> bool:  # pragma: no cover - parser-only test
+            return True
 
     spec = ChaosSpec.model_validate(
         {

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Literal
 
@@ -32,25 +33,44 @@ _log = get_logger("chaos.time_trigger")
 
 @TRIGGERS.register("time")
 class TimeTrigger(Trigger):
-    """Sleep for ``delay_seconds`` then return.
+    """Sleep for ``delay_seconds`` then fire.
 
     Attributes:
         type: Discriminator literal, always ``"time"``.
-        delay_seconds: Seconds to block in :meth:`wait`. ``0`` returns
+        delay_seconds: Seconds to block in :meth:`wait`. ``0`` fires
             immediately; negative values are rejected.
     """
 
     type: Literal["time"] = "time"
     delay_seconds: int = Field(default=0, ge=0)
 
-    def wait(self, ctx: RunContext) -> None:
-        """Block for :attr:`delay_seconds` seconds.
+    def wait(self, ctx: RunContext, stop: threading.Event | None = None) -> bool:
+        """Block for :attr:`delay_seconds` seconds, honoring an early stop.
+
+        A delay that outlives the agent skips the fault instead of injecting
+        it after the agent has already exited: a disruption nothing can react
+        to measures nothing, and the sleep would otherwise block result
+        draining for the remainder of the delay.
 
         Args:
             ctx: Run context (unused; accepted for interface symmetry with
                 triggers that observe cluster state).
+            stop: Optional event; when set mid-sleep the trigger returns
+                False so the fault is skipped.
+
+        Returns:
+            True when the full delay elapsed; False when stopped early.
         """
         if self.delay_seconds <= 0:
-            return
+            return True
         _log.info("time trigger sleeping for %d seconds", self.delay_seconds)
-        time.sleep(self.delay_seconds)
+        if stop is None:
+            time.sleep(self.delay_seconds)
+            return True
+        if stop.wait(self.delay_seconds):
+            _log.info(
+                "time trigger stopped before the %ds delay elapsed; skipping the fault",
+                self.delay_seconds,
+            )
+            return False
+        return True

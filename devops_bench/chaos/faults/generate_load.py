@@ -199,6 +199,12 @@ def run_chaos_command(
             _log.info("load spike detected; signaling harness via chaos event")
             chaos_active_event.set()
 
+        if is_load and load_result is not None:
+            # Wall-clock anchor for the timing metrics: the disruption becomes
+            # real when traffic starts flowing, not when the LLM loop began
+            # composing the command. ``setdefault`` keeps the *first* spike's
+            # start when the model issues several.
+            load_result.setdefault("started_at", time.time())
         completed = run(argv, check=False, timeout=_COMMAND_TIMEOUT)
         if is_load and load_result is not None:
             # Record the spike's real exit status so the fault can fail closed:
@@ -206,6 +212,9 @@ def run_chaos_command(
             load_result["attempted"] = True
             load_result["returncode"] = completed.returncode
             load_result["ok"] = completed.returncode == 0
+            # Overwritten by each subsequent spike, so this ends up marking the
+            # last moment load was still flowing.
+            load_result["ended_at"] = time.time()
         return f"Stdout:\n{completed.stdout}\nStderr:\n{completed.stderr}"
     except Exception as exc:  # noqa: BLE001 - surface any failure back to the LLM
         if is_load and load_result is not None:
@@ -398,6 +407,8 @@ class GenerateLoadFault(Fault):
                 injected_fault=self.type,
                 output=output,
                 elapsed_time=elapsed,
+                injected_at=load_result.get("started_at"),
+                reverted_at=load_result.get("ended_at"),
                 error=f"load did not reach the workload: {detail}",
             )
         return ChaosResult(
@@ -405,6 +416,12 @@ class GenerateLoadFault(Fault):
             injected_fault=self.type,
             output=output,
             elapsed_time=elapsed,
+            # Anchored on the spike itself (recorded by ``run_chaos_command``),
+            # so the LLM loop's planning turns are excluded from every
+            # downstream duration. The spike ending is this fault's revert:
+            # once fortio exits, the disruption is over.
+            injected_at=load_result.get("started_at"),
+            reverted_at=load_result.get("ended_at"),
         )
 
     def _run_agent_loop(

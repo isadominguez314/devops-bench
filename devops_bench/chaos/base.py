@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from typing import ClassVar
 
 from pydantic import BaseModel
 
@@ -50,6 +51,16 @@ class ChaosResult(BaseModel):
             metrics.
         output: Free-form text payload (typically the model's final summary).
         elapsed_time: Wall-clock seconds spent injecting the fault.
+        injected_at: UTC epoch seconds at the moment the disruption became
+            real (the API call that mutates the cluster returned), not when
+            ``inject`` was entered — a fault that spends 30s resolving its
+            target must not charge that setup to the agent's detection time.
+            ``None`` when the fault does not stamp it; every timing metric
+            derived from it degrades to "unavailable" rather than guessing.
+        reverted_at: UTC epoch seconds at which a self-reverting fault undid
+            its disruption. ``None`` for faults whose disruption is a
+            one-shot event (``kill_pod``) or which had not reverted when the
+            result was built.
         error: Human-readable error string when ``success`` is False; ``None``
             on success.
     """
@@ -58,6 +69,8 @@ class ChaosResult(BaseModel):
     injected_fault: str
     output: str = ""
     elapsed_time: float = 0.0
+    injected_at: float | None = None
+    reverted_at: float | None = None
     error: str | None = None
 
 
@@ -91,6 +104,30 @@ class Fault(BaseModel, ABC):
         """
         raise NotImplementedError
 
+    def detection_watch(self) -> Trigger | None:
+        """Return a trigger that fires on the agent's first corrective action.
+
+        The benchmark cannot observe the agent *noticing* a fault — the agent
+        is an external process and its reads leave no trace. What it can
+        observe is the first mutation of the blast radius by something other
+        than the fault, which is the proxy the time-to-detection metric is
+        built on. A fault that knows its own target returns a trigger watching
+        it; the scenario runs that trigger on a background thread from
+        ``injected_at`` and stamps the moment it fires.
+
+        Watch a *spec* field (``metadata.generation`` on a Deployment), never
+        ``status`` or a bare ``resourceVersion``: controller churn following
+        the injection bumps those on its own and would score the fault's own
+        blast wave as the agent's response.
+
+        Returns:
+            A :class:`Trigger` to run as the detection watcher, or ``None``
+            when the fault declares no blast radius — the scenario then
+            records the metric as unavailable instead of inventing one. A
+            spec-level ``detect:`` node overrides whatever this returns.
+        """
+        return None
+
 
 class Trigger(BaseModel, ABC):
     """Abstract base for a ``type``-tagged chaos firing condition.
@@ -98,14 +135,31 @@ class Trigger(BaseModel, ABC):
     Concrete triggers are pydantic models with a ``type: Literal["..."]``
     discriminator and self-register via ``@TRIGGERS.register(...)``. They
     implement :meth:`wait`, which blocks until the condition the trigger
-    encodes is met.
+    encodes is met — or until it can no longer fire, in which case the fault
+    is skipped rather than injected.
     """
 
+    #: Triggers that observe the *agent's* effects (e.g. a resource mutation
+    #: the agent performs) can only fire while the agent is running. The
+    #: harness skips its pre-agent chaos-active gate for these, since waiting
+    #: for the disruption to be active before starting the agent would
+    #: deadlock on a condition only the agent can satisfy.
+    requires_agent_running: ClassVar[bool] = False
+
     @abstractmethod
-    def wait(self, ctx: RunContext) -> None:
-        """Block until the trigger's condition is satisfied.
+    def wait(self, ctx: RunContext, stop: threading.Event | None = None) -> bool:
+        """Block until the trigger's condition is satisfied or abandoned.
 
         Args:
             ctx: Run context describing the target cluster and workspace.
+            stop: Optional event the caller sets when the trigger's outcome can
+                no longer matter (the agent finished, or the run is aborting).
+                A trigger should return promptly once it is set.
+
+        Returns:
+            True when the condition fired and the fault should inject; False
+            when the trigger gave up (stopped early or timed out) and the
+            fault should be skipped. Callers treat a legacy ``None`` return as
+            True so pre-existing external triggers keep working.
         """
         raise NotImplementedError

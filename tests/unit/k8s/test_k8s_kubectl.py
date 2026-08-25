@@ -147,6 +147,43 @@ def test_apply_builds_argv(mocker: MockerFixture) -> None:
     assert argv == ["kubectl", "apply", "-f", "/manifests/app.yaml", "-n", "staging"]
 
 
+def test_delete_resource_builds_argv(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete_resource("pod", ["web-abc", "web-def"], namespace="team-alpha")
+
+    argv = mock_run.call_args.args[0]
+    assert argv == [
+        "kubectl",
+        "delete",
+        "pod",
+        "web-abc",
+        "web-def",
+        "--wait=false",
+        "-n",
+        "team-alpha",
+    ]
+
+
+def test_delete_resource_wait_true(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete_resource("pod", ["web-abc"], wait=True, timeout=30)
+
+    argv = mock_run.call_args.args[0]
+    assert argv == ["kubectl", "delete", "pod", "web-abc", "--wait=true"]
+    assert mock_run.call_args.kwargs["timeout"] == 30
+
+
+def test_delete_resource_rejects_empty_names(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    # A bare ``kubectl delete pod`` is an authoring error, not a no-op delete.
+    with pytest.raises(ValueError, match="at least one resource name"):
+        kubectl.delete_resource("pod", [])
+    mock_run.assert_not_called()
+
+
 def test_rollout_status_with_timeout(mocker: MockerFixture) -> None:
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 

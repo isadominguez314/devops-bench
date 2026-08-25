@@ -781,26 +781,53 @@ class DefaultEvalHarness(Harness):
             )
             if scenario is not None:
                 scenario_manager, scenario_thread = scenario
-                _log.info("waiting for chaos agent to establish the cluster load spike...")
-                chaos_active = scenario_manager.chaos_active_event.wait(
-                    timeout=_CHAOS_ACTIVE_WAIT_SEC
-                )
-                if chaos_active:
-                    _log.info("cluster load spike active; proceeding with operator agent...")
-                else:
-                    # The event is also set when injection fails (to unblock us), so
-                    # a False here means it never signalled within the budget. The
-                    # agent still runs, but flag it: the run may not reflect the
-                    # intended disruption. The drained chaos_report carries the detail.
-                    _log.warning(
-                        "chaos did not signal active within %ss; proceeding, but the "
-                        "run may not reflect the intended disruption",
-                        _CHAOS_ACTIVE_WAIT_SEC,
+                # getattr: the spec's trigger is typed ``Any``, and an external
+                # trigger predating the flag simply keeps the gated behavior.
+                if getattr(chaos_specs[0].trigger, "requires_agent_running", False):
+                    # The trigger fires on an action only the agent can take,
+                    # and the agent has not started yet — gating its start on
+                    # the disruption being active would wait on a condition
+                    # that cannot occur.
+                    _log.info(
+                        "chaos trigger %r fires on the agent's own action; "
+                        "starting the operator agent without the chaos-active gate",
+                        chaos_specs[0].trigger.type,
                     )
+                else:
+                    _log.info("waiting for chaos agent to establish the cluster load spike...")
+                    chaos_active = scenario_manager.chaos_active_event.wait(
+                        timeout=_CHAOS_ACTIVE_WAIT_SEC
+                    )
+                    if chaos_active:
+                        _log.info("cluster load spike active; proceeding with operator agent...")
+                    else:
+                        # The event is also set when injection fails (to unblock us), so
+                        # a False here means it never signalled within the budget. The
+                        # agent still runs, but flag it: the run may not reflect the
+                        # intended disruption. The drained chaos_report carries the detail.
+                        _log.warning(
+                            "chaos did not signal active within %ss; proceeding, but the "
+                            "run may not reflect the intended disruption",
+                            _CHAOS_ACTIVE_WAIT_SEC,
+                        )
 
             _log.info("executing agent for prompt: %s", prompt)
             before_files = snapshot_dir(workspace_path)
-            agent_res = self.execute_agent(prompt, context)
+            if scenario_manager is not None:
+                # Anchors the agent's own span on the chaos timeline, so the
+                # report can distinguish a fault the agent was present for
+                # from one injected before it started.
+                scenario_manager.mark_agent_started()
+            try:
+                agent_res = self.execute_agent(prompt, context)
+            finally:
+                # The agent is done (or dead): a chaos trigger still waiting on
+                # its action can never fire now. Release it so the scenario
+                # records "skipped" instead of holding the drain (or the
+                # exception path's join) for the full budget. A trigger that
+                # already fired is unaffected.
+                if scenario_manager is not None:
+                    scenario_manager.notify_agent_done()
             # NOTE/TODO: This collects ALL frontmatter from bootstrapping, not just generated files.
             # Consider a more targeted filter in a future iteration.
             # Best-effort: a collection failure (I/O, permissions, a bad link in the

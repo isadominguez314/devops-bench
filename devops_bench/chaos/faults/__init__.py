@@ -17,6 +17,6 @@
 from __future__ import annotations
 
 # Imported for the ``@FAULTS.register`` side effect that populates the registry.
-from devops_bench.chaos.faults import generate_load  # noqa: F401
+from devops_bench.chaos.faults import generate_load, kill_pod  # noqa: F401
 
 __all__: list[str] = []

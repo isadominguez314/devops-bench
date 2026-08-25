@@ -161,6 +161,21 @@ class ChaosSpec(BaseModel):
         action: ``type``-tagged disruption (e.g. :class:`GenerateLoadFault`).
         verify: Optional verification-key reference; ``None`` skips post-fault
             verification. Accepts the ``verification`` alias.
+        detect: Optional ``type``-tagged condition used as the *detection
+            watcher*: the scenario runs it on a background thread from the
+            moment of injection and stamps when it fires, which anchors the
+            time-to-detection metric. Any registered trigger works, so the
+            watcher axis is as extensible as the firing axis. Omit it to
+            accept the fault's own ``detection_watch()`` default; a fault that
+            offers none leaves the metric unavailable rather than guessed.
+        recovery_verify: Verification-entry names that constitute "the agent
+            fixed what the fault broke", scored against the **post-run**
+            report as the remediation-accuracy signal. Defaults to
+            ``[verify]``. It is a list, and separate from ``verify``, because
+            the in-window check answers a narrower question (did the workload
+            come back inside the observation window) than remediation accuracy
+            does (was the damage repaired at all, by the end of the run) — and
+            because repairing a fault often takes more than one objective.
     """
 
     # Accept the ``verification`` alias; forbid unknown keys.
@@ -173,11 +188,13 @@ class ChaosSpec(BaseModel):
         default=None,
         validation_alias=AliasChoices("verify", "verification"),
     )
+    detect: Any = None
+    recovery_verify: list[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def _parse_nodes(cls, data: Any) -> Any:
-        """Route ``trigger`` / ``action`` payloads through the registry parsers."""
+        """Route ``trigger`` / ``action`` / ``detect`` payloads through the parsers."""
         if not isinstance(data, dict):
             return data
         out = dict(data)
@@ -185,4 +202,28 @@ class ChaosSpec(BaseModel):
             out["trigger"] = parse_trigger(out["trigger"])
         if "action" in out:
             out["action"] = parse_fault(out["action"])
+        if out.get("detect") is not None:
+            out["detect"] = parse_trigger(out["detect"])
         return out
+
+    def recovery_entries(self) -> list[str]:
+        """Return the verification-entry names remediation accuracy scores.
+
+        Falls back to the single ``verify`` reference so a task authored
+        before this field existed still produces the signal.
+        """
+        if self.recovery_verify:
+            return list(self.recovery_verify)
+        return [self.verify] if self.verify else []
+
+    def detection_trigger(self) -> Any:
+        """Return the detection watcher to run, or ``None`` for no watcher.
+
+        An explicit spec-level ``detect:`` wins over the fault's default, so a
+        task author can widen the blast radius the watcher covers (or narrow
+        it to a decoy-free subset) without touching the fault.
+        """
+        if self.detect is not None:
+            return self.detect
+        watch = getattr(self.action, "detection_watch", None)
+        return watch() if callable(watch) else None

@@ -388,6 +388,88 @@ def test_run_one_collects_files_the_agent_writes_to_its_workspace(
         AGENTS._items.pop("fake-workspace-writer", None)  # noqa: SLF001
 
 
+class _NoopAgent(AgentHarness):
+    """Stand-in agent that returns immediately."""
+
+    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        return AgentResult(output="done", trajectory=[])
+
+
+def _run_one_with_chaos(trigger: dict[str, Any], tmp_path: Path) -> Any:
+    """Drive ``_run_one`` with a chaos task and a mocked scenario pair.
+
+    Returns the mocked ScenarioManager so callers can assert on how the
+    harness interacted with the scenario (the chaos-active gate and the
+    agent-done release), without a background thread or a cluster.
+    """
+    from unittest.mock import MagicMock
+
+    AGENTS.register("fake-noop-agent")(_NoopAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p", cluster_name="c", agent_type="fake-noop-agent", no_infra=True
+        )
+        task = Task.from_dict(
+            {
+                "task_id": "t",
+                "name": "demo",
+                "prompt": "p",
+                "chaos_spec": [
+                    {
+                        "name": "disruption",
+                        "trigger": trigger,
+                        "action": {
+                            "type": "kill_pod",
+                            "target": {"deployment": "web", "namespace": "ns"},
+                        },
+                    }
+                ],
+            }
+        )
+        manager = MagicMock()
+        manager.get_reports.return_value = ({}, {})
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        with patch.object(DefaultEvalHarness, "start_scenario", return_value=(manager, thread)):
+            record = harness._run_one(task, tmp_path)  # noqa: SLF001
+        assert record["status"] == "success"
+        return manager
+    finally:
+        AGENTS._items.pop("fake-noop-agent", None)  # noqa: SLF001
+
+
+def test_run_one_skips_chaos_active_gate_for_agent_dependent_trigger(
+    isolated_env: None, tmp_path: Path
+) -> None:
+    """An ``agent_action`` trigger must not gate the agent's start on chaos.
+
+    The trigger fires on an action only the agent can take; waiting for the
+    disruption to be active before starting the agent would stall on a
+    condition that cannot occur yet.
+    """
+    manager = _run_one_with_chaos(
+        {
+            "type": "agent_action",
+            "kind": "clusterpolicy",
+            "path": "spec.validationFailureAction",
+            "equals": "Enforce",
+        },
+        tmp_path,
+    )
+    manager.chaos_active_event.wait.assert_not_called()
+    # The agent finished: a still-waiting trigger is released either way.
+    manager.notify_agent_done.assert_called_once()
+
+
+def test_run_one_keeps_chaos_active_gate_for_time_trigger(
+    isolated_env: None, tmp_path: Path
+) -> None:
+    """A time trigger fires independently of the agent, so the gate stays on."""
+    manager = _run_one_with_chaos({"type": "time", "delay_seconds": 0}, tmp_path)
+    manager.chaos_active_event.wait.assert_called_once()
+    manager.notify_agent_done.assert_called_once()
+
+
 def test_run_one_warns_when_a_verification_entry_fails_to_parse(
     isolated_env: None, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

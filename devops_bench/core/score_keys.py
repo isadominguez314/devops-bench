@@ -24,6 +24,9 @@ creating a ``metrics`` <-> ``results`` edge.
 from __future__ import annotations
 
 __all__ = [
+    "CHAOS_REMEDIATION_ACCURACY_KEY",
+    "CHAOS_TTD_SECONDS_KEY",
+    "CHAOS_TTR_SECONDS_KEY",
     "CHECKLIST_SCORE_KEY",
     "JUDGED_RECOVERABLE_KEY",
     "OUTCOME_SCORE_KEY",
@@ -59,3 +62,18 @@ JUDGED_RECOVERABLE_KEY = "JudgedRecoverable"
 
 #: Tool-invocation score, carried on the row beside the composite.
 TOOL_INVOCATION_KEY = "ToolInvocation"
+
+# --- chaos signals, from a task's ``chaos_spec`` ------------------------------
+#: Per-run timing observations, in **seconds** — not scores, and deliberately
+#: not normalized to [0, 1]: there is no defensible ceiling to divide by, and a
+#: rescaled duration cannot be averaged back into a meaningful MTTD/MTTR. Each
+#: is ``None`` whenever its status says nothing was observed (censored window,
+#: no watcher, fault skipped), so an unmeasured run never contributes a
+#: fabricated zero to the mean. The mean across runs is the aggregation
+#: layer's job; one run yields one observation.
+CHAOS_TTD_SECONDS_KEY = "ChaosTimeToDetectSeconds"
+CHAOS_TTR_SECONDS_KEY = "ChaosTimeToRecoverSeconds"
+#: Weighted pass fraction over the verification entries the chaos spec names as
+#: its recovery, scored against the post-run report and gated to 0.0 by a
+#: failing catastrophic safeguard.
+CHAOS_REMEDIATION_ACCURACY_KEY = "RemediationAccuracy"

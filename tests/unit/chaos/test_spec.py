@@ -80,6 +80,95 @@ def test_legacy_verification_alias_is_accepted() -> None:
     assert spec.verify == "Planned Load Spike Verification"
 
 
+def _spec_with(**extra) -> ChaosSpec:
+    return ChaosSpec.model_validate(
+        {
+            "trigger": {"type": "time", "delay_seconds": 0},
+            "action": {
+                "type": "kill_pod",
+                "target": {"deployment": "web", "namespace": "team-alpha"},
+            },
+            **extra,
+        }
+    )
+
+
+def test_detect_node_parses_through_the_trigger_registry() -> None:
+    """The watcher axis is the trigger axis: whatever can fire a fault can time one."""
+    spec = _spec_with(
+        detect={
+            "type": "agent_action",
+            "kind": "deployment",
+            "resource_name": "web",
+            "namespace": "team-alpha",
+            "path": "metadata.generation",
+        }
+    )
+
+    assert spec.detect.type == "agent_action"
+    assert spec.detection_trigger() is spec.detect
+
+
+def test_unknown_detect_type_is_rejected_like_any_other_trigger() -> None:
+    with pytest.raises(ValidationError, match="unknown chaos trigger type"):
+        _spec_with(detect={"type": "no_such_watcher"})
+
+
+def test_detect_falls_back_to_the_faults_own_blast_radius() -> None:
+    """A task author gets a watcher for free; the fault knows what it broke."""
+    watcher = _spec_with().detection_trigger()
+
+    assert watcher is not None
+    assert watcher.type == "agent_action"
+    assert watcher.resource_name == "web"
+    # A spec field, never ``status`` or ``resourceVersion``: controller churn
+    # after the kill bumps those on its own, and scoring the fault's own blast
+    # wave as the agent's response would report detection at ~0s every time.
+    assert watcher.path == "metadata.generation"
+
+
+def test_an_explicit_detect_node_overrides_the_faults_default() -> None:
+    spec = _spec_with(
+        detect={
+            "type": "agent_action",
+            "kind": "deployment",
+            "resource_name": "api",
+            "namespace": "team-alpha",
+            "path": "metadata.generation",
+        }
+    )
+
+    assert spec.detection_trigger().resource_name == "api"
+
+
+def test_a_fault_with_no_blast_radius_offers_no_watcher() -> None:
+    """Better no metric than a guessed one."""
+    spec = ChaosSpec.model_validate(
+        {
+            "trigger": {"type": "time", "delay_seconds": 0},
+            "action": {
+                "type": "generate_load",
+                "target": {"service_url": "http://svc", "qps": 1},
+            },
+        }
+    )
+
+    assert spec.detection_trigger() is None
+
+
+def test_recovery_entries_default_to_the_single_verify_reference() -> None:
+    """A task authored before ``recovery_verify`` existed still produces the signal."""
+    assert _spec_with(verify="pod_healthy").recovery_entries() == ["pod_healthy"]
+    assert _spec_with().recovery_entries() == []
+
+
+def test_recovery_verify_is_a_list_separate_from_the_in_window_check() -> None:
+    """Repairing a fault often takes more than the one objective we poll on."""
+    spec = _spec_with(verify="pod_healthy", recovery_verify=["pod_healthy", "policy_enforced"])
+
+    assert spec.recovery_entries() == ["pod_healthy", "policy_enforced"]
+
+
 def test_bare_list_or_dict_at_node_position_is_rejected() -> None:
     # A bare list is the legacy authoring anti-pattern: the spec must be a
     # typed mapping, not a free-form list/dict.

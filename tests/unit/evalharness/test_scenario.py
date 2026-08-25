@@ -24,6 +24,7 @@ or a real LLM.
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any, Literal
 from unittest.mock import patch
@@ -31,6 +32,7 @@ from unittest.mock import patch
 import pytest
 
 from devops_bench.chaos import ChaosResult, ChaosSpec
+from devops_bench.chaos.base import TRIGGERS, Trigger
 from devops_bench.chaos.faults.generate_load import GenerateLoadFault
 from devops_bench.chaos.triggers.time_delay import TimeTrigger
 from devops_bench.core.context import RunContext
@@ -67,8 +69,9 @@ def test_scenario_drives_trigger_wait_then_action_inject() -> None:
     spec = _build_spec(verify_key=None)
     order: list[str] = []
 
-    def fake_wait(self: TimeTrigger, ctx: RunContext) -> None:
+    def fake_wait(self: TimeTrigger, ctx: RunContext, stop: threading.Event | None = None) -> bool:
         order.append("trigger.wait")
+        return True
 
     def fake_inject(
         self: GenerateLoadFault,
@@ -132,7 +135,7 @@ def test_scenario_threads_port_forward_target_onto_ctx_env() -> None:
         return ChaosResult(success=True, injected_fault=self.type, elapsed_time=0.0)
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", fake_inject),
     ):
         manager = ScenarioManager(
@@ -167,7 +170,7 @@ def test_scenario_threads_custom_local_port_onto_ctx_env() -> None:
         return ChaosResult(success=True, injected_fault=self.type, elapsed_time=0.0)
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", fake_inject),
     ):
         manager = ScenarioManager(
@@ -194,7 +197,7 @@ def test_scenario_omits_local_port_env_by_default() -> None:
         return ChaosResult(success=True, injected_fault=self.type, elapsed_time=0.0)
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", fake_inject),
     ):
         ScenarioManager(
@@ -220,7 +223,7 @@ def test_scenario_resolves_verify_against_mapping() -> None:
     fake_result = VerificationResult(success=True, elapsed_time=2.5, reason="all good")
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(
             GenerateLoadFault,
             "inject",
@@ -300,7 +303,7 @@ def test_chaos_referenced_assert_mode_entry_evaluates_single_shot() -> None:
     spec = _build_spec(verify_key="planned-verify")
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(
             GenerateLoadFault,
             "inject",
@@ -334,7 +337,7 @@ def test_scenario_unknown_verify_key_surfaces_failure_into_report() -> None:
     spec = _build_spec(verify_key="not-in-mapping")
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(
             GenerateLoadFault,
             "inject",
@@ -376,7 +379,7 @@ def test_chaos_failure_lands_typed_error_into_report() -> None:
         )
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", failing_inject),
     ):
         manager = ScenarioManager(
@@ -404,7 +407,7 @@ def test_injection_exception_sets_chaos_active_event() -> None:
         raise RuntimeError("port-forward refused")
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", raising_inject),
     ):
         manager = ScenarioManager(
@@ -428,8 +431,153 @@ def test_stop_aborts_verification() -> None:
     )
     manager.stop()  # The fault owns the port-forward; stop only sets the flag.
     assert manager._aborted.is_set()  # noqa: SLF001
+    # stop() also releases a trigger still waiting on the agent's action.
+    assert manager._trigger_stop.is_set()  # noqa: SLF001
     # Idempotent — the second call must not raise.
     manager.stop()
+
+
+def test_notify_agent_done_releases_trigger_without_aborting_verification() -> None:
+    """``notify_agent_done()`` stops a waiting trigger but not a pending verification.
+
+    The agent finishing means an unfired trigger can never fire — but a fault
+    that already injected must still get its verification, so only the
+    trigger-stop event is set, never the abort flag.
+    """
+    manager = ScenarioManager(
+        target_deployment="dep",
+        namespace="ns",
+        skip_port_forward=True,
+    )
+    manager.notify_agent_done()
+    assert manager._trigger_stop.is_set()  # noqa: SLF001
+    assert not manager._aborted.is_set()  # noqa: SLF001
+    # Idempotent — the second call must not raise.
+    manager.notify_agent_done()
+
+
+def test_trigger_declining_to_fire_records_skipped_and_skips_everything() -> None:
+    """A trigger returning False skips injection AND verification, status='skipped'.
+
+    The skipped outcome is distinct from a failed injection: the fault never
+    ran, so verifying "recovery" from it would measure nothing. The
+    chaos-active event is still set so a waiting main thread unblocks.
+    """
+    spec = _build_spec(verify_key="planned-verify")
+
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: False),
+        patch.object(
+            GenerateLoadFault,
+            "inject",
+            side_effect=AssertionError("a skipped trigger must never inject"),
+        ),
+        patch.object(VerifierAgent, "run_entry") as mock_run_entry,
+    ):
+        manager = ScenarioManager(
+            target_deployment="dep",
+            namespace="ns",
+            verification_mapping={"planned-verify": object()},
+            skip_port_forward=True,
+        )
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    mock_run_entry.assert_not_called()
+    assert manager.chaos_active_event.is_set()
+    chaos_report, perf_report = manager.get_reports()
+    assert chaos_report["status"] == "skipped"
+    assert chaos_report["injected_fault"] == "generate_load"
+    assert "did not fire" in chaos_report["reason"]
+    assert perf_report == {}
+
+
+def test_legacy_trigger_returning_none_still_fires() -> None:
+    """A pre-signature external trigger returning ``None`` injects as before.
+
+    Only an explicit ``False`` skips; ``None`` (the old contract's return
+    value) must keep meaning "fired" so entry-point triggers that predate the
+    bool contract are not silently downgraded to never firing.
+    """
+    spec = _build_spec(verify_key=None)
+    injected: list[str] = []
+
+    def legacy_wait(self: TimeTrigger, ctx: RunContext, stop=None) -> None:
+        return None
+
+    with (
+        patch.object(TimeTrigger, "wait", legacy_wait),
+        patch.object(
+            GenerateLoadFault,
+            "inject",
+            lambda self, ctx, event: (
+                injected.append(self.type),
+                ChaosResult(success=True, injected_fault=self.type, elapsed_time=0.0),
+            )[1],
+        ),
+    ):
+        manager = ScenarioManager(
+            target_deployment="dep",
+            namespace="ns",
+            skip_port_forward=True,
+        )
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    assert injected == ["generate_load"]
+    chaos_report, _ = manager.get_reports()
+    assert chaos_report["status"] == "success"
+
+
+def test_scenario_never_resolves_lb_for_action_without_load_url() -> None:
+    """An action with no ``target.service_url`` (kill_pod) skips LB resolution.
+
+    The LB lookup exists purely to route load at the workload; for a fault
+    that generates no load it would waste up to the LB timeout resolving an
+    IP nothing consumes.
+    """
+    from devops_bench.chaos.faults.kill_pod import KillPodFault
+
+    spec = ChaosSpec.model_validate(
+        {
+            "name": "Pod Kill",
+            "trigger": {"type": "time", "delay_seconds": 0},
+            "action": {
+                "type": "kill_pod",
+                "target": {"deployment": "web", "namespace": "team-alpha"},
+            },
+        }
+    )
+    captured: dict[str, Any] = {}
+
+    def fake_inject(self: KillPodFault, ctx: RunContext, event):
+        captured["env"] = dict(ctx.env)
+        return ChaosResult(success=True, injected_fault=self.type, elapsed_time=0.0)
+
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
+        patch.object(KillPodFault, "inject", fake_inject),
+        # kill_pod's real detection watcher polls the target Deployment; this
+        # test is about LB resolution, and a watcher thread shelling out to
+        # kubectl against a cluster that does not exist is not part of it.
+        patch.object(KillPodFault, "detection_watch", lambda self: None),
+        patch(
+            "devops_bench.evalharness.scenario.get_resource",
+            side_effect=AssertionError("kill_pod must not trigger LB resolution"),
+        ),
+        patch(
+            "devops_bench.evalharness.scenario.poll_until",
+            side_effect=AssertionError("kill_pod must not poll for an LB IP"),
+        ),
+    ):
+        manager = ScenarioManager(
+            target_deployment="dep",
+            namespace="ns",
+            skip_port_forward=False,  # real-cluster path — the gate under test
+        )
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    chaos_report, _ = manager.get_reports()
+    assert chaos_report["status"] == "success"
+    assert chaos_report["injected_fault"] == "kill_pod"
 
 
 def test_scenario_resolves_lb_ip_and_points_action_url_at_it() -> None:
@@ -458,7 +606,7 @@ def test_scenario_resolves_lb_ip_and_points_action_url_at_it() -> None:
     fake_svc = {"status": {"loadBalancer": {"ingress": [{"ip": "34.10.20.30"}]}}}
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", fake_inject),
         patch(
             "devops_bench.evalharness.scenario.get_resource",
@@ -505,7 +653,7 @@ def test_scenario_falls_back_to_port_forward_when_lb_ip_unavailable() -> None:
     no_ip_svc = {"status": {"loadBalancer": {}}}
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", fake_inject),
         patch(
             "devops_bench.evalharness.scenario.get_resource",
@@ -552,7 +700,7 @@ def test_scenario_skips_lb_resolution_in_smoke_path() -> None:
         return ChaosResult(success=True, injected_fault=self.type, elapsed_time=0.0)
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", fake_inject),
         patch(
             "devops_bench.evalharness.scenario.get_resource",
@@ -604,7 +752,7 @@ def test_scenario_skips_lb_resolution_for_local_cluster() -> None:
     ctx.cluster = local_cluster
 
     with (
-        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
         patch.object(GenerateLoadFault, "inject", fake_inject),
         patch(
             "devops_bench.evalharness.scenario.get_resource",
@@ -628,6 +776,285 @@ def test_scenario_skips_lb_resolution_for_local_cluster() -> None:
     assert captured["env"][_ENV_TARGET_NAMESPACE] == "ns"
 
 
+# --- detection watcher / timing metrics ---------------------------------------
+
+
+@TRIGGERS.register("scenario_detect")
+class _ScenarioDetect(Trigger):
+    """A watcher double: fires, declines, or raises, without touching a cluster.
+
+    Registered so the spec's ``detect:`` node parses through the real
+    :data:`TRIGGERS` registry — the point of running the watcher as a trigger
+    is that any registered trigger can serve as one, and a hand-built stub
+    would not prove that.
+    """
+
+    type: Literal["scenario_detect"]
+    fires: bool = True
+    raises: bool = False
+    waits: list[str] = []
+
+    def wait(self, ctx: RunContext, stop: threading.Event | None = None) -> bool:
+        self.waits.append("waited")
+        if self.raises:
+            raise RuntimeError("watcher exploded")
+        if stop is not None and stop.is_set():
+            return False
+        return self.fires
+
+
+def _build_watched_spec(**detect: Any) -> ChaosSpec:
+    """A load-fault spec whose detection watcher is the double above."""
+    return ChaosSpec.model_validate(
+        {
+            "name": "Watched Disruption",
+            "trigger": {"type": "time", "delay_seconds": 0},
+            "action": {
+                "type": "generate_load",
+                "target": {"service_url": "http://example.svc", "qps": 50},
+            },
+            "detect": {"type": "scenario_detect", "waits": [], **detect},
+        }
+    )
+
+
+def _inject_at(injected_at: float):
+    """A fake ``inject`` that reports the disruption became real at a fixed instant."""
+
+    def _fake(self: GenerateLoadFault, ctx: RunContext, event) -> ChaosResult:
+        if event is not None:
+            event.set()
+        return ChaosResult(
+            success=True,
+            injected_fault=self.type,
+            elapsed_time=0.0,
+            injected_at=injected_at,
+        )
+
+    return _fake
+
+
+def _run_watched(spec: ChaosSpec) -> dict[str, Any]:
+    manager = ScenarioManager(target_deployment="dep", namespace="ns", skip_port_forward=True)
+    # The detection window is the agent's lifetime, so an agent has to exist
+    # for the scenario to hold it open at all.
+    manager.mark_agent_started()
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
+        patch.object(GenerateLoadFault, "inject", _inject_at(time.time())),
+    ):
+        manager.run_chaos_and_verification(spec, _build_ctx())
+    chaos_report, _ = manager.get_reports()
+    return chaos_report
+
+
+def test_detection_watcher_fires_and_anchors_ttd_on_the_injection() -> None:
+    """The first mutation of the blast radius is the time-to-detect observation."""
+    spec = _build_watched_spec(fires=True)
+
+    chaos_report = _run_watched(spec)
+
+    metrics = chaos_report["metrics"]
+    assert metrics["ttd_status"] == "observed"
+    assert metrics["ttd_source"] == "cluster_action"
+    assert metrics["ttd_seconds"] is not None and metrics["ttd_seconds"] >= 0.0
+    # The anchor pair the number was derived from is on the record too, so the
+    # arithmetic is auditable rather than taken on trust.
+    assert chaos_report["timeline"]["injected_at"] is not None
+    assert chaos_report["timeline"]["first_action_at"] is not None
+
+
+def test_watcher_that_declines_records_not_observed_rather_than_a_number() -> None:
+    chaos_report = _run_watched(_build_watched_spec(fires=False))
+
+    assert chaos_report["metrics"]["ttd_status"] == "not_observed"
+    assert chaos_report["metrics"]["ttd_seconds"] is None
+    assert chaos_report["timeline"]["first_action_at"] is None
+
+
+def test_an_agent_that_has_already_exited_closes_the_detection_window() -> None:
+    """A departed agent cannot take a corrective action; the watcher stops polling."""
+    spec = _build_watched_spec(fires=True)
+
+    manager = ScenarioManager(target_deployment="dep", namespace="ns", skip_port_forward=True)
+    manager.mark_agent_started()
+    manager.notify_agent_done()
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
+        patch.object(GenerateLoadFault, "inject", _inject_at(time.time())),
+    ):
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    chaos_report, _ = manager.get_reports()
+    # The watcher ran and honored the stop event rather than reporting a fire.
+    assert spec.detect.waits == ["waited"]
+    assert chaos_report["metrics"]["ttd_status"] == "not_observed"
+
+
+def test_a_crashing_watcher_costs_the_metric_not_the_run() -> None:
+    """A broken detection proxy must never turn a good chaos run into a failed one."""
+    chaos_report = _run_watched(_build_watched_spec(raises=True))
+
+    assert chaos_report["status"] == "success"
+    assert chaos_report["metrics"]["ttd_status"] == "not_observed"
+
+
+def test_no_watcher_configured_reports_unavailable_not_unobserved() -> None:
+    """A fault with no declared blast radius never accuses the agent of inaction."""
+    spec = _build_spec(verify_key=None)
+    assert spec.detection_trigger() is None
+
+    manager = ScenarioManager(target_deployment="dep", namespace="ns", skip_port_forward=True)
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
+        patch.object(GenerateLoadFault, "inject", _inject_at(time.time())),
+    ):
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    chaos_report, _ = manager.get_reports()
+    assert chaos_report["metrics"]["ttd_status"] == "unavailable"
+
+
+def test_watcher_is_armed_only_after_the_fault_actually_landed() -> None:
+    """A watcher armed before the disruption would time the agent's prior work."""
+    spec = _build_watched_spec(fires=True)
+    watcher = spec.detect
+
+    manager = ScenarioManager(target_deployment="dep", namespace="ns", skip_port_forward=True)
+    manager.mark_agent_started()
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
+        patch.object(
+            GenerateLoadFault,
+            "inject",
+            lambda self, ctx, event: ChaosResult(
+                success=False, injected_fault=self.type, elapsed_time=0.0, error="no route"
+            ),
+        ),
+    ):
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    assert watcher.waits == []
+    chaos_report, _ = manager.get_reports()
+    # A fault that never disrupted anything has no detection time to report —
+    # and reporting one would credit the agent for noticing a non-event.
+    assert chaos_report["status"] == "failed"
+    assert chaos_report["metrics"]["ttd_status"] == "unavailable"
+    assert chaos_report["metrics"]["ttr_status"] == "unavailable"
+
+
+def test_a_trigger_that_never_fired_reports_skipped_timings() -> None:
+    """No fault, so both metrics are "skipped" — distinct from "unavailable"."""
+    spec = _build_watched_spec(fires=True)
+
+    manager = ScenarioManager(target_deployment="dep", namespace="ns", skip_port_forward=True)
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: False),
+        patch.object(
+            GenerateLoadFault,
+            "inject",
+            side_effect=AssertionError("a skipped trigger must never inject"),
+        ),
+    ):
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    chaos_report, _ = manager.get_reports()
+    assert chaos_report["metrics"]["ttd_status"] == "skipped"
+    assert chaos_report["metrics"]["ttr_status"] == "skipped"
+    assert spec.detect.waits == []
+
+
+def test_recovery_timing_is_measured_from_injection_and_named_on_the_report() -> None:
+    """A converged recovery check stamps TTR; the entries it scored are recorded."""
+    spec = ChaosSpec.model_validate(
+        {
+            "name": "Watched Disruption",
+            "trigger": {"type": "time", "delay_seconds": 0},
+            "action": {
+                "type": "generate_load",
+                "target": {"service_url": "http://example.svc", "qps": 50},
+            },
+            "verify": "planned-verify",
+            "recovery_verify": ["web_healthy", "api_healthy"],
+        }
+    )
+    entry = SimpleNamespace(check=object(), resolved_mode="converge")
+
+    manager = ScenarioManager(
+        target_deployment="dep",
+        namespace="ns",
+        verification_mapping={"planned-verify": entry},
+        skip_port_forward=True,
+    )
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
+        patch.object(GenerateLoadFault, "inject", _inject_at(time.time())),
+        patch.object(
+            VerifierAgent,
+            "run_entry",
+            return_value=VerificationResult(success=True, elapsed_time=1.0, reason="back"),
+        ),
+    ):
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    chaos_report, _ = manager.get_reports()
+    assert chaos_report["metrics"]["ttr_status"] == "recovered"
+    assert chaos_report["metrics"]["ttr_seconds"] is not None
+    # The remediation-accuracy metric reads these names off the report rather
+    # than re-deriving them from the spec it never sees.
+    assert chaos_report["recovery_entries"] == ["web_healthy", "api_healthy"]
+
+
+def test_failing_converge_recovery_is_censored_not_a_recovery_time() -> None:
+    spec = _build_spec(verify_key="planned-verify")
+    entry = SimpleNamespace(check=object(), resolved_mode="converge")
+
+    manager = ScenarioManager(
+        target_deployment="dep",
+        namespace="ns",
+        verification_mapping={"planned-verify": entry},
+        skip_port_forward=True,
+    )
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx, stop=None: True),
+        patch.object(GenerateLoadFault, "inject", _inject_at(time.time())),
+        patch.object(
+            VerifierAgent,
+            "run_entry",
+            return_value=VerificationResult(success=False, elapsed_time=120.0, reason="still down"),
+        ),
+    ):
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    chaos_report, _ = manager.get_reports()
+    assert chaos_report["metrics"]["ttr_status"] == "censored"
+    # Emphatically not 120.0: that is how long we watched, not how long it took.
+    assert chaos_report["metrics"]["ttr_seconds"] is None
+    # ``recovery_verify`` unset falls back to the single ``verify`` reference.
+    assert chaos_report["recovery_entries"] == ["planned-verify"]
+
+
+def test_agent_span_is_recorded_on_the_timeline() -> None:
+    """Reader can tell a fault the agent was present for from one injected alone."""
+    manager = ScenarioManager(target_deployment="dep", namespace="ns", skip_port_forward=True)
+    manager.mark_agent_started()
+    first = manager.timeline.agent_started_at
+    # Idempotent: a re-stamp would move an anchor other numbers derive from.
+    manager.mark_agent_started()
+    manager.notify_agent_done()
+
+    assert manager.timeline.agent_started_at == first
+    assert manager.timeline.agent_finished_at is not None
+    assert manager._detect_stop.is_set()  # noqa: SLF001
+
+
+def test_stop_releases_the_detection_watcher() -> None:
+    manager = ScenarioManager(target_deployment="dep", namespace="ns", skip_port_forward=True)
+    manager.stop()
+
+    assert manager._detect_stop.is_set()  # noqa: SLF001
+
+
 @pytest.fixture(autouse=True)
 def _no_real_kubectl(monkeypatch: pytest.MonkeyPatch) -> None:
     """Guard against this file accidentally shelling out to ``kubectl``.
@@ -637,9 +1064,15 @@ def _no_real_kubectl(monkeypatch: pytest.MonkeyPatch) -> None:
     patches the ``subprocess.Popen`` the port-forward helper would use so a test
     that forgets the flag (and isn't deliberately driving the port-forward path)
     fails loudly instead of attempting a real port-forward.
+
+    The one-shot ``kubectl`` path is blocked for the same reason. It is not
+    only the fault that can reach it: the detection watcher polls the blast
+    radius on its own thread, so a test driving a real fault has a second way
+    to shell out.
     """
 
     def _boom(*args, **kwargs):  # pragma: no cover - exercised only on regression
         raise RuntimeError("test attempted to spawn a real kubectl process")
 
     monkeypatch.setattr("devops_bench.k8s.kubectl.subprocess.Popen", _boom)
+    monkeypatch.setattr("devops_bench.k8s.kubectl.run", _boom)

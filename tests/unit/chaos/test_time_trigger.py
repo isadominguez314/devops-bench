@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import patch
 
 from devops_bench.chaos.triggers import time_delay
@@ -27,15 +28,42 @@ def _ctx() -> RunContext:
     return RunContext(task_id="t1")
 
 
-def test_zero_delay_returns_without_sleeping() -> None:
+def test_zero_delay_fires_without_sleeping() -> None:
     trigger = TimeTrigger(delay_seconds=0)
     with patch.object(time_delay.time, "sleep") as sleep_mock:
-        trigger.wait(_ctx())
+        assert trigger.wait(_ctx()) is True
     sleep_mock.assert_not_called()
 
 
 def test_positive_delay_sleeps_for_that_many_seconds() -> None:
     trigger = TimeTrigger(delay_seconds=4)
     with patch.object(time_delay.time, "sleep") as sleep_mock:
-        trigger.wait(_ctx())
+        assert trigger.wait(_ctx()) is True
     sleep_mock.assert_called_once_with(4)
+
+
+def test_delay_waits_on_the_stop_event_when_one_is_given() -> None:
+    """With a stop event, the sleep is ``stop.wait`` so it can end early."""
+    trigger = TimeTrigger(delay_seconds=4)
+    stop = threading.Event()
+    with patch.object(stop, "wait", return_value=False) as wait_mock:
+        assert trigger.wait(_ctx(), stop=stop) is True
+    wait_mock.assert_called_once_with(4)
+
+
+def test_stop_set_mid_delay_skips_the_fault() -> None:
+    """A stop arriving before the delay elapses returns False (skip).
+
+    A fault injected after the agent has already exited measures nothing;
+    the trigger reports "did not fire" instead of firing late.
+    """
+    trigger = TimeTrigger(delay_seconds=60)
+    stop = threading.Event()
+    stop.set()  # already stopped: wait(60) returns True immediately
+    assert trigger.wait(_ctx(), stop=stop) is False
+
+
+def test_requires_agent_running_defaults_false() -> None:
+    """A time trigger fires independently of the agent, so the harness's
+    pre-agent chaos-active gate stays on for it."""
+    assert TimeTrigger.requires_agent_running is False

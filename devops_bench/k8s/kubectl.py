@@ -28,6 +28,7 @@ from devops_bench.core.subprocess import CompletedProcess, _build_env, run
 
 __all__ = [
     "apply",
+    "delete_resource",
     "get_resource",
     "port_forward",
     "rollout_status",
@@ -195,6 +196,52 @@ def apply(
     """
     argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
     return _run_kubectl(argv, kubeconfig)
+
+
+def delete_resource(
+    resource_type: str,
+    names: list[str],
+    *,
+    namespace: str | None = None,
+    kubeconfig: KubeconfigSource = None,
+    wait: bool = False,
+    timeout: float | None = None,
+) -> CompletedProcess:
+    """Delete named resources via ``kubectl delete``.
+
+    Deletion is graceful (no ``--force`` / ``--grace-period=0``) and by
+    default does not block on finalization (``--wait=false``), so a caller
+    disrupting pods can return as soon as the deletion is accepted and let
+    the controller recreate them.
+
+    Args:
+        resource_type: Resource kind to delete, e.g. ``"pod"``.
+        names: Explicit resource names; must be non-empty (a bare
+            ``kubectl delete pod`` with no names is an authoring error, not a
+            no-op).
+        namespace: Optional namespace (``-n``).
+        kubeconfig: Kubeconfig path or context-like object.
+        wait: When True, block until the resources are fully removed.
+        timeout: Optional seconds before the subprocess is killed.
+
+    Returns:
+        The completed process.
+
+    Raises:
+        ValueError: If ``names`` is empty.
+        SubprocessError: If kubectl exits non-zero or times out.
+    """
+    if not names:
+        raise ValueError("delete_resource requires at least one resource name")
+    argv = [
+        "kubectl",
+        "delete",
+        resource_type,
+        *names,
+        f"--wait={'true' if wait else 'false'}",
+        *_namespace_args(namespace),
+    ]
+    return _run_kubectl(argv, kubeconfig, timeout=timeout)
 
 
 def rollout_status(
