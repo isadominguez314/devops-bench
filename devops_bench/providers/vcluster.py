@@ -60,13 +60,6 @@ _LOCAL_CONTEXT_PREFIXES = (
     "local-",
 )
 
-_LOCAL_HOSTNAMES = {
-    "localhost",
-    "kubernetes.docker.internal",
-    "host.docker.internal",
-    "host.minikube.internal",
-}
-
 _LOCAL_HOSTNAME_SUFFIXES = (
     ".localhost",
     ".local",
@@ -85,9 +78,7 @@ def _is_local_server_url(server: str) -> bool:
         return False
     if not hostname:
         return False
-    if hostname in _LOCAL_HOSTNAMES or any(
-        hostname.endswith(suffix) for suffix in _LOCAL_HOSTNAME_SUFFIXES
-    ):
+    if hostname == "localhost" or hostname.endswith(_LOCAL_HOSTNAME_SUFFIXES):
         return True
     try:
         ip = ipaddress.ip_address(hostname)
