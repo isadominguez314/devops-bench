@@ -841,11 +841,12 @@ def _run_with_fake_agent(tmp_path: Path, agent_key: str) -> dict[str, Any]:
 def test_run_flags_sensitive_access_without_touching_scores(
     isolated_env: None, tmp_path: Path
 ) -> None:
-    """A task.yaml read in the trajectory yields a flagged report; scoring is untouched.
+    """A task.yaml read in the trajectory yields a flagged report; this step scores nothing.
 
-    Flag-only contract: the report is annotation for human review, so
-    ``scores`` and ``validated`` must be byte-identical to what an
-    undetected run would carry.
+    The annotation pass is pure: it writes ``cheating_report`` and leaves
+    every other field byte-identical to what an undetected run would carry.
+    The score consequence belongs to ``IntegrityMetric`` in the later scoring
+    pass, not here, and ``validated`` is never touched by either.
     """
     record = _run_with_fake_agent(tmp_path, "fake-sensitive-reader")
 
@@ -854,7 +855,7 @@ def test_run_flags_sensitive_access_without_touching_scores(
     assert "task-definition" in report["categories"]
     assert "harness-repo" in report["categories"]
     assert report["findings"][0]["trajectory_index"] == 0
-    # Flag-only: nothing else about the record changes.
+    # The annotation pass alone: nothing else about the record changes.
     assert record["scores"] == {}
     assert record["validated"] is False
 

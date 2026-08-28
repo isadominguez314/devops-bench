@@ -187,9 +187,11 @@ class DefaultEvalHarness(Harness):
         self.no_teardown = no_teardown if no_teardown is not None else get_bool("BENCH_NO_TEARDOWN")
         # Resolved once so capabilities and scoring observe the same value.
         self.use_mcp: bool = get_bool("BENCH_USE_MCP", True)
-        # Trajectory-based cheating detection is flag-only: it annotates each
-        # record with a ``cheating_report`` and never touches scores or
-        # ``validated``. Extra rules load from an optional YAML file — loaded
+        # Trajectory-based cheating detection annotates each record with a
+        # ``cheating_report`` and never touches ``validated``. The report is
+        # not inert, though: ``IntegrityMetric`` reads it during the later
+        # scoring pass and gates a flagged run's ``OutcomeScore`` to zero.
+        # Extra rules load from an optional YAML file — loaded
         # here so a bad BENCH_CHEAT_RULES path fails loud at construction
         # (an operator config error) instead of being swallowed by the
         # best-effort scan at the end of the run.
@@ -674,9 +676,11 @@ class DefaultEvalHarness(Harness):
         detailed_results: list[dict[str, Any]] = [self._run_one(task, run_dir) for task in tasks]
 
         # Annotate sensitive-access flags before the first write so both the
-        # raw and the scored results.json carry the report. Best-effort and
-        # flag-only, per record: a detector failure leaves that record's
-        # seeded empty report and moves on to the next.
+        # raw and the scored results.json carry the report, and because
+        # ``_score`` below reads it. Best-effort per record: a detector failure
+        # leaves that record's seeded empty report and moves on to the next —
+        # which also leaves that record ungated, since an absent verdict is an
+        # abstention rather than a zero.
         if self.cheat_detect:
             # Per record: a home entry the task prompt itself names (the
             # GitOps repo to push to, the deliverable to write) is
@@ -1131,8 +1135,9 @@ class DefaultEvalHarness(Harness):
             "recoverable_safety": list(task.recoverable_safety),
             "chaos_report": {},
             "perf_report": {},
-            # Populated by the flag-only cheat detector in ``run`` (empty when
-            # detection is disabled or fails); never consulted by scoring.
+            # Populated by the cheat detector in ``run`` (empty when detection
+            # is disabled or fails). Read by ``IntegrityMetric``, which gates a
+            # flagged run to zero and abstains on this empty seed.
             "cheating_report": {},
             "documentation": [doc.model_dump() for doc in task.documentation],
             "capabilities_granted": {
