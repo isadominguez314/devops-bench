@@ -21,6 +21,8 @@ from devops_bench.detection.detector import (
     scan_record,
 )
 from devops_bench.detection.inventory import (
+    DEFAULT_BASELINE,
+    baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
 )
@@ -31,11 +33,13 @@ from devops_bench.detection.rules import (
 )
 
 __all__ = [
+    "DEFAULT_BASELINE",
     "DEFAULT_RULES",
     "DETECTOR_VERSION",
     "REPORT_SCHEMA_VERSION",
     "SensitiveAccessRule",
     "annotate_records",
+    "baseline_from_granted_paths",
     "build_inventory_rules",
     "filter_rules_for_prompt",
     "load_ruleset",

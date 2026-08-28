@@ -118,6 +118,11 @@ def _scan_text(
     """
     if budget <= 0 or not text:
         return budget
+    # One finding per pattern per surface, not per occurrence: ``budget`` is
+    # spent across the whole record, so letting a single ``find`` output emit
+    # 20 near-identical excerpts would crowd out the evidence that the agent
+    # also touched the material at trajectory entries 12, 19 and 30. Breadth
+    # of evidence beats depth for the reviewer this report is written for.
     for pattern in rule.patterns:
         match = _compile(pattern).search(text)
         if match is None:

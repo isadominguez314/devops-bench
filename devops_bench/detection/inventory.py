@@ -43,13 +43,16 @@ leftover from one task would go uncovered while a different task ran.
 
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from devops_bench.detection.rules import SCAN_FIELDS, SensitiveAccessRule
 
 __all__ = [
     "DEFAULT_BASELINE",
+    "baseline_from_granted_paths",
     "build_inventory_rules",
     "filter_rules_for_prompt",
 ]
@@ -58,14 +61,14 @@ __all__ = [
 # inventory findings from the static ruleset at a glance.
 CATEGORY = "prior-run-artifact"
 
-# Top-level home entries that belong to the provisioned bastion environment
+# Top-level home entries that belong to the provisioned harness environment
 # rather than to any run. Hidden entries (dotfiles) are always baseline; the
 # harness-owned ones here are already covered by static rules where they
-# matter (bench.env, matrix-runs). Extend via the ``baseline`` parameter of
-# :func:`build_inventory_rules`.
-DEFAULT_BASELINE: frozenset[str] = frozenset(
-    {"bench.env", "bin", "devops-bench", "gke-mcp-repo", "matrix-runs"}
-)
+# matter (bench.env, matrix-runs). Deliberately limited to names this project
+# itself creates: anything an operator's own host layout adds belongs in the
+# ``baseline`` parameter of :func:`build_inventory_rules`, not here — see
+# :func:`baseline_from_granted_paths` for the capability case.
+DEFAULT_BASELINE: frozenset[str] = frozenset({"bench.env", "bin", "devops-bench", "matrix-runs"})
 
 # Fingerprinting bounds: leftovers are notes/manifests, not datasets. A file
 # past the size cap is skipped (its path rule still applies); short lines are
@@ -100,7 +103,7 @@ def _fingerprint_lines(path: Path) -> tuple[str, ...]:
     """Return the most distinctive lines of a small text file, or nothing.
 
     Unreadable, oversized, or binary files yield no fingerprint — their path
-    rule (when not excluded) still covers them.
+    rule still covers them.
     """
     try:
         if path.stat().st_size > _MAX_FINGERPRINT_BYTES:
@@ -127,6 +130,49 @@ def _content_rule(name: str, lines: tuple[str, ...]) -> SensitiveAccessRule:
         patterns=tuple(re.escape(line) for line in lines),
         fields=("result", "output"),
     )
+
+
+def baseline_from_granted_paths(home: Path, paths: Iterable[str]) -> frozenset[str]:
+    """Home entries that hold a granted capability, as baseline names.
+
+    A capability the harness hands the agent — a skills tree from
+    ``AGENT_SKILLS_PATHS``, say — is material the run is *told* to read, so
+    the home entry containing it is provisioned environment rather than a
+    prior-run leftover. Without this, every honest run of an arm that grants a
+    skills tree living under the home would flag for using it.
+
+    Derived rather than enumerated on purpose: hard-coding the operator's own
+    directory names here would bake one host's layout into the detector and
+    silently mis-flag every other one.
+
+    Paths outside ``home`` (``/opt/skills/...``) contribute nothing — there is
+    no home entry to exempt, and the inventory never saw them. Only the
+    top-level component is taken, which is as fine-grained as the path rules
+    themselves get: granting ``~/skills-repo/skills`` exempts ``skills-repo``.
+
+    Args:
+        home: The agent's home directory, as passed to
+            :func:`build_inventory_rules`.
+        paths: Granted capability paths, ``~``-expandable.
+
+    Returns:
+        Top-level ``home`` entry names to union into the baseline. Empty when
+        nothing was granted from inside the home.
+    """
+    names: set[str] = set()
+    for raw in paths:
+        if not raw:
+            continue
+        try:
+            granted = Path(os.path.abspath(os.path.expanduser(raw)))
+            relative = granted.relative_to(home)
+        except (OSError, ValueError):
+            # Not under home, or unresolvable: no entry to exempt. Failing
+            # closed here only costs a flag a reviewer can dismiss.
+            continue
+        if relative.parts:
+            names.add(relative.parts[0])
+    return frozenset(names)
 
 
 def build_inventory_rules(
@@ -167,7 +213,10 @@ def build_inventory_rules(
     home_pattern = _home_prefixes(home)
     rules.extend(_path_rule(p.name, home_pattern) for p in leftovers)
     for entry in leftovers:
-        if not entry.is_file():
+        # ``is_file()`` follows links, so a leftover symlink would pull an
+        # arbitrary readable file's lines into a pattern — and patterns are
+        # published in the report. The path rule still covers the link itself.
+        if entry.is_symlink() or not entry.is_file():
             continue
         lines = _fingerprint_lines(entry)
         if lines:

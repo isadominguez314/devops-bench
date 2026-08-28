@@ -46,8 +46,10 @@ from devops_bench.core import (
 )
 from devops_bench.deployers.factory import get_deployer
 from devops_bench.detection import (
+    DEFAULT_BASELINE,
     SensitiveAccessRule,
     annotate_records,
+    baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
     load_ruleset,
@@ -652,7 +654,14 @@ class DefaultEvalHarness(Harness):
         inventory_rules: tuple[SensitiveAccessRule, ...] = ()
         if self.cheat_detect and self.cheat_inventory:
             try:
-                inventory_rules = build_inventory_rules(Path.home())
+                home = Path.home()
+                # Skills granted to the agent are material it is told to read,
+                # so the home entry holding them is environment, not leftover.
+                inventory_rules = build_inventory_rules(
+                    home,
+                    baseline=DEFAULT_BASELINE
+                    | baseline_from_granted_paths(home, self._granted_skill_paths),
+                )
                 if inventory_rules:
                     _log.info(
                         "cheat detection: %d prior-run-artifact rule(s) from the "

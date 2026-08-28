@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from devops_bench.detection import (
+    DEFAULT_BASELINE,
+    baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
     scan_record,
@@ -129,6 +131,61 @@ def test_leftover_deliverable_is_covered_when_the_task_does_not_name_it(
     filtered = filter_rules_for_prompt(rules, unrelated_prompt)
     report = scan_record(_record([_exec("cat ~/report.md")]), filtered)
     assert report["status"] == "flagged"
+
+
+def test_granted_skills_tree_is_baseline_not_leftover(tmp_path: Path) -> None:
+    """An arm granting a skills tree under the home must not flag for using it.
+
+    The path is derived from what the harness granted rather than hard-coded,
+    so any operator's directory name works — no host layout is baked in.
+    """
+    home = _seed_home(tmp_path)
+    (home / "skills-repo").mkdir()
+    granted = (str(home / "skills-repo" / "skills"),)
+
+    baseline = DEFAULT_BASELINE | baseline_from_granted_paths(home, granted)
+    assert "skills-repo" in baseline
+    rules = build_inventory_rules(home, baseline=baseline)
+    assert "skills-repo" not in [r.source for r in rules]
+    read = _record([_exec("cat ~/skills-repo/skills/kubectl/SKILL.md")])
+    assert scan_record(read, rules)["status"] == "clean"
+    # Unrelated leftovers keep their rules.
+    assert scan_record(_record([_exec("cat ~/policies.yaml")]), rules)["status"] == "flagged"
+
+
+def test_granted_paths_outside_home_exempt_nothing(tmp_path: Path) -> None:
+    """``/opt/skills`` has no home entry to exempt, and neither does an empty
+    or unresolvable entry — the baseline must stay empty rather than widen."""
+    assert baseline_from_granted_paths(tmp_path, ("/opt/skills/devops", "", "relative/path")) == (
+        frozenset()
+    )
+
+
+def test_granted_paths_expand_home_shorthand(tmp_path: Path) -> None:
+    """``AGENT_SKILLS_PATHS`` accepts ``~/...``, so the mapping must expand it."""
+    assert baseline_from_granted_paths(Path.home(), ("~/skills-repo/skills",)) == frozenset(
+        {"skills-repo"}
+    )
+
+
+def test_symlinked_leftover_is_not_fingerprinted(tmp_path: Path) -> None:
+    """A leftover symlink must not pull its target's lines into a pattern.
+
+    ``Path.is_file()`` follows links, so a link to any readable file would
+    otherwise embed that file's content in the generated rules — and patterns
+    are published in the record's report. The link keeps its path rule.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    secret = tmp_path / "outside" / "credentials"
+    secret.parent.mkdir()
+    secret.write_text("client_secret: a-very-long-and-distinctive-value\n", encoding="utf-8")
+    (home / "notes.txt").symlink_to(secret)
+
+    rules = build_inventory_rules(home)
+    assert [r.source for r in rules] == ["notes.txt"]  # path rule only, no content rule
+    assert not any("client_secret" in p for r in rules for p in r.patterns)
+    assert scan_record(_record([_exec("cat ~/notes.txt")]), rules)["status"] == "flagged"
 
 
 def test_same_name_outside_home_is_not_flagged(tmp_path: Path) -> None:
