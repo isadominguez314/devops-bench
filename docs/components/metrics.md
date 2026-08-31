@@ -58,7 +58,7 @@ These four are **bare numbers** in `results.json`, not `{"score", …}` objects 
 
 Emitted by [`integrity.py`](../../devops_bench/metrics/integrity.py) from the report that [cheating detection](detection.md) attaches to every record. Three things follow from how it is keyed and gated:
 
-- **No task opts in.** Integrity is not a property a task declares, so unlike every key above it applies to all of them.
+- **No task opts in.** Integrity is not a property a task declares, so unlike every key above it applies to all of them. Because the gate is deterministic, it also does not depend on the judge: if `get_judge_model()` fails (bad `JUDGE_PROVIDER`, missing key), the harness scores the deterministic metrics with no judge rather than abandoning the batch, so a judge outage cannot leave a cheating run ungated. One exception it cannot cover: a `status: "failed"` record is never scored at all — see the [detection limitation](detection.md#known-limitations).
 - **It is a second, distinct catastrophic key** rather than a reuse of `VerificationCatastrophic`. The scores map is last-write-wins, so a clean integrity check sharing that key would silently overwrite a real task catastrophic. Keeping them apart also means the key name *is* the failure type.
 - **Silence is not a pass.** A `no_data` report (an errored run detection had nothing to scan) or a missing report (detection disabled) emits *nothing* rather than `1.0`, so absence of evidence never reads as a clean bill of health.
 

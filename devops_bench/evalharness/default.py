@@ -1234,5 +1234,19 @@ class DefaultEvalHarness(Harness):
         # Lazy import keeps ``deepeval`` / provider SDKs out of harness import.
         from devops_bench.metrics import evaluate_metrics_batch, get_judge_model
 
-        judge_model = self._judge_model or get_judge_model()
+        try:
+            judge_model = self._judge_model or get_judge_model()
+        except Exception:  # noqa: BLE001 - a judge outage must not unscore the batch
+            # Building the judge reads provider config and constructs a client,
+            # so a bad JUDGE_PROVIDER or a missing key raises here. Letting that
+            # propagate would abort scoring for the whole batch — including the
+            # deterministic metrics, which need no judge at all. That matters
+            # beyond convenience: the catastrophic gates (task safeguards and
+            # the benchmark-integrity check) are deterministic, so an unrelated
+            # judge outage would otherwise leave a cheating run ungated and its
+            # ``outcomeScore`` null, dropping it out of leaderboard aggregates.
+            # Judge-backed metrics fail individually on the ``None`` and are
+            # isolated by the pipeline's per-metric guard.
+            _log.exception("judge unavailable; scoring deterministic metrics only")
+            judge_model = None
         evaluate_metrics_batch(scorable, judge_model, use_mcp=self.use_mcp)

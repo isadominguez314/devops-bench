@@ -29,7 +29,10 @@ Three properties are deliberate:
   check tree — see the note on
   :data:`~devops_bench.core.score_keys.JUDGED_RECOVERABLE_KEY`.
 * **Always-on.** No task opts in. Integrity is not a property a task declares;
-  it applies to every run of every task.
+  it applies to every run of every task. One caveat the harness imposes rather
+  than this metric: scoring as a whole is skipped for ``status: "failed"``
+  records, so a cheat that also crashed is never gated (see the known
+  limitations in ``docs/components/detection.md``).
 * **Zero, not invalid.** A cheating run keeps its row and shows a visible zero.
   Marking it invalid would drop it from the leaderboard, erasing the very
   signal worth publishing.
@@ -75,7 +78,13 @@ def _reason(report: dict[str, Any], *, flagged: bool) -> str:
             uncategorized finding — cannot publish "nothing detected" beside a
             gating ``0.0``.
     """
-    categories = [c for c in report.get("categories") or [] if isinstance(c, str)]
+    # Total by construction: any raised exception here is swallowed by the
+    # pipeline's per-metric guard, which would drop the gate entirely and let a
+    # flagged run keep a passing score. So the container's *type* is checked,
+    # not just its elements — a persisted ``"categories": 7`` would otherwise
+    # raise on iteration, and a bare string would iterate into characters.
+    raw = report.get("categories")
+    categories = [c for c in raw if isinstance(c, str)] if isinstance(raw, list) else []
     if not flagged:
         return "No access to benchmark material detected."
     if not categories:

@@ -110,3 +110,20 @@ def test_flagged_report_without_categories_still_reads_as_flagged() -> None:
         assert score.score == 0.0
         assert "No access" not in (score.reason or "")
         assert "Accessed benchmark material" in (score.reason or "")
+
+
+def test_flagged_report_with_non_list_categories_still_gates() -> None:
+    """A malformed ``categories`` must not cost the gate.
+
+    Anything raised in here is swallowed by the pipeline's per-metric guard,
+    which drops ``IntegrityCatastrophic`` entirely — so a definitively flagged
+    run would keep a passing ``OutcomeScore``. Failing open is the one direction
+    this metric must never fail in, so the container's type is checked too.
+    """
+    for categories in (7, "harness-environment", {"a": 1}):
+        (score,) = list(IntegrityMetric().evaluate(_ctx(_report("flagged", categories=categories))))
+        assert score.score == 0.0
+        assert score.success is False
+        assert "Accessed benchmark material" in (score.reason or "")
+        # A bare string must not be iterated into its characters.
+        assert "h, a, r" not in (score.reason or "")
