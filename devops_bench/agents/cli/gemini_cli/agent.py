@@ -241,12 +241,20 @@ class GeminiCliAgent(AgentHarness):
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
             try:
-                completed = run(
+                # Through the sandbox seam: containerised when
+                # ``config.sandbox`` is set, byte-identical to a direct
+                # ``run(...)`` call otherwise. The module-level ``run`` rides
+                # along as the host-path executor. The overlay is the RESOLVED
+                # configuration (provider-routed api key, GEMINI_MODEL, the
+                # OTLP disables), so it is exactly what should cross a sandbox
+                # boundary — by value, never as inherited process env.
+                completed = self.run_agent_cmd(
                     argv,
                     extra_env=env_overlay,
                     cwd=workdir,
                     check=False,
                     timeout=self.config.timeout_sec,
+                    host_run=run,
                 )
             except SubprocessError as exc:
                 return AgentResult.errored(f"gemini subprocess error: {exc}")

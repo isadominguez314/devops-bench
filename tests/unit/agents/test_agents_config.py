@@ -138,3 +138,20 @@ def test_capabilities_constructor_is_harness_friendly() -> None:
     assert cfg.capabilities.allowed_tools == ("list",)
     assert cfg.capabilities.skills.paths == ("/opt/skills",)
     assert cfg.capabilities.rules.text == "you are a sre"
+
+
+def test_from_env_sandbox_defaults_to_none() -> None:
+    """Flag off must mean flag off: an unset env yields no sandbox spec, and
+    ``run_agent_cmd`` stays a plain passthrough."""
+    assert AgentConfig.from_env({}).sandbox is None
+
+
+def test_from_env_reads_the_sandbox_opt_in_and_image() -> None:
+    cfg = AgentConfig.from_env(
+        {"BENCH_AGENT_SANDBOX": "docker", "BENCH_SANDBOX_IMAGE": "agent-sandbox:dev"}
+    )
+    assert cfg.sandbox is not None
+    assert cfg.sandbox.image == "agent-sandbox:dev"
+    # from_env yields the skeletal spec; the eval harness completes it per task.
+    assert cfg.sandbox.workspace is None
+    assert cfg.sandbox.kubeconfig is None

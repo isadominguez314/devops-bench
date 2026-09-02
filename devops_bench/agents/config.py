@@ -26,6 +26,7 @@ from devops_bench.agents.capabilities import (
     McpBinding,
     SkillBinding,
 )
+from devops_bench.agents.sandbox import SandboxSpec, spec_from_env
 from devops_bench.core import get_env, get_int
 
 __all__ = ["AgentConfig"]
@@ -103,6 +104,12 @@ class AgentConfig:
             catalog (no GKE-specific strings live in agent code).
         extra_env: Provider-agnostic env overlay forwarded to subprocess calls.
             Concrete agents may add their own provider-specific keys on top.
+        sandbox: Sandbox spec when the run opted into containerised agent
+            execution (``BENCH_AGENT_SANDBOX``), else ``None`` — the flag-off
+            default, under which ``AgentHarness.run_agent_cmd`` is a plain
+            passthrough to ``core.subprocess.run``. ``from_env`` yields a
+            skeletal spec (image only); the eval harness completes it per
+            task once the workspace and cluster exist.
     """
 
     model: str | None = None
@@ -113,6 +120,7 @@ class AgentConfig:
     max_turns: int | None = None
     capabilities: AllCapabilities = field(default_factory=AllCapabilities)
     extra_env: Mapping[str, str] = field(default_factory=dict)
+    sandbox: SandboxSpec | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
@@ -122,8 +130,11 @@ class AgentConfig:
         ``AGENT_TARGET`` / ``AGENT_TIMEOUT_SEC`` / ``AGENT_MAX_TURNS`` and
         delegates capability construction (``AGENT_MCP_SERVER`` /
         ``AGENT_ALLOWED_TOOLS`` / ``AGENT_SKILLS_PATHS`` / ``AGENT_RULES_TEXT``)
-        to :func:`_build_capabilities_from_env`. A missing variable yields the
-        dataclass default — this method never raises on unset variables.
+        to :func:`_build_capabilities_from_env`, and the sandbox opt-in
+        (``BENCH_AGENT_SANDBOX`` / ``BENCH_SANDBOX_IMAGE``) to
+        :func:`~devops_bench.agents.sandbox.spec_from_env`. A missing variable
+        yields the dataclass default — this method never raises on unset
+        variables.
 
         Args:
             env: Optional mapping to read from (defaults to ``os.environ``).
@@ -142,4 +153,5 @@ class AgentConfig:
             timeout_sec=float(timeout) if timeout is not None else 600.0,
             max_turns=max_turns,
             capabilities=_build_capabilities_from_env(env),
+            sandbox=spec_from_env(env),
         )
