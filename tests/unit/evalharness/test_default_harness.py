@@ -1021,6 +1021,193 @@ def test_run_survives_detector_failure(
     assert len(run_dirs) == 1 and (run_dirs[0] / "results.json").exists()
 
 
+# -- sandbox wiring ----------------------------------------------------------
+
+
+def _sandboxed_harness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **kwargs: Any
+) -> DefaultEvalHarness:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_SANDBOX_IMAGE", "agent-sandbox:test")
+    return DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results"), **kwargs
+    )
+
+
+def test_agent_config_snapshot_carries_the_sandbox_opt_in(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The snapshot rebuild must not drop the ``sandbox`` field on the floor."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    assert harness.build_agent_config().sandbox is not None
+    assert harness.build_agent_config().sandbox.image == "agent-sandbox:test"
+
+
+def test_agent_config_snapshot_has_no_sandbox_when_flag_off(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    harness = DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results")
+    )
+    assert harness.build_agent_config().sandbox is None
+
+
+def test_prepare_sandbox_spec_completes_the_skeletal_spec(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devops_bench.agents.sandbox import NetworkPlan
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    plan = NetworkPlan(docker_network="kind", rewrite_server="https://c1-control-plane:6443")
+    kubeconfig = tmp_path / "creds" / "kubeconfig"
+
+    def fake_build_kubeconfig(got_plan: Any, dest_dir: Path) -> Path:
+        assert got_plan is plan
+        assert dest_dir == tmp_path / "creds"
+        return kubeconfig
+
+    plan_requests: list[str] = []
+
+    def fake_build_network_plan(cluster_name: str) -> Any:
+        plan_requests.append(cluster_name)
+        return plan
+
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "build_network_plan", fake_build_network_plan
+    )
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "build_agent_kubeconfig", fake_build_kubeconfig
+    )
+    monkeypatch.setattr(
+        harness_default.agent_sandbox,
+        "discover_fixture_mounts",
+        lambda cluster: {"/home/op/repo-c1.git": "/workspace/home/repo-c1.git"},
+    )
+
+    workspace = tmp_path / "workspace-x"
+    workspace.mkdir()
+    (tmp_path / "creds").mkdir()
+    spec = harness._prepare_sandbox_spec(workspace, tmp_path / "creds", "c1")  # noqa: SLF001
+
+    # The sandbox home exists on the host before the agent runs (it is both
+    # the container HOME mountpoint and the detection inventory root).
+    assert (workspace / "home").is_dir()
+    assert spec.image == "agent-sandbox:test"
+    assert spec.network is plan
+    assert spec.workspace == workspace
+    assert spec.kubeconfig == kubeconfig
+    assert spec.fixture_mounts == {"/home/op/repo-c1.git": "/workspace/home/repo-c1.git"}
+    # The run's own cluster name pins the plan (and through it the
+    # kubeconfig), never the ambient current-context.
+    assert plan_requests == ["c1"]
+
+
+def test_build_agent_config_overlays_the_active_sandbox_spec(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace as dc_replace
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    completed = dc_replace(
+        harness.build_agent_config().sandbox, workspace=tmp_path, kubeconfig=tmp_path / "kc"
+    )
+
+    harness._active_sandbox_spec = completed  # noqa: SLF001
+    overlaid = harness.build_agent_config()
+    assert overlaid.sandbox is completed
+    # Everything else still reads from the one snapshot.
+    assert overlaid.capabilities is harness._agent_config.capabilities  # noqa: SLF001
+
+    harness._active_sandbox_spec = None  # noqa: SLF001
+    assert harness.build_agent_config() is harness._agent_config  # noqa: SLF001
+
+
+def test_inventory_sandbox_home_records_rules_per_task(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sandbox home replaces the operator home as the inventory root:
+    a leftover seeded there is flagged, and a fresh home yields the empty
+    ruleset (correct by construction, not a skipped scan)."""
+    monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+
+    dirty_home = tmp_path / "ws-dirty" / "home"
+    dirty_home.mkdir(parents=True)
+    (dirty_home / "report.md").write_text("prior-run leftover fingerprint line\n" * 3)
+    harness._inventory_sandbox_home("dirty-task", dirty_home)  # noqa: SLF001
+    assert harness._sandbox_inventory_rules["dirty-task"]  # noqa: SLF001
+
+    fresh_home = tmp_path / "ws-fresh" / "home"
+    fresh_home.mkdir(parents=True)
+    harness._inventory_sandbox_home("fresh-task", fresh_home)  # noqa: SLF001
+    assert harness._sandbox_inventory_rules["fresh-task"] == ()  # noqa: SLF001
+
+
+def test_inventory_covers_fixture_mounts_at_their_container_paths(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fixture mounts only materialize inside the container, so the host-side
+    home scan cannot see them; each mounted name must get a container-path
+    rule, and the prompt filter must drop exactly the ones the task names."""
+    import re
+
+    from devops_bench.cheat_detection import filter_rules_for_prompt
+
+    monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+
+    home = tmp_path / "ws" / "home"
+    home.mkdir(parents=True)
+    harness._inventory_sandbox_home(  # noqa: SLF001
+        "t",
+        home,
+        {
+            "/home/op/opa-repo-c1.git": "/workspace/home/opa-repo-c1.git",
+            "/home/op/stale-notes-c1.md": "/workspace/home/stale-notes-c1.md",
+        },
+    )
+    rules = harness._sandbox_inventory_rules["t"]  # noqa: SLF001
+    assert {r.source for r in rules} == {"opa-repo-c1.git", "stale-notes-c1.md"}
+    # The rules match the container-side spellings the trajectory records.
+    repo_rule = next(r for r in rules if r.source == "opa-repo-c1.git")
+    assert re.search(repo_rule.patterns[0], "cat /workspace/home/opa-repo-c1.git/config")
+    assert re.search(repo_rule.patterns[0], "git clone ~/opa-repo-c1.git")
+
+    # A prompt naming the repo authorizes it for that record; the mount the
+    # prompt never asked for (a leftover swept in by the token glob) stays.
+    surviving = filter_rules_for_prompt(rules, "Fix the policy and push to '~/opa-repo-c1.git'.")
+    assert {r.source for r in surviving} == {"stale-notes-c1.md"}
+
+
+def test_stray_container_sweep_is_skipped_under_parallel(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep matches on the shared name prefix and cannot tell a stray
+    from a sibling harness's live container, so BENCH_PARALLEL must skip it."""
+    monkeypatch.setenv("BENCH_PARALLEL", "1")
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    swept: list[bool] = []
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
+    )
+    harness.run([])
+    assert swept == []
+
+
+def test_stray_container_sweep_runs_when_not_parallel(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    swept: list[bool] = []
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
+    )
+    harness.run([])
+    assert swept == [True]
+
+
 class _BatchContaminatingAgent(AgentHarness):
     """Task 1 leaves a deliverable in the home; task 2 reads it back.
 
@@ -1093,100 +1280,40 @@ def test_inventory_is_resnapshotted_between_tasks(
     assert "prior-run-artifact" in report["categories"]
 
 
-class _CollidingDeliverableAgent(AgentHarness):
-    """Call 1 writes a deliverable; call 2 reads its content back.
+def test_mid_batch_entry_is_not_fingerprinted(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An entry created during the batch gets a path rule but no fingerprint.
 
-    The read returns the file's lines in ``result``, so only a content
-    fingerprint can catch it when the second task's prompt names the entry
-    and the path rule is therefore dropped. Class-level state because the
-    registry constructs its own instance per task.
+    Fingerprints are unfilterable, so fingerprinting task 1's honest report
+    would flag a later iteration that merely worded its own report the same
+    way. Only the run-start leftovers may contribute content patterns.
     """
-
-    home: Path
-    calls: int = 0
-
-    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
-        type(self).calls += 1
-        report = self.home / "shared-report.md"
-        if type(self).calls == 1:
-            report.write_text(
-                "# Findings\n- set privileged to false on team-alpha/cache\n",
-                encoding="utf-8",
-            )
-            command, result = "write ~/shared-report.md", None
-        else:
-            command, result = "cat ~/shared-report.md", report.read_text(encoding="utf-8")
-        return AgentResult(
-            output="done",
-            trajectory=[
-                ToolCall(
-                    name="exec", args={"command": command}, result=result, status="completed"
-                ).to_dict()
-            ],
-        )
-
-
-def _run_colliding_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, second_task_name: str
-) -> list[dict[str, Any]]:
-    """Run a two-task batch where both prompts name the shared deliverable."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
 
-    _CollidingDeliverableAgent.home = fake_home
-    _CollidingDeliverableAgent.calls = 0
-    AGENTS.register("fake-colliding-deliverable")(_CollidingDeliverableAgent)
+    _BatchContaminatingAgent.home = fake_home
+    _BatchContaminatingAgent.calls = 0
+    AGENTS.register("fake-batch-fingerprint")(_BatchContaminatingAgent)
     try:
         harness = DefaultEvalHarness(
             project_id="p",
             cluster_name="c",
-            agent_type="fake-colliding-deliverable",
+            agent_type="fake-batch-fingerprint",
             no_infra=True,
             results_root=str(tmp_path / "results"),
         )
-        prompt = "Write your findings to '~/shared-report.md'."
-        return harness.run(
+        harness.run(
             [
-                Task.from_dict({"task_id": "t1", "name": "writer", "prompt": prompt}),
-                Task.from_dict({"task_id": "t2", "name": second_task_name, "prompt": prompt}),
+                Task.from_dict({"task_id": "t1", "name": "writer", "prompt": "do the work"}),
+                Task.from_dict({"task_id": "t2", "name": "reader", "prompt": "do other work"}),
             ]
         )
+        rules = harness._inventory_home(fingerprint_only=frozenset())  # noqa: SLF001
     finally:
-        AGENTS._items.pop("fake-colliding-deliverable", None)  # noqa: SLF001
+        AGENTS._items.pop("fake-batch-fingerprint", None)  # noqa: SLF001
 
-
-def test_prompt_named_mid_batch_entry_is_caught_by_content_fingerprint(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A different task reading task 1's deliverable flags on content alone.
-
-    The reader's prompt names the entry, so its path rule is dropped — the
-    fingerprint built from task 1's file is the only remaining coverage, and
-    it must exist for a *differently named* task.
-    """
-    results = _run_colliding_batch(tmp_path, monkeypatch, second_task_name="reader")
-
-    assert results[0]["cheating_report"]["status"] == "clean"
-    report = results[1]["cheating_report"]
-    assert report["status"] == "flagged"
-    assert "prior-run-artifact" in report["categories"]
-    # The catch came from content surfacing in the tool result, not the path.
-    assert {f["field"] for f in report["findings"]} == {"result"}
-
-
-def test_same_task_repeat_is_not_fingerprinted(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An honest repeat of the same task must not flag on shared wording.
-
-    Fingerprints are unfilterable, so fingerprinting task 1's report would
-    flag a later iteration of the *same* task that merely reproduced its own
-    deliverable's lines. Identical batch to the test above except the second
-    task's name — that one difference is the whole exemption.
-    """
-    results = _run_colliding_batch(tmp_path, monkeypatch, second_task_name="writer")
-
-    assert results[0]["cheating_report"]["status"] == "clean"
-    assert results[1]["cheating_report"]["status"] == "clean"
+    assert "task-1-report.md" in {r.source for r in rules if r.source}
+    assert not any("team-alpha/cache" in p for r in rules for p in r.patterns)
