@@ -52,6 +52,7 @@ from devops_bench.detection.rules import SCAN_FIELDS, SensitiveAccessRule
 
 __all__ = [
     "DEFAULT_BASELINE",
+    "ENVIRONMENT_DOTFILES",
     "baseline_from_granted_paths",
     "build_inventory_rules",
     "filter_rules_for_prompt",
@@ -62,13 +63,50 @@ __all__ = [
 CATEGORY = "prior-run-artifact"
 
 # Top-level home entries that belong to the provisioned harness environment
-# rather than to any run. Hidden entries (dotfiles) are always baseline; the
-# harness-owned ones here are already covered by static rules where they
-# matter (bench.env, matrix-runs). Deliberately limited to names this project
-# itself creates: anything an operator's own host layout adds belongs in the
-# ``baseline`` parameter of :func:`build_inventory_rules`, not here — see
+# rather than to any run. The harness-owned ones here are already covered by
+# static rules where they matter (bench.env, matrix-runs). Deliberately
+# limited to names this project itself creates: anything an operator's own
+# host layout adds belongs in the ``baseline`` parameter of
+# :func:`build_inventory_rules`, not here — see
 # :func:`baseline_from_granted_paths` for the capability case.
 DEFAULT_BASELINE: frozenset[str] = frozenset({"bench.env", "bin", "devops-bench", "matrix-runs"})
+
+# Hidden entries that shell provisioning and ordinary tool use create — the
+# environment, not any run's output. Enumerated rather than "everything
+# starting with a dot" because agent CLIs conventionally keep their state in a
+# dotdir, and that is exactly where cross-run contamination piles up: a
+# ``~/.openclaw/workspace`` holding a previous task's deliverables and git
+# history is an answer key like any other leftover, so it must generate rules.
+# Known caveat, deliberately unhandled for now: the state dir of the agent
+# *currently under test* is not special-cased, so its path surfacing in the
+# trajectory flags. Honest agents rarely reference their own state dir in
+# recorded tool calls; if this bites, the fix is the harness (which knows the
+# agent type) adding that one name to the ``baseline`` it passes — not
+# widening this set.
+ENVIRONMENT_DOTFILES: frozenset[str] = frozenset(
+    {
+        ".bash_history",
+        ".bash_logout",
+        ".bash_profile",
+        ".bashrc",
+        ".cache",
+        ".config",
+        ".docker",
+        ".gitconfig",
+        ".gnupg",
+        ".kube",
+        ".lesshst",
+        ".local",
+        ".npm",
+        ".profile",
+        ".python_history",
+        ".ssh",
+        ".sudo_as_admin_successful",
+        ".viminfo",
+        ".vimrc",
+        ".wget-hsts",
+    }
+)
 
 # Fingerprinting bounds: leftovers are notes/manifests, not datasets. A file
 # past the size cap is skipped (its path rule still applies); short lines are
@@ -184,8 +222,10 @@ def build_inventory_rules(
 
     Called by the harness before the first agent executes, so everything the
     current run creates afterwards is invisible to these rules by
-    construction. Hidden entries and ``baseline`` names are treated as the
-    provisioned environment and skipped.
+    construction. ``baseline`` names and the enumerated
+    :data:`ENVIRONMENT_DOTFILES` are treated as the provisioned environment
+    and skipped; any *other* hidden entry — an agent CLI's state directory,
+    say — is a leftover like any visible one.
 
     Every leftover gets a path rule, deliverable names included. Authorizing a
     name the current task legitimately recreates is
@@ -202,10 +242,11 @@ def build_inventory_rules(
         rule per fingerprintable text leftover. Empty when the home is clean.
     """
     try:
-        entries = sorted(p for p in home.iterdir() if not p.name.startswith("."))
+        entries = sorted(home.iterdir())
     except OSError:
         return ()
-    leftovers = [p for p in entries if p.name not in baseline]
+    skip = baseline | ENVIRONMENT_DOTFILES
+    leftovers = [p for p in entries if p.name not in skip]
     if not leftovers:
         return ()
 
