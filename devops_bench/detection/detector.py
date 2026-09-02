@@ -49,8 +49,12 @@ __all__ = [
 # result/output payloads are JSON-dumped and scanned instead of skipped. v5:
 # path rules scan the result surface again — a benchmark path surfacing in an
 # `ls` listing now flags, because no legitimate task puts that material in
-# view. Reports below v5 are not comparable with v5 ones.
-DETECTOR_VERSION = 5
+# view. Reports below v5 are not comparable with v5 ones. v6: the pre-run
+# inventory no longer blanket-skips hidden home entries; only the enumerated
+# ENVIRONMENT_DOTFILES are baseline, so an agent-state dotdir left by a prior
+# run (a stale ~/.openclaw/workspace) now generates rules. v6 flags strictly
+# more than v5.
+DETECTOR_VERSION = 6
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1
 

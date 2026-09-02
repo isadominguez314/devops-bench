@@ -45,7 +45,7 @@ rules:
 
 ## Prior-run artifacts (dynamic rules)
 
-The agent home persists between runs, so earlier runs leave material behind — a previous `report.md` is an answer key for the next attempt. "Left by a prior run" is temporal, not lexical: this run's legitimate `report.md` write and a read of last run's leftover are the same string, so no static regex can separate them. Instead, [`devops_bench/detection/inventory.py`](../../devops_bench/detection/inventory.py) snapshots the home **before the first agent executes** and generates per-run `prior-run-artifact` rules from whatever is already there (hidden entries and a baseline of provisioned names — `bin`, `bench.env`, `devops-bench`, `matrix-runs` — are skipped):
+The agent home persists between runs, so earlier runs leave material behind — a previous `report.md` is an answer key for the next attempt. "Left by a prior run" is temporal, not lexical: this run's legitimate `report.md` write and a read of last run's leftover are the same string, so no static regex can separate them. Instead, [`devops_bench/detection/inventory.py`](../../devops_bench/detection/inventory.py) snapshots the home **before the first agent executes** and generates per-run `prior-run-artifact` rules from whatever is already there. A baseline of provisioned names (`bin`, `bench.env`, `devops-bench`, `matrix-runs`) and an enumerated set of environment dotfiles (`.bashrc`, `.cache`, `.config`, `.ssh`, `.kube`, …) are skipped — but *only* those: any other hidden entry is a leftover like any visible one, because agent CLIs conventionally keep their state in a dotdir and that is exactly where cross-run contamination accumulates (a stale `~/.openclaw/workspace` holds a previous task's deliverables and git history). One known caveat, deliberately unhandled: the state directory of the agent currently under test is not special-cased, so an honest agent that references its own state dir in a recorded tool call flags; if that bites in practice, the harness (which knows the agent type) should add that one name to the baseline it passes rather than the dotfile set widening. The generated rules are:
 
 - **Path rules**, anchored to home spellings (`~`, `$HOME`, the literal home path), so this run's own same-named files elsewhere (e.g. a fresh `/tmp` clone) never match. Like all path rules they scan every surface, so a leftover's name echoing through a directory listing flags too — the agent had no reason to be enumerating the home directory.
 - **Content fingerprints** for small text leftovers: their most distinctive lines, matched only against `result`/`output`. Reading the stale file reproduces those exact lines; writing a fresh file does not — so a stale `report.md` read is flagged even when the command that read it named some other path.
@@ -76,7 +76,7 @@ Each record carries a `cheating_report`:
 ```json
 {
   "schema_version": 1,
-  "detector_version": 5,
+  "detector_version": 6,
   "status": "flagged",
   "categories": ["harness-repo", "task-definition"],
   "findings": [

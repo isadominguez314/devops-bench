@@ -22,6 +22,7 @@ from devops_bench.detection.detector import (
 )
 from devops_bench.detection.inventory import (
     DEFAULT_BASELINE,
+    ENVIRONMENT_DOTFILES,
     baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
@@ -36,6 +37,7 @@ __all__ = [
     "DEFAULT_BASELINE",
     "DEFAULT_RULES",
     "DETECTOR_VERSION",
+    "ENVIRONMENT_DOTFILES",
     "REPORT_SCHEMA_VERSION",
     "SensitiveAccessRule",
     "annotate_records",
