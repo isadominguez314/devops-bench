@@ -26,6 +26,7 @@ from devops_bench.agents.capabilities import (
     McpBinding,
     SkillBinding,
 )
+from devops_bench.agents.sandbox import SandboxSpec, spec_from_env
 from devops_bench.core import get_env, get_int
 
 __all__ = ["AgentConfig"]
@@ -106,6 +107,12 @@ class AgentConfig:
             Concrete agents may add their own provider-specific keys on top.
         extra_flags: Optional CLI argument flags forwarded to the spawned agent
             subprocess; flows from ``AGENT_EXTRA_FLAGS``.
+        sandbox: Sandbox spec when the run opted into containerised agent
+            execution (``BENCH_AGENT_SANDBOX``), else ``None`` — the flag-off
+            default, under which ``AgentHarness.run_agent_cmd`` is a plain
+            passthrough to ``core.subprocess.run``. ``from_env`` yields a
+            skeletal spec (image only); the eval harness completes it per
+            task once the workspace and cluster exist.
     """
 
     model: str | None = None
@@ -117,6 +124,7 @@ class AgentConfig:
     capabilities: AllCapabilities = field(default_factory=AllCapabilities)
     extra_env: Mapping[str, str] = field(default_factory=dict)
     extra_flags: tuple[str, ...] = ()
+    sandbox: SandboxSpec | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> AgentConfig:
@@ -124,10 +132,12 @@ class AgentConfig:
 
         Reads ``AGENT_MODEL`` / ``AGENT_PROVIDER`` / ``AGENT_API_KEY`` /
         ``AGENT_TARGET`` / ``AGENT_TIMEOUT_SEC`` / ``AGENT_MAX_TURNS`` /
-        ``AGENT_EXTRA_FLAGS`` and delegates capability construction
+        ``AGENT_EXTRA_FLAGS``, delegates capability construction
         (``AGENT_MCP_SERVER`` / ``AGENT_ALLOWED_TOOLS`` / ``AGENT_SKILLS_PATHS`` /
-        ``AGENT_RULES_TEXT``) to :func:`_build_capabilities_from_env`. A missing
-        variable yields the dataclass default — this method never raises on unset
+        ``AGENT_RULES_TEXT``) to :func:`_build_capabilities_from_env`, and the
+        sandbox opt-in (``BENCH_AGENT_SANDBOX`` / ``BENCH_SANDBOX_IMAGE``) to
+        :func:`~devops_bench.agents.sandbox.spec_from_env`. A missing variable
+        yields the dataclass default — this method never raises on unset
         variables.
 
         Args:
@@ -150,4 +160,5 @@ class AgentConfig:
             max_turns=max_turns,
             capabilities=_build_capabilities_from_env(env),
             extra_flags=extra_flags,
+            sandbox=spec_from_env(env),
         )
