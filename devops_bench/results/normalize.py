@@ -30,7 +30,6 @@ from devops_bench.core import score_keys
 from devops_bench.results.row import Manifest, ResultRow
 
 __all__ = [
-    "CATASTROPHIC_SCORE_KEY",
     "OUTCOME_SCORE_KEY",
     "TOOL_SCORE_KEY",
     "NormalizedTokens",
@@ -63,7 +62,6 @@ _RECOVERABLE_KEYS = (
     score_keys.VERIFICATION_RECOVERABLE_KEY,
     score_keys.JUDGED_RECOVERABLE_KEY,
 )
-CATASTROPHIC_SCORE_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
 # Every key that hard gates the outcome. Shared with ``metrics.pipeline``
 # rather than mirrored, unlike the two chains above: the row's ``catastrophic``
 # flag has to agree with the zero the pipeline already applied to
