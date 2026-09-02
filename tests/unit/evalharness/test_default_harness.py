@@ -1019,3 +1019,115 @@ def test_run_survives_detector_failure(
     # The raw results survived the detector failure on disk as well.
     run_dirs = [p for p in tmp_path.iterdir() if p.is_dir()]
     assert len(run_dirs) == 1 and (run_dirs[0] / "results.json").exists()
+
+
+# -- sandbox wiring ----------------------------------------------------------
+
+
+def _sandboxed_harness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **kwargs: Any
+) -> DefaultEvalHarness:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX", "docker")
+    monkeypatch.setenv("BENCH_SANDBOX_IMAGE", "agent-sandbox:test")
+    return DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results"), **kwargs
+    )
+
+
+def test_agent_config_snapshot_carries_the_sandbox_opt_in(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The snapshot rebuild must not drop the ``sandbox`` field on the floor."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    assert harness.build_agent_config().sandbox is not None
+    assert harness.build_agent_config().sandbox.image == "agent-sandbox:test"
+
+
+def test_agent_config_snapshot_has_no_sandbox_when_flag_off(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    harness = DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results")
+    )
+    assert harness.build_agent_config().sandbox is None
+
+
+def test_prepare_sandbox_spec_completes_the_skeletal_spec(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from devops_bench.agents.sandbox import NetworkPlan
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    plan = NetworkPlan(docker_network="kind", rewrite_server="https://c1-control-plane:6443")
+    kubeconfig = tmp_path / "creds" / "kubeconfig"
+
+    def fake_build_kubeconfig(got_plan: Any, dest_dir: Path) -> Path:
+        assert got_plan is plan
+        assert dest_dir == tmp_path / "creds"
+        return kubeconfig
+
+    monkeypatch.setattr(harness_default.agent_sandbox, "build_network_plan", lambda: plan)
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "build_agent_kubeconfig", fake_build_kubeconfig
+    )
+    monkeypatch.setattr(
+        harness_default.agent_sandbox,
+        "discover_fixture_mounts",
+        lambda cluster: {"/home/op/repo-c1.git": "/workspace/home/repo-c1.git"},
+    )
+
+    workspace = tmp_path / "workspace-x"
+    workspace.mkdir()
+    (tmp_path / "creds").mkdir()
+    spec = harness._prepare_sandbox_spec(workspace, tmp_path / "creds", "c1")  # noqa: SLF001
+
+    # The sandbox home exists on the host before the agent runs (it is both
+    # the container HOME mountpoint and the detection inventory root).
+    assert (workspace / "home").is_dir()
+    assert spec.image == "agent-sandbox:test"
+    assert spec.network is plan
+    assert spec.workspace == workspace
+    assert spec.kubeconfig == kubeconfig
+    assert spec.fixture_mounts == {"/home/op/repo-c1.git": "/workspace/home/repo-c1.git"}
+
+
+def test_build_agent_config_overlays_the_active_sandbox_spec(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace as dc_replace
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    completed = dc_replace(
+        harness.build_agent_config().sandbox, workspace=tmp_path, kubeconfig=tmp_path / "kc"
+    )
+
+    harness._active_sandbox_spec = completed  # noqa: SLF001
+    overlaid = harness.build_agent_config()
+    assert overlaid.sandbox is completed
+    # Everything else still reads from the one snapshot.
+    assert overlaid.capabilities is harness._agent_config.capabilities  # noqa: SLF001
+
+    harness._active_sandbox_spec = None  # noqa: SLF001
+    assert harness.build_agent_config() is harness._agent_config  # noqa: SLF001
+
+
+def test_inventory_sandbox_home_records_rules_per_task(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sandbox home replaces the operator home as the inventory root:
+    a leftover seeded there is flagged, and a fresh home yields the empty
+    ruleset (correct by construction, not a skipped scan)."""
+    monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+
+    dirty_home = tmp_path / "ws-dirty" / "home"
+    dirty_home.mkdir(parents=True)
+    (dirty_home / "report.md").write_text("prior-run leftover fingerprint line\n" * 3)
+    harness._inventory_sandbox_home("dirty-task", dirty_home)  # noqa: SLF001
+    assert harness._sandbox_inventory_rules["dirty-task"]  # noqa: SLF001
+
+    fresh_home = tmp_path / "ws-fresh" / "home"
+    fresh_home.mkdir(parents=True)
+    harness._inventory_sandbox_home("fresh-task", fresh_home)  # noqa: SLF001
+    assert harness._sandbox_inventory_rules["fresh-task"] == ()  # noqa: SLF001
