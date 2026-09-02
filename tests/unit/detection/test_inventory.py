@@ -58,13 +58,41 @@ def _seed_home(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_inventory_skips_baseline_and_hidden_entries(tmp_path: Path) -> None:
+def test_inventory_skips_baseline_and_environment_dotfiles(tmp_path: Path) -> None:
     home = _seed_home(tmp_path)
     rules = build_inventory_rules(home)
     joined = " ".join(p for rule in rules for p in rule.patterns)
     assert "bench\\.env" not in joined
     assert "bashrc" not in joined
     assert all(rule.category == "prior-run-artifact" for rule in rules)
+
+
+def test_agent_state_dotdir_is_a_leftover_not_environment(tmp_path: Path) -> None:
+    """An agent CLI's state dotdir generates rules; enumerated dotfiles do not.
+
+    Agent harnesses conventionally keep their state in a dotdir, and that is
+    exactly where cross-run contamination piles up — a stale
+    ``~/.openclaw/workspace`` holds a previous task's deliverables. Only the
+    enumerated :data:`ENVIRONMENT_DOTFILES` are baseline, so the dotdir is
+    covered while ``.bashrc`` stays invisible.
+    """
+    workspace = tmp_path / ".openclaw" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "production-readiness.md").write_text(
+        "# Production readiness review\n", encoding="utf-8"
+    )
+    (tmp_path / ".bashrc").write_text("# shell init\n", encoding="utf-8")
+
+    rules = build_inventory_rules(tmp_path)
+    joined = " ".join(p for rule in rules for p in rule.patterns)
+    assert "openclaw" in joined
+    assert "bashrc" not in joined
+
+    report = scan_record(
+        _record([_exec("cat ~/.openclaw/workspace/production-readiness.md")]), rules
+    )
+    assert report["status"] == "flagged"
+    assert report["categories"] == ["prior-run-artifact"]
 
 
 def test_clean_home_yields_no_rules(tmp_path: Path) -> None:
