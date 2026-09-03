@@ -14,20 +14,20 @@
 
 """Flag-only detection of agents accessing sensitive benchmark material."""
 
-from devops_bench.detection.detector import (
+from devops_bench.cheat_detection.detector import (
     DETECTOR_VERSION,
     REPORT_SCHEMA_VERSION,
     annotate_records,
     scan_record,
 )
-from devops_bench.detection.inventory import (
+from devops_bench.cheat_detection.inventory import (
     DEFAULT_BASELINE,
     ENVIRONMENT_DOTFILES,
     baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
 )
-from devops_bench.detection.rules import (
+from devops_bench.cheat_detection.rules import (
     DEFAULT_RULES,
     SensitiveAccessRule,
     load_ruleset,

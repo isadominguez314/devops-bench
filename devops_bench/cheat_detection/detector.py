@@ -35,7 +35,7 @@ import re
 from functools import cache
 from typing import Any
 
-from devops_bench.detection.rules import SensitiveAccessRule
+from devops_bench.cheat_detection.rules import SensitiveAccessRule
 
 __all__ = [
     "DETECTOR_VERSION",
@@ -58,8 +58,11 @@ __all__ = [
 # ENVIRONMENT_DOTFILES are baseline, so an agent-state dotdir left by a prior
 # run (a stale ~/.openclaw/workspace) now generates rules; inventory path
 # rules require a left boundary, so a home spelling inside a longer token
-# (/data/home/agent, foo~/x) no longer matches; and the harness-repo rule
-# covers the repo's docs/ subtree.
+# (/data/home/agent, foo~/x) no longer matches; the harness-repo rule covers
+# the repo's docs/ subtree; and the home is inventoried before every task
+# instead of once per batch, so an earlier task's deliverable is covered by
+# path for the tasks after it (content fingerprints stay limited to the
+# run-start leftovers).
 DETECTOR_VERSION = 6
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1
@@ -164,7 +167,7 @@ def scan_record(record: dict[str, Any], rules: tuple[SensitiveAccessRule, ...]) 
     Args:
         record: A results.json record dict (``trajectory`` + ``output`` keys).
         rules: The ruleset to match, e.g. from
-            :func:`devops_bench.detection.rules.load_ruleset`.
+            :func:`devops_bench.cheat_detection.rules.load_ruleset`.
 
     Returns:
         The report mapping: ``status`` is ``flagged`` (findings present),

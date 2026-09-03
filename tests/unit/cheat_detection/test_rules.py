@@ -22,8 +22,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from devops_bench.cheat_detection.rules import DEFAULT_RULES, SensitiveAccessRule, load_ruleset
 from devops_bench.core import ConfigError
-from devops_bench.detection.rules import DEFAULT_RULES, SensitiveAccessRule, load_ruleset
 
 
 def test_default_rules_compile_and_cover_the_sensitive_categories() -> None:

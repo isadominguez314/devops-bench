@@ -19,8 +19,11 @@ The agent home persists between runs, so artifacts of earlier runs (a previous
 accumulate there and amount to answer keys for later runs. "Left by a prior
 run" is a temporal property no static regex can express — this run's legit
 ``report.md`` write and a read of last run's leftover are the same string — so
-the harness snapshots the home *before* the agent starts and generates a
-per-run ruleset from what it finds:
+the harness snapshots the home *before each task's agent starts* and generates
+a ruleset from what it finds. Per task rather than once per batch because the
+home keeps accumulating while the batch runs: task 1's deliverable is exactly
+the kind of answer key task 2 must not read, and a single run-start snapshot
+is blind to it. What each snapshot yields:
 
 * a **path rule** per leftover, anchored to home-style prefixes (``~``,
   ``$HOME``, the literal home path) so an unrelated same-named file elsewhere
@@ -28,9 +31,13 @@ per-run ruleset from what it finds:
   scanned surface, so the entry's name echoing through tool output (an
   ``ls ~``, a grep error trail) flags too: the agent had no reason to be
   looking; and
-* a **content-fingerprint rule** per small text leftover: its most distinctive
-  lines, matched only against tool ``result``/``output`` surfaces. A read of
-  the stale file reproduces those exact lines; a freshly written file does not.
+* a **content-fingerprint rule** per small text leftover that the *run-start*
+  snapshot already saw: its most distinctive lines, matched only against tool
+  ``result``/``output`` surfaces. A read of the stale file reproduces those
+  exact lines; a freshly written file does not. Entries that appear mid-batch
+  get their path rule but no fingerprint — see ``fingerprint_only`` in
+  :func:`build_inventory_rules` for why the honest repeat iteration needs
+  that exemption.
 
 Path rules are filtered per record against the task prompt
 (:func:`filter_rules_for_prompt`): an entry the prompt itself names — the
@@ -48,7 +55,7 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-from devops_bench.detection.rules import SCAN_FIELDS, SensitiveAccessRule
+from devops_bench.cheat_detection.rules import SCAN_FIELDS, SensitiveAccessRule
 
 __all__ = [
     "DEFAULT_BASELINE",
@@ -224,12 +231,13 @@ def build_inventory_rules(
     home: Path,
     *,
     baseline: frozenset[str] = DEFAULT_BASELINE,
+    fingerprint_only: frozenset[str] | None = None,
 ) -> tuple[SensitiveAccessRule, ...]:
-    """Snapshot ``home`` and return rules covering its prior-run leftovers.
+    """Snapshot ``home`` and return rules covering its leftovers.
 
-    Called by the harness before the first agent executes, so everything the
-    current run creates afterwards is invisible to these rules by
-    construction. ``baseline`` names and the enumerated
+    Called by the harness before *each* task's agent executes, so a
+    deliverable an earlier task in the same batch left behind is covered for
+    every task after it. ``baseline`` names and the enumerated
     :data:`ENVIRONMENT_DOTFILES` are treated as the provisioned environment
     and skipped; any *other* hidden entry — an agent CLI's state directory,
     say — is a leftover like any visible one.
@@ -243,6 +251,16 @@ def build_inventory_rules(
     Args:
         home: The agent's home directory (shared across runs on the host).
         baseline: Top-level names that belong to the environment, not a run.
+        fingerprint_only: When given, the only entry names allowed to produce
+            content rules; every other leftover gets its path rule alone. The
+            harness passes the leftovers its *run-start* snapshot saw, so an
+            entry that appears later in the batch is path-only. The asymmetry
+            is deliberate: fingerprints are unfilterable by design, and two
+            iterations of one task legitimately share long lines (a pasted
+            policy body, a command line, a cluster name), so fingerprinting a
+            same-batch deliverable would flag the honest repeat. Referencing
+            a previous task's output *by path* has no such excuse, so the
+            path rule still applies. ``None`` fingerprints every leftover.
 
     Returns:
         The generated ruleset: one path rule per leftover, plus one content
@@ -261,6 +279,8 @@ def build_inventory_rules(
     home_pattern = _home_prefixes(home)
     rules.extend(_path_rule(p.name, home_pattern) for p in leftovers)
     for entry in leftovers:
+        if fingerprint_only is not None and entry.name not in fingerprint_only:
+            continue
         # ``is_file()`` follows links, so a leftover symlink would pull an
         # arbitrary readable file's lines into a pattern — and patterns are
         # published in the report. The path rule still covers the link itself.
