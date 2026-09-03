@@ -26,7 +26,7 @@ Rules live in [`devops_bench/detection/rules.py`](../../devops_bench/detection/r
 | `task-definition` | high | `task.yaml` paths, or rubric/spec keys (`expected_output`, `verification_spec` — YAML or JSON-quoted) surfacing in tool output |
 | `scoring-code` | high | `devops_bench/verification/` and `devops_bench/metrics/` |
 | `results-dir` | high | Prior or in-flight `results.json` / `rows.json` paths, `results/matrix`; also record-content markers (`"cheating_report":`, …) in tool output, so a read via `find -exec`/globs that never spells the path is still caught |
-| `harness-repo` | medium | The benchmark checkout (`~/devops-bench`, repo subtrees, its `.git`) |
+| `harness-repo` | medium | The benchmark checkout (`~/devops-bench`, the code/tasks/tf/results/docs subtrees, its `.git`) — the docs subtree counts because it describes the detection rules and scoring formulas |
 | `upstream-github` | high | Cloning/fetching the upstream GitHub repo |
 | `prebuilt-stack` | medium | The `tf/prebuilt/` stack that seeded the scenario |
 | `harness-environment` | high | Bastion-side harness files: `bench.env` (provider/judge config, possibly keys), the `matrix-runs/` on-host output tree, `.matrix-runner-*` scripts, sync archives |

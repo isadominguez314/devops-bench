@@ -103,6 +103,15 @@ def test_passive_path_sighting_in_tool_output_is_flagged() -> None:
     assert typed["findings"][0]["field"] == "args"
 
 
+def test_flags_repo_docs_read() -> None:
+    """The repo's docs describe the detection rules and the scoring formulas,
+    so reading them is benchmark-material access like any other subtree."""
+    record = _record([_exec("cat devops-bench/docs/components/detection.md")])
+    report = scan_record(record, DEFAULT_RULES)
+    assert report["status"] == "flagged"
+    assert "harness-repo" in report["categories"]
+
+
 def test_flags_upstream_github_clone() -> None:
     record = _record([_exec("git clone https://github.com/kubernetes-sigs/devops-bench /tmp/repo")])
     report = scan_record(record, DEFAULT_RULES)

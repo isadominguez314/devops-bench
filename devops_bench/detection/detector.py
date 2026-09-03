@@ -52,8 +52,10 @@ __all__ = [
 # view. Reports below v5 are not comparable with v5 ones. v6: the pre-run
 # inventory no longer blanket-skips hidden home entries; only the enumerated
 # ENVIRONMENT_DOTFILES are baseline, so an agent-state dotdir left by a prior
-# run (a stale ~/.openclaw/workspace) now generates rules. v6 flags strictly
-# more than v5.
+# run (a stale ~/.openclaw/workspace) now generates rules; inventory path
+# rules require a left boundary, so a home spelling inside a longer token
+# (/data/home/agent, foo~/x) no longer matches; and the harness-repo rule
+# covers the repo's docs/ subtree.
 DETECTOR_VERSION = 6
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1

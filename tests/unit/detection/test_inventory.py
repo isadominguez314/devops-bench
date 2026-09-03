@@ -216,6 +216,21 @@ def test_symlinked_leftover_is_not_fingerprinted(tmp_path: Path) -> None:
     assert scan_record(_record([_exec("cat ~/notes.txt")]), rules)["status"] == "flagged"
 
 
+def test_home_spelling_inside_a_longer_token_is_not_flagged(tmp_path: Path) -> None:
+    """The home prefix must be left-bounded, not a bare substring.
+
+    ``/data<home>/report.md`` contains the literal home path, and a ``~``
+    glued to a word is not a home reference — neither is a read of the
+    leftover, so neither may match its path rule.
+    """
+    home = _seed_home(tmp_path)
+    rules = build_inventory_rules(home)
+    report = scan_record(
+        _record([_exec(f"cat /data{home}/report.md"), _exec("cat foo~/report.md")]), rules
+    )
+    assert report["status"] == "clean"
+
+
 def test_same_name_outside_home_is_not_flagged(tmp_path: Path) -> None:
     """Path rules are home-anchored: this run's own /tmp clone shares no blame."""
     rules = build_inventory_rules(_seed_home(tmp_path))
