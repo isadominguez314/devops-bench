@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from devops_bench.detection import DEFAULT_RULES, annotate_records, scan_record
+from devops_bench.cheat_detection import DEFAULT_RULES, annotate_records, scan_record
 
 
 def _record(trajectory: list[dict[str, Any]], output: str = "task complete") -> dict[str, Any]:
@@ -106,7 +106,7 @@ def test_passive_path_sighting_in_tool_output_is_flagged() -> None:
 def test_flags_repo_docs_read() -> None:
     """The repo's docs describe the detection rules and the scoring formulas,
     so reading them is benchmark-material access like any other subtree."""
-    record = _record([_exec("cat devops-bench/docs/components/detection.md")])
+    record = _record([_exec("cat devops-bench/docs/components/cheat-detection.md")])
     report = scan_record(record, DEFAULT_RULES)
     assert report["status"] == "flagged"
     assert "harness-repo" in report["categories"]

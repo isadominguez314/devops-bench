@@ -31,7 +31,7 @@ import re
 from functools import cache
 from typing import Any
 
-from devops_bench.detection.rules import SensitiveAccessRule
+from devops_bench.cheat_detection.rules import SensitiveAccessRule
 
 __all__ = [
     "DETECTOR_VERSION",
@@ -163,7 +163,7 @@ def scan_record(record: dict[str, Any], rules: tuple[SensitiveAccessRule, ...]) 
     Args:
         record: A results.json record dict (``trajectory`` + ``output`` keys).
         rules: The ruleset to match, e.g. from
-            :func:`devops_bench.detection.rules.load_ruleset`.
+            :func:`devops_bench.cheat_detection.rules.load_ruleset`.
 
     Returns:
         The report mapping: ``status`` is ``flagged`` (findings present),

@@ -55,7 +55,7 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-from devops_bench.detection.rules import SCAN_FIELDS, SensitiveAccessRule
+from devops_bench.cheat_detection.rules import SCAN_FIELDS, SensitiveAccessRule
 
 __all__ = [
     "DEFAULT_BASELINE",

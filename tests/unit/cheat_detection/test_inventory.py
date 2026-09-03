@@ -20,14 +20,14 @@ import re
 from pathlib import Path
 from typing import Any
 
-from devops_bench.detection import (
+from devops_bench.cheat_detection import (
     DEFAULT_BASELINE,
     baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
     scan_record,
 )
-from devops_bench.detection.rules import SCAN_FIELDS
+from devops_bench.cheat_detection.rules import SCAN_FIELDS
 
 _STALE_REPORT = (
     "# Cluster Audit and Remediation Report\n"

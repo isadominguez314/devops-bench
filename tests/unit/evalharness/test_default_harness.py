@@ -883,7 +883,7 @@ def test_detection_failure_on_one_record_spares_the_rest(
 ) -> None:
     """Annotation is best-effort per record: one failing record keeps its
     seeded empty report while every other record is still annotated."""
-    from devops_bench.detection import annotate_records
+    from devops_bench.cheat_detection import annotate_records
 
     def flaky(records: list[dict[str, Any]], rules: Any) -> None:
         if records[0].get("name") == "boom":

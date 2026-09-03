@@ -35,6 +35,15 @@ from devops_bench.agents.capabilities import (
     SkillBinding,
 )
 from devops_bench.chaos import ChaosSpec
+from devops_bench.cheat_detection import (
+    DEFAULT_BASELINE,
+    SensitiveAccessRule,
+    annotate_records,
+    baseline_from_granted_paths,
+    build_inventory_rules,
+    filter_rules_for_prompt,
+    load_ruleset,
+)
 from devops_bench.core import (
     ConfigError,
     MissingDependencyError,
@@ -45,15 +54,6 @@ from devops_bench.core import (
     get_logger,
 )
 from devops_bench.deployers.factory import get_deployer
-from devops_bench.detection import (
-    DEFAULT_BASELINE,
-    SensitiveAccessRule,
-    annotate_records,
-    baseline_from_granted_paths,
-    build_inventory_rules,
-    filter_rules_for_prompt,
-    load_ruleset,
-)
 from devops_bench.evalharness.artifacts import collect_generated_files, snapshot_dir
 from devops_bench.evalharness.base import Harness
 from devops_bench.evalharness.reporter import ResultReporter
@@ -646,7 +646,7 @@ class DefaultEvalHarness(Harness):
 
         Args:
             fingerprint_only: Passed through to
-                :func:`~devops_bench.detection.build_inventory_rules` — the
+                :func:`~devops_bench.cheat_detection.build_inventory_rules` — the
                 entry names still allowed to produce content rules.
 
         Returns:
