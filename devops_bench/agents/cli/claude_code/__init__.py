@@ -12,24 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reusable Kubernetes primitives: kubectl wrappers and wait/poll conditions."""
+"""Claude Code CLI agent harness, named to distinguish it from the Claude model.
 
-from devops_bench.k8s.conditions import poll_until
-from devops_bench.k8s.kubectl import (
-    apply,
-    get_resource,
-    is_not_found,
-    port_forward,
-    rollout_status,
-    wait,
-)
+The harness driver lives in :mod:`.agent` and the stream-json parser in
+:mod:`.parsing`. Importing this package self-registers the agent under the
+``"claude"`` key via ``@AGENTS.register``.
+"""
 
-__all__ = [
-    "apply",
-    "get_resource",
-    "is_not_found",
-    "poll_until",
-    "port_forward",
-    "rollout_status",
-    "wait",
-]
+from __future__ import annotations
+
+from devops_bench.agents.cli.claude_code.agent import ClaudeCodeAgent
+from devops_bench.agents.cli.claude_code.parsing import parse_stream_json
+
+__all__ = ["ClaudeCodeAgent", "parse_stream_json"]
