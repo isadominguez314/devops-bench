@@ -117,8 +117,15 @@ _MIN_LINE_LEN = 24
 
 
 def _home_prefixes(home: Path) -> str:
-    """Regex alternation of the ways a trajectory spells the home directory."""
-    return rf"(?:~|\$HOME|{re.escape(str(home))})"
+    """Regex alternation of the ways a trajectory spells the home directory.
+
+    Left-bounded so a home spelling inside a longer token does not match: an
+    unrelated ``/data/home/agent/report.md`` contains the literal home path as
+    a substring, and a ``~`` glued to a word (``foo~/report.md``) is not a
+    home reference. A preceding quote, whitespace, ``=`` or start-of-string
+    still matches — the ways a shell actually introduces a home path.
+    """
+    return rf"(?<![\w~])(?:~|\$HOME|{re.escape(str(home))})"
 
 
 def _path_rule(name: str, home_pattern: str) -> SensitiveAccessRule:
