@@ -41,7 +41,7 @@ from pathlib import Path
 
 from devops_bench.agents.config import AgentConfig
 from devops_bench.agents.result import AgentResult
-from devops_bench.core import Registry, get_logger
+from devops_bench.core import Registry, SandboxError, get_logger
 from devops_bench.core.subprocess import CompletedProcess
 from devops_bench.core.subprocess import run as _host_subprocess_run
 
@@ -109,6 +109,15 @@ class AgentHarness(ABC):
             ``AgentConfig()`` (use the agent's built-in defaults).
     """
 
+    #: Whether every agent-owned subprocess in this harness goes through
+    #: :meth:`run_agent_cmd`. :meth:`run` refuses a sandboxed config on a
+    #: harness that has not been migrated onto the seam: its direct
+    #: ``run(...)`` calls would execute on the host with the operator's
+    #: ambient credentials while the operator believes the run is contained.
+    #: A subclass flips this to ``True`` only once all its call sites are on
+    #: the seam.
+    supports_sandbox: bool = False
+
     def __init__(self, config: AgentConfig | None = None) -> None:
         self.config = config or AgentConfig()
 
@@ -129,7 +138,21 @@ class AgentHarness(ABC):
         Returns:
             An :class:`AgentResult` with ``latency`` always populated. A
             subclass crash produces ``AgentResult.errored(msg)``.
+
+        Raises:
+            SandboxError: When the run is sandboxed but this harness has not
+                been migrated onto the :meth:`run_agent_cmd` seam, or when
+                the executor itself refuses mid-run. Deliberately *not*
+                converted to an errored result: a containment failure is an
+                infrastructure failure, not an agent performance, and the
+                eval harness records it as a failed, unscored run.
         """
+        if self.config.sandbox is not None and not self.supports_sandbox:
+            raise SandboxError(
+                f"agent harness {type(self).__name__} has not been migrated onto the "
+                "sandbox seam (run_agent_cmd); refusing to run it unsandboxed on the "
+                "host while BENCH_AGENT_SANDBOX is set"
+            )
         start = time.monotonic()
         try:
             traced = _maybe_observe(self._execute)
@@ -140,6 +163,11 @@ class AgentHarness(ABC):
             if not result.latency:
                 result.latency = elapsed
             return result
+        except SandboxError:
+            # Never swallowed into an errored result: that would score a broken
+            # boundary as a badly-performing agent. Propagates to the eval
+            # harness's failed-record path instead.
+            raise
         except Exception as exc:  # noqa: BLE001 - safety net for the whole benchmark
             elapsed = time.monotonic() - start
             _log.exception("agent _execute raised; converting to errored result")
@@ -171,10 +199,12 @@ class AgentHarness(ABC):
         off a call site swapped onto this method behaves byte-for-byte as its
         direct ``run(...)`` call did.
 
-        A sandbox that cannot run raises (``SandboxError`` from the executor,
-        surfaced by :meth:`run`'s safety net as an errored result) rather than
-        falling back to the host: a containment control that quietly degrades
-        is worse than none.
+        A sandbox that cannot run raises ``SandboxError`` rather than falling
+        back to the host: a containment control that quietly degrades is
+        worse than none. :meth:`run`'s safety net deliberately re-raises it
+        (instead of converting to an errored result) so the eval harness
+        records a failed, unscored run — a broken boundary must never read
+        as a badly-performing agent.
 
         Args:
             cmd: Command and arguments, never a shell string.

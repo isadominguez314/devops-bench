@@ -1067,7 +1067,15 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
         assert dest_dir == tmp_path / "creds"
         return kubeconfig
 
-    monkeypatch.setattr(harness_default.agent_sandbox, "build_network_plan", lambda: plan)
+    plan_requests: list[str] = []
+
+    def fake_build_network_plan(cluster_name: str) -> Any:
+        plan_requests.append(cluster_name)
+        return plan
+
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "build_network_plan", fake_build_network_plan
+    )
     monkeypatch.setattr(
         harness_default.agent_sandbox, "build_agent_kubeconfig", fake_build_kubeconfig
     )
@@ -1090,6 +1098,9 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     assert spec.workspace == workspace
     assert spec.kubeconfig == kubeconfig
     assert spec.fixture_mounts == {"/home/op/repo-c1.git": "/workspace/home/repo-c1.git"}
+    # The run's own cluster name pins the plan (and through it the
+    # kubeconfig), never the ambient current-context.
+    assert plan_requests == ["c1"]
 
 
 def test_build_agent_config_overlays_the_active_sandbox_spec(
@@ -1131,3 +1142,67 @@ def test_inventory_sandbox_home_records_rules_per_task(
     fresh_home.mkdir(parents=True)
     harness._inventory_sandbox_home("fresh-task", fresh_home)  # noqa: SLF001
     assert harness._sandbox_inventory_rules["fresh-task"] == ()  # noqa: SLF001
+
+
+def test_inventory_covers_fixture_mounts_at_their_container_paths(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fixture mounts only materialize inside the container, so the host-side
+    home scan cannot see them; each mounted name must get a container-path
+    rule, and the prompt filter must drop exactly the ones the task names."""
+    import re
+
+    from devops_bench.detection import filter_rules_for_prompt
+
+    monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+
+    home = tmp_path / "ws" / "home"
+    home.mkdir(parents=True)
+    harness._inventory_sandbox_home(  # noqa: SLF001
+        "t",
+        home,
+        {
+            "/home/op/opa-repo-c1.git": "/workspace/home/opa-repo-c1.git",
+            "/home/op/stale-notes-c1.md": "/workspace/home/stale-notes-c1.md",
+        },
+    )
+    rules = harness._sandbox_inventory_rules["t"]  # noqa: SLF001
+    assert {r.source for r in rules} == {"opa-repo-c1.git", "stale-notes-c1.md"}
+    # The rules match the container-side spellings the trajectory records.
+    repo_rule = next(r for r in rules if r.source == "opa-repo-c1.git")
+    assert re.search(repo_rule.patterns[0], "cat /workspace/home/opa-repo-c1.git/config")
+    assert re.search(repo_rule.patterns[0], "git clone ~/opa-repo-c1.git")
+
+    # A prompt naming the repo authorizes it for that record; the mount the
+    # prompt never asked for (a leftover swept in by the token glob) stays.
+    surviving = filter_rules_for_prompt(rules, "Fix the policy and push to '~/opa-repo-c1.git'.")
+    assert {r.source for r in surviving} == {"stale-notes-c1.md"}
+
+
+def test_stray_container_sweep_is_skipped_under_parallel(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep matches on the shared name prefix and cannot tell a stray
+    from a sibling harness's live container, so BENCH_PARALLEL must skip it."""
+    monkeypatch.setenv("BENCH_PARALLEL", "1")
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    swept: list[bool] = []
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
+    )
+    harness.run([])
+    assert swept == []
+
+
+def test_stray_container_sweep_runs_when_not_parallel(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    swept: list[bool] = []
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
+    )
+    harness.run([])
+    assert swept == [True]

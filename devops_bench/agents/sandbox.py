@@ -124,6 +124,13 @@ _DENIED_ENV_NAMES = frozenset(
 )
 _DENIED_ENV_PREFIXES = ("BENCH_", "TF_")
 
+# Variables the executor itself owns inside the container. Unlike the deny
+# list above these are not even allowlistable: docker's last ``-e`` wins, so
+# an overlay value crossing for one of these would repoint HOME / KUBECONFIG /
+# PATH *inside* the boundary — redirecting the agent's home or credential
+# resolution is never a legitimate per-task need.
+_CONTAINER_OWNED_ENV = frozenset({"HOME", "KUBECONFIG", "PATH"})
+
 
 @dataclass(frozen=True)
 class NetworkPlan:
@@ -145,12 +152,20 @@ class NetworkPlan:
             kubeconfig, or ``None`` to keep the context's own server.
         tls_server_name: Value for the kubeconfig's ``tls-server-name`` when
             the rewritten endpoint's certificate carries a different SAN.
+        kubectl_context: kubectl context every credential read for this plan
+            is pinned to (``--context``). ``None`` falls back to the ambient
+            current-context — only acceptable when the caller has no cluster
+            identity of its own; the eval harness always pins, so a
+            current-context switched under it (an operator, a parallel
+            harness) can never hand the container another cluster's admin
+            credential.
     """
 
     docker_network: str | None = None
     extra_hosts: tuple[str, ...] = ()
     rewrite_server: str | None = None
     tls_server_name: str | None = None
+    kubectl_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,8 +190,10 @@ class SandboxSpec:
             fixtures, mounted READ-WRITE (see :func:`discover_fixture_mounts`).
         env_allowlist: Variable names explicitly permitted to cross even when
             they match a deny rule (e.g. a task that legitimately needs one
-            ``TF_VAR``). Everything else in the caller's overlay crosses
-            unless denied; nothing outside the overlay ever crosses.
+            ``TF_VAR``). The container-owned ``HOME``/``KUBECONFIG``/``PATH``
+            are excepted — never crossable, allowlisted or not. Everything
+            else in the caller's overlay crosses unless denied; nothing
+            outside the overlay ever crosses.
     """
 
     image: str = ""
@@ -222,8 +239,8 @@ def current_cluster_name() -> str | None:
     return ctx[len("kind-") :]
 
 
-def build_network_plan() -> NetworkPlan:
-    """Build the :class:`NetworkPlan` for the active kubectl context.
+def build_network_plan(cluster_name: str | None = None) -> NetworkPlan:
+    """Build the :class:`NetworkPlan` for this run's cluster.
 
     kind only, for now: kind writes ``https://127.0.0.1:<port>`` as the
     server, which means nothing inside a container — but kind also creates a
@@ -231,34 +248,62 @@ def build_network_plan() -> NetworkPlan:
     apiserver at ``https://<cluster>-control-plane:6443``. The apiserver
     certificate covers the control-plane node name, so TLS still verifies.
 
+    Args:
+        cluster_name: The run's own cluster name (from the deployer). The
+            plan is built for — and pinned to — the ``kind-<cluster_name>``
+            context, never the ambient current-context, which a parallel
+            harness or the operator may have switched since provisioning.
+            ``None`` falls back to deriving the name from the current
+            context, for callers that hold no cluster identity of their own.
+
     Returns:
-        The kind plan for the current context.
+        The kind plan for the run's cluster, with ``kubectl_context`` pinned.
 
     Raises:
-        SandboxError: For a non-kind context. Cloud and vcluster contexts get
-            a per-provider plan hook in the credential-scoping follow-up;
-            refusing here beats running against a server URL the container
-            cannot reach — or silently not sandboxing at all.
+        SandboxError: When no cluster name can be resolved, or kubectl knows
+            no ``kind-<cluster_name>`` context for the resolved name (a
+            non-kind provider, or a kubeconfig that never saw this cluster).
+            Cloud and vcluster clusters get a per-provider plan hook in the
+            credential-scoping follow-up; refusing here beats running against
+            a server the container cannot reach — or handing it credentials
+            for a different cluster entirely.
     """
-    cluster = current_cluster_name()
+    cluster = cluster_name or current_cluster_name()
     if cluster is None:
         raise SandboxError(
             "the active kubectl context is not a kind context; the sandbox currently "
             "only knows how to reach kind clusters (the per-provider network plan "
             "hook arrives with the credential-scoping follow-up)"
         )
+    context = f"kind-{cluster}"
+    known = (
+        run(["kubectl", "config", "get-contexts", "-o", "name"], check=False).stdout or ""
+    ).split()
+    if context not in known:
+        raise SandboxError(
+            f"kubectl has no {context!r} context for this run's cluster {cluster!r}; "
+            "either the cluster is not a kind cluster (the per-provider plan hook "
+            "arrives with the credential-scoping follow-up) or this kubeconfig "
+            "never saw it — refusing to build a plan from the ambient context"
+        )
     return NetworkPlan(
         docker_network="kind",
         rewrite_server=f"https://{cluster}-control-plane:6443",
+        kubectl_context=context,
     )
 
 
-def _kubectl_config_value(jsonpath: str) -> str:
-    """Read one value from the active kubectl context, empty when absent."""
-    completed = run(
-        ["kubectl", "config", "view", "--raw", "--minify", "-o", f"jsonpath={jsonpath}"],
-        check=False,
-    )
+def _kubectl_config_value(jsonpath: str, context: str | None = None) -> str:
+    """Read one kubectl config value, empty when absent.
+
+    Pinned to ``context`` when given (``--minify`` then minifies relative to
+    it); otherwise reads the ambient current-context.
+    """
+    argv = ["kubectl", "config", "view", "--raw", "--minify"]
+    if context:
+        argv += ["--context", context]
+    argv += ["-o", f"jsonpath={jsonpath}"]
+    completed = run(argv, check=False)
     return (completed.stdout or "").strip()
 
 
@@ -271,15 +316,21 @@ def build_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path:
     a plugin would need ambient cloud credentials the container deliberately
     lacks.
 
-    The credential is the operator's client certificate from the active
-    (kind) context, which is cluster-admin — so the container boundary is
-    doing all the work and the RBAC boundary none. That is a deliberate,
-    loudly-logged interim state: scoped ServiceAccount tokens arrive with the
+    The credential is the operator's client certificate for the run's (kind)
+    cluster, which is cluster-admin — so the container boundary is doing all
+    the work and the RBAC boundary none. That is a deliberate, loudly-logged
+    interim state: scoped ServiceAccount tokens arrive with the
     credential-scoping follow-up.
+
+    Every kubectl read is pinned to ``plan.kubectl_context`` when the plan
+    carries one, so the rendered CA / cert / server always belong to the
+    run's own cluster even if the ambient current-context was switched after
+    provisioning (an operator mid-run, a parallel harness's ``up()``).
 
     Args:
         plan: The run's network plan; ``rewrite_server`` replaces the
-            context's server URL and ``tls_server_name`` is rendered when set.
+            context's server URL, ``tls_server_name`` is rendered when set,
+            and ``kubectl_context`` pins every config read.
         dest_dir: Directory the kubeconfig is written into. Callers must keep
             it OUTSIDE the workspace, otherwise the file would also surface
             read-write under ``/workspace``.
@@ -292,19 +343,22 @@ def build_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path:
             client certificate (e.g. an exec-plugin context) — refusing beats
             handing the container a kubeconfig that cannot authenticate.
     """
-    ca = _kubectl_config_value("{.clusters[0].cluster.certificate-authority-data}")
+    ctx = plan.kubectl_context
+    ca = _kubectl_config_value("{.clusters[0].cluster.certificate-authority-data}", context=ctx)
     if not ca:
-        raise SandboxError("could not read the cluster CA from the current kubectl context")
+        raise SandboxError("could not read the cluster CA from the run's kubectl context")
 
-    server = plan.rewrite_server or _kubectl_config_value("{.clusters[0].cluster.server}")
+    server = plan.rewrite_server or _kubectl_config_value(
+        "{.clusters[0].cluster.server}", context=ctx
+    )
     if not server:
-        raise SandboxError("could not read the cluster server URL from the current kubectl context")
+        raise SandboxError("could not read the cluster server URL from the run's kubectl context")
 
-    cert = _kubectl_config_value("{.users[0].user.client-certificate-data}")
-    key = _kubectl_config_value("{.users[0].user.client-key-data}")
+    cert = _kubectl_config_value("{.users[0].user.client-certificate-data}", context=ctx)
+    key = _kubectl_config_value("{.users[0].user.client-key-data}", context=ctx)
     if not (cert and key):
         raise SandboxError(
-            "the current kubectl context carries no static client certificate; "
+            "the run's kubectl context carries no static client certificate; "
             "exec-credential-plugin contexts are handled by the credential-scoping "
             "follow-up, not by reusing the operator's plugin inside the container"
         )
@@ -361,6 +415,10 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
         Host path -> container path (under ``/workspace/home``, so a prompt's
         ``~/<name>`` resolves to exactly the mounted fixture). Empty when
         nothing matches, the normal case for tasks that seed no files.
+
+    Raises:
+        SandboxError: When two declared fixtures share a basename and would
+            collide on one container mount point.
     """
     explicit = (get_env(FIXTURES_ENV) or "").strip()
     if explicit:
@@ -376,11 +434,25 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
         candidates = sorted(home.glob(f"*{cluster_name}*"))
 
     mounts: dict[str, str] = {}
+    dest_owner: dict[str, str] = {}
     for path in candidates:
         if not path.exists():
             _log.warning("declared fixture %s does not exist; not mounting it", path)
             continue
-        mounts[str(path.resolve())] = f"{CONTAINER_HOME}/{path.name}"
+        host_path = str(path.resolve())
+        container_path = f"{CONTAINER_HOME}/{path.name}"
+        # Two host paths sharing a basename (only reachable through the
+        # explicit override; glob candidates share one directory) would emit
+        # two ``-v`` flags with the same destination, which docker aborts on
+        # with a cryptic "Duplicate mount point". Refuse with the actual paths.
+        if container_path in dest_owner and dest_owner[container_path] != host_path:
+            raise SandboxError(
+                f"fixture name collision: {dest_owner[container_path]} and {host_path} "
+                f"would both mount at {container_path}; rename one or narrow "
+                f"{FIXTURES_ENV}"
+            )
+        dest_owner[container_path] = host_path
+        mounts[host_path] = container_path
     if mounts:
         _log.info("mounting %d task fixture(s): %s", len(mounts), sorted(mounts))
     return mounts
@@ -400,21 +472,30 @@ def filter_boundary_env(
     ``os.environ``: scraping the process environment for well-known credential
     names would reinstate "inherit whatever the operator happened to export",
     the exact behaviour the sandbox removes. Within the overlay, names
-    matching the deny rules (operator cloud identity, ``BENCH_*``/``TF_*``,
-    and the container-owned ``HOME``/``KUBECONFIG``) are dropped with a
-    warning unless explicitly allowlisted.
+    matching the deny rules (operator cloud identity, ``BENCH_*``/``TF_*``)
+    are dropped with a warning unless explicitly allowlisted — except the
+    container-owned ``HOME``/``KUBECONFIG``/``PATH``, which never cross, not
+    even allowlisted: docker's last ``-e`` wins, so a crossing value would
+    override the executor's own inside the container.
 
     Args:
         overlay: The resolved per-run env overlay (provider-routed API key,
             model selection, agent toggles), or ``None``.
-        allowlist: Names permitted to cross despite matching a deny rule.
+        allowlist: Names permitted to cross despite matching a deny rule
+            (container-owned names excepted).
 
     Returns:
         The filtered mapping that becomes ``-e`` flags.
     """
     kept: dict[str, str] = {}
     for name, value in (overlay or {}).items():
-        if name in allowlist or not _env_denied(name):
+        if name in _CONTAINER_OWNED_ENV:
+            _log.warning(
+                "env var %s is container-owned and never crosses the sandbox "
+                "boundary, even allowlisted; dropped",
+                name,
+            )
+        elif name in allowlist or not _env_denied(name):
             kept[name] = value
         else:
             _log.warning("env var %s does not cross the sandbox boundary; dropped", name)
@@ -489,9 +570,11 @@ class SandboxExecutor:
         operator-owned (Docker Desktop already remaps ownership on macOS); the
         four-mount set (workspace RW, kubeconfig RO, fixtures RW — the write
         bit is deliberate, several tasks ask the agent to commit its fix back
-        to the seeded repo); the filtered env overlay by value; and **no
-        ``-i``** — keeping stdin open gives the agent an open, non-TTY stdin
-        to block on, and a headless prompt run never reads it.
+        to the seeded repo); the filtered env overlay by value, then the
+        container-owned ``HOME``/``KUBECONFIG`` last so they win any
+        duplicate ``-e``; and **no ``-i``** — keeping stdin open gives the
+        agent an open, non-TTY stdin to block on, and a headless prompt run
+        never reads it.
         """
         spec = self.spec
         argv: list[str] = ["docker", "run", "--rm", "--name", self.container_name]
@@ -506,9 +589,12 @@ class SandboxExecutor:
         argv += ["-v", f"{spec.kubeconfig}:{CONTAINER_KUBECONFIG}:ro"]
         for host_path, container_path in spec.fixture_mounts.items():
             argv += ["-v", f"{host_path}:{container_path}"]
-        argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         for name, value in filter_boundary_env(extra_env, spec.env_allowlist).items():
             argv += ["-e", f"{name}={value}"]
+        # Container-owned env comes AFTER the overlay: docker's last ``-e``
+        # wins, so even a filter regression could not let an overlay value
+        # repoint HOME or the credential path inside the boundary.
+        argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
         argv.append(spec.image)
         argv.extend(str(part) for part in cmd)
@@ -594,8 +680,12 @@ def sweep_stray_containers() -> None:
     Intended to run once at harness start (before any run's own container
     exists) so a container orphaned by a prior crash or a killed harness
     process gets cleaned up before it burns any more quota. Matches
-    exclusively on this harness's own name prefix, so it can never reap a
-    container it did not itself create.
+    exclusively on this benchmark's own name prefix, so it can never reap a
+    container some other tool created — but the prefix is shared across
+    benchmark processes, so this assumes it is the only harness on the host:
+    a *sibling* harness's live agent container matches too. Callers running
+    parallel harnesses must not sweep (see the eval harness's
+    ``BENCH_PARALLEL`` gate).
     """
     listed = run(
         ["docker", "ps", "-q", "--filter", f"name=^{_CONTAINER_NAME_PREFIX}"],

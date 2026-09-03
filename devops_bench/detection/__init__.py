@@ -24,6 +24,7 @@ from devops_bench.detection.inventory import (
     DEFAULT_BASELINE,
     baseline_from_granted_paths,
     build_inventory_rules,
+    build_mount_rules,
     filter_rules_for_prompt,
 )
 from devops_bench.detection.rules import (
@@ -41,6 +42,7 @@ __all__ = [
     "annotate_records",
     "baseline_from_granted_paths",
     "build_inventory_rules",
+    "build_mount_rules",
     "filter_rules_for_prompt",
     "load_ruleset",
     "scan_record",

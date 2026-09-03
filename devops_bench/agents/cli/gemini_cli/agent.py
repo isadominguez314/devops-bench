@@ -197,6 +197,11 @@ class GeminiCliAgent(AgentHarness):
     from disk.
     """
 
+    # Every agent-owned subprocess here goes through run_agent_cmd, so a
+    # sandboxed run is actually contained. Unmigrated harnesses keep the base
+    # False and are refused by AgentHarness.run when the sandbox flag is on.
+    supports_sandbox = True
+
     def __init__(self, config: AgentConfig | None = None) -> None:
         AgentHarness.__init__(self, config)
         caps = self.config.capabilities

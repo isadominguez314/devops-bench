@@ -191,13 +191,34 @@ def test_current_cluster_name_strips_kind_prefix(monkeypatch: pytest.MonkeyPatch
     assert sandbox.current_cluster_name() == "my-cluster"
 
 
+def _known_contexts(*names: str):
+    """A fake ``run`` answering ``kubectl config get-contexts -o name``."""
+
+    def fake_run(argv, **kwargs):
+        assert argv[:3] == ["kubectl", "config", "get-contexts"]
+        return SimpleNamespace(returncode=0, stdout="\n".join(names) + "\n", stderr="")
+
+    return fake_run
+
+
 def test_build_network_plan_joins_kind_network_and_rewrites_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "c1")
-    plan = sandbox.build_network_plan()
+    monkeypatch.setattr(sandbox, "run", _known_contexts("kind-c1", "kind-other"))
+    plan = sandbox.build_network_plan("c1")
     assert plan.docker_network == "kind"
     assert plan.rewrite_server == "https://c1-control-plane:6443"
+    # The plan pins credential reads to the run's own context, so an ambient
+    # current-context switch can never redirect the kubeconfig build.
+    assert plan.kubectl_context == "kind-c1"
+
+
+def test_build_network_plan_falls_back_to_the_current_context_without_a_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "c1")
+    monkeypatch.setattr(sandbox, "run", _known_contexts("kind-c1"))
+    assert sandbox.build_network_plan().kubectl_context == "kind-c1"
 
 
 def test_build_network_plan_refuses_a_non_kind_context(
@@ -206,6 +227,17 @@ def test_build_network_plan_refuses_a_non_kind_context(
     monkeypatch.setattr(sandbox, "current_cluster_name", lambda: None)
     with pytest.raises(SandboxError, match="not a kind context"):
         sandbox.build_network_plan()
+
+
+def test_build_network_plan_refuses_when_the_runs_cluster_has_no_kind_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run's own cluster (from the deployer), not the ambient context, is
+    authoritative: if kubectl has no ``kind-<cluster>`` context for it, the
+    plan must refuse rather than build against whatever is currently active."""
+    monkeypatch.setattr(sandbox, "run", _known_contexts("kind-someone-elses-cluster"))
+    with pytest.raises(SandboxError, match="kind-c1"):
+        sandbox.build_network_plan("c1")
 
 
 # -- kubeconfig generation --------------------------------------------------
@@ -217,8 +249,13 @@ def _kubectl_config_dispatch(
     server: str = "https://127.0.0.1:6443",
     cert: str = "Y2VydA==",
     key: str = "a2V5",
+    expect_context: str | None = None,
 ):
-    """A fake ``run`` answering the four kubectl jsonpath reads."""
+    """A fake ``run`` answering the four kubectl jsonpath reads.
+
+    With ``expect_context`` every read must carry ``--context <name>`` —
+    the pin that keeps the generated kubeconfig on the run's own cluster.
+    """
 
     answers = {
         "jsonpath={.clusters[0].cluster.certificate-authority-data}": ca,
@@ -229,6 +266,8 @@ def _kubectl_config_dispatch(
 
     def fake_run(argv, **kwargs):
         if argv[-1] in answers:
+            if expect_context is not None:
+                assert argv[argv.index("--context") + 1] == expect_context
             return SimpleNamespace(returncode=0, stdout=answers[argv[-1]], stderr="")
         raise AssertionError(f"unexpected argv in kubeconfig test: {argv}")
 
@@ -287,6 +326,18 @@ def test_build_agent_kubeconfig_renders_tls_server_name_when_the_plan_sets_it(
     path = sandbox.build_agent_kubeconfig(plan, tmp_path)
     cluster = yaml.safe_load(path.read_text())["clusters"][0]["cluster"]
     assert cluster["tls-server-name"] == "localhost"
+
+
+def test_build_agent_kubeconfig_pins_reads_to_the_plans_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every credential read carries ``--context kind-c1``: the rendered CA /
+    cert / server belong to the run's cluster even if the ambient
+    current-context was switched after provisioning."""
+    monkeypatch.setattr(sandbox, "run", _kubectl_config_dispatch(expect_context="kind-c1"))
+    plan = sandbox.NetworkPlan(kubectl_context="kind-c1")
+    path = sandbox.build_agent_kubeconfig(plan, tmp_path)
+    assert yaml.safe_load(path.read_text())["users"][0]["user"]["client-key-data"] == "a2V5"
 
 
 def test_build_agent_kubeconfig_refuses_without_a_ca(
@@ -366,6 +417,24 @@ def test_discover_fixture_mounts_honours_the_explicit_env_override(
     assert mounts == {str(fixture.resolve()): "/workspace/home/oddly-named-repo.git"}
 
 
+def test_discover_fixture_mounts_refuses_duplicate_fixture_basenames(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two same-named fixtures would emit two ``-v`` flags onto one container
+    destination, which docker aborts on with a cryptic 'Duplicate mount
+    point' — refuse up front, naming both host paths."""
+    first = tmp_path / "a" / "fix.git"
+    second = tmp_path / "b" / "fix.git"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    monkeypatch.setenv(sandbox.FIXTURES_ENV, f"{first}:{second}")
+
+    with pytest.raises(SandboxError, match="collision") as excinfo:
+        sandbox.discover_fixture_mounts(None)
+    assert str(first.resolve()) in str(excinfo.value)
+    assert str(second.resolve()) in str(excinfo.value)
+
+
 # -- boundary env filter ------------------------------------------------------
 
 
@@ -388,6 +457,15 @@ def test_filter_boundary_env_rejects_credential_and_benchmark_vars() -> None:
 def test_filter_boundary_env_allowlist_overrides_a_denial() -> None:
     kept = sandbox.filter_boundary_env({"TF_VAR_task_input": "x"}, allowlist=("TF_VAR_task_input",))
     assert kept == {"TF_VAR_task_input": "x"}
+
+
+def test_filter_boundary_env_never_admits_container_owned_vars() -> None:
+    """HOME/KUBECONFIG/PATH are the executor's own inside the container;
+    docker's last ``-e`` wins, so even an explicit allowlist must not let an
+    overlay value repoint them."""
+    overlay = {"HOME": "/home/op", "KUBECONFIG": "/home/op/.kube/config", "PATH": "/evil/bin"}
+    kept = sandbox.filter_boundary_env(overlay, allowlist=("HOME", "KUBECONFIG", "PATH"))
+    assert kept == {}
 
 
 def test_filter_boundary_env_handles_none_overlay() -> None:
@@ -435,6 +513,16 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     # Default working directory is the workspace; image then the raw argv.
     assert argv[argv.index("-w") + 1] == "/workspace"
     assert argv[-4:] == ["agent-image", "gemini", "-p", "hi"]
+
+
+def test_wrap_argv_container_owned_env_flags_come_last(tmp_path: Path) -> None:
+    """Defense in depth against a filter regression: the executor's own
+    ``-e HOME``/``-e KUBECONFIG`` trail every overlay flag, so docker's
+    last-one-wins keeps them authoritative no matter what crossed."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    argv = executor.wrap_argv(["gemini"], extra_env={"GEMINI_API_KEY": "k"})
+    assert argv.index("HOME=/workspace/home") > argv.index("GEMINI_API_KEY=k")
+    assert argv.index("KUBECONFIG=/creds/kubeconfig") > argv.index("GEMINI_API_KEY=k")
 
 
 def test_wrap_argv_never_forwards_denied_env(tmp_path: Path) -> None:
@@ -650,16 +738,45 @@ def test_run_agent_cmd_dispatches_to_the_executor_when_sandbox_is_set(
     assert wrapped[-4:] == ["agent-image", "gemini", "-p", "hi"]
 
 
-def test_run_agent_cmd_sandbox_refusal_surfaces_as_an_errored_result(tmp_path: Path) -> None:
-    """An incomplete spec raises in the executor; the base safety net turns
-    that into an errored AgentResult instead of a silent host fallback."""
+def test_sandbox_error_from_the_executor_propagates_out_of_run(tmp_path: Path) -> None:
+    """An incomplete spec raises in the executor and the base safety net
+    deliberately re-raises it: converted to an errored result it would score
+    a broken boundary as a badly-performing agent, when the eval harness
+    should record a failed, unscored run instead."""
 
     class _Boomy(AgentHarness):
+        supports_sandbox = True
+
         def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
             self.run_agent_cmd(["gemini"])
             raise AssertionError("unreachable")
 
     agent = _Boomy(AgentConfig(sandbox=sandbox.SandboxSpec(image="img")))
+    with pytest.raises(SandboxError, match="incomplete"):
+        agent.run("p")
+
+
+def test_run_still_converts_non_sandbox_crashes_to_errored_results() -> None:
+    """The SandboxError carve-out must not widen: every other crash keeps the
+    safety-net behaviour so one agent fault never aborts the benchmark."""
+    agent = _DummyAgent(AgentConfig())  # _execute raises NotImplementedError
     result = agent.run("p")
     assert result.errors
-    assert "incomplete" in result.errors[0]
+    assert "NotImplementedError" in result.errors[0]
+
+
+def test_run_refuses_a_sandboxed_config_on_an_unmigrated_agent(tmp_path: Path) -> None:
+    """A harness that never routed its subprocesses through run_agent_cmd
+    would run on the host with the operator's ambient credentials while the
+    flag says 'contained'. Refusal must be loud, before _execute ever runs."""
+    agent = _DummyAgent(AgentConfig(sandbox=_complete_spec(tmp_path)))
+    with pytest.raises(SandboxError, match="not been migrated"):
+        agent.run("p")
+
+
+def test_gemini_declares_sandbox_support() -> None:
+    from devops_bench.agents.cli.gemini_cli.agent import GeminiCliAgent
+
+    assert GeminiCliAgent.supports_sandbox is True
+    # The base default stays False so a new harness must opt in explicitly.
+    assert AgentHarness.supports_sandbox is False

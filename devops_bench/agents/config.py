@@ -19,6 +19,7 @@ from __future__ import annotations
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from devops_bench.agents.capabilities import (
     AgentRules,
@@ -26,8 +27,10 @@ from devops_bench.agents.capabilities import (
     McpBinding,
     SkillBinding,
 )
-from devops_bench.agents.sandbox import SandboxSpec, spec_from_env
 from devops_bench.core import get_env, get_int
+
+if TYPE_CHECKING:  # pragma: no cover - typing-only import
+    from devops_bench.agents.sandbox import SandboxSpec
 
 __all__ = ["AgentConfig"]
 
@@ -143,6 +146,11 @@ class AgentConfig:
         Returns:
             A populated :class:`AgentConfig`.
         """
+        # Function-local so importing the agents package does not pull the
+        # sandbox module in; it only loads once a config is actually built
+        # (which keeps base.py's own deferred import of the executor honest).
+        from devops_bench.agents.sandbox import spec_from_env
+
         timeout = get_int("AGENT_TIMEOUT_SEC", env=env)
         max_turns = get_int("AGENT_MAX_TURNS", env=env)
         return cls(

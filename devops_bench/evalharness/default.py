@@ -23,8 +23,9 @@ import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentResult
@@ -52,6 +53,7 @@ from devops_bench.detection import (
     annotate_records,
     baseline_from_granted_paths,
     build_inventory_rules,
+    build_mount_rules,
     filter_rules_for_prompt,
     load_ruleset,
 )
@@ -667,15 +669,27 @@ class DefaultEvalHarness(Harness):
         sandboxed = self._agent_config.sandbox is not None
         if sandboxed:
             self._sandbox_inventory_rules.clear()
-            # A container the harness starts is normally reaped around its own
-            # run, but a harness process killed outright (Ctrl-C, OOM, a host
-            # reboot) never gets to run that ``finally``. Sweeping once here,
-            # before this batch's own containers exist, catches exactly that
-            # leak without risking a live container from the run in progress.
-            try:
-                agent_sandbox.sweep_stray_containers()
-            except Exception:  # noqa: BLE001 - a sweep failure must not block the run
-                _log.exception("stray sandbox container sweep failed; continuing")
+            if self.parallel:
+                # The sweep matches on the shared name prefix and cannot tell a
+                # crashed run's stray from a sibling harness's *live* agent
+                # container, so under BENCH_PARALLEL it would reap a concurrent
+                # run mid-task.
+                _log.info(
+                    "BENCH_PARALLEL set: skipping the stray sandbox-container "
+                    "sweep; reap leftovers manually with `docker ps --filter "
+                    "name=devops-bench-agent-` once no benchmark is running"
+                )
+            else:
+                # A container the harness starts is normally reaped around its
+                # own run, but a harness process killed outright (Ctrl-C, OOM,
+                # a host reboot) never gets to run that ``finally``. Sweeping
+                # once here, before this batch's own containers exist, catches
+                # exactly that leak without risking a live container from the
+                # run in progress.
+                try:
+                    agent_sandbox.sweep_stray_containers()
+                except Exception:  # noqa: BLE001 - a sweep failure must not block the run
+                    _log.exception("stray sandbox container sweep failed; continuing")
 
         run_dir = self.reporter.new_run_dir()
 
@@ -861,10 +875,13 @@ class DefaultEvalHarness(Harness):
                 # try and becomes a failed record — never a silent
                 # unsandboxed run.
                 creds_dir = Path(tempfile.mkdtemp(prefix="devops-bench-creds-"))
-                self._active_sandbox_spec = self._prepare_sandbox_spec(
+                completed_spec = self._prepare_sandbox_spec(
                     workspace_path, creds_dir, active_cluster_name
                 )
-                self._inventory_sandbox_home(task.name, workspace_path / "home")
+                self._active_sandbox_spec = completed_spec
+                self._inventory_sandbox_home(
+                    task.name, workspace_path / "home", completed_spec.fixture_mounts
+                )
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
@@ -1027,18 +1044,23 @@ class DefaultEvalHarness(Harness):
         Creates the sandbox home (``<workspace>/home`` — the container's
         ``HOME``, kept under the workspace so everything the agent writes
         stays inside the directory the harness already diffs), builds the
-        network plan and single-cluster kubeconfig for the active context,
-        and discovers the task's seeded fixture mounts keyed on the
-        run-unique cluster token. Fixture completeness is part of the
-        boundary, not a convenience: an under-provisioned agent hunts for
-        its missing input (see the proposal doc's first observed incident).
+        network plan and single-cluster kubeconfig for *this run's* cluster
+        — ``cluster_name`` pins both to the ``kind-<cluster>`` context, so a
+        current-context switched after provisioning (an operator mid-run, a
+        parallel harness's ``up()``) can never hand the container another
+        cluster's admin credential — and discovers the task's seeded fixture
+        mounts keyed on the same cluster token. Fixture completeness is part
+        of the boundary, not a convenience: an under-provisioned agent hunts
+        for its missing input (see the proposal doc's first observed
+        incident).
 
         Args:
             workspace_path: This task's freshly-created workspace.
             creds_dir: Directory (outside the workspace) for the generated
                 kubeconfig.
-            cluster_name: The active cluster name, the fixture-discovery
-                token.
+            cluster_name: This run's cluster name (from the deployer): both
+                the context the plan/kubeconfig are pinned to and the
+                fixture-discovery token.
 
         Returns:
             The completed :class:`~devops_bench.agents.sandbox.SandboxSpec`.
@@ -1049,7 +1071,7 @@ class DefaultEvalHarness(Harness):
                 rather than falling back to an unsandboxed run.
         """
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
-        plan = agent_sandbox.build_network_plan()
+        plan = agent_sandbox.build_network_plan(cluster_name)
         kubeconfig = agent_sandbox.build_agent_kubeconfig(plan, creds_dir)
         return replace(
             self._agent_config.sandbox,
@@ -1059,7 +1081,12 @@ class DefaultEvalHarness(Harness):
             fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_name),
         )
 
-    def _inventory_sandbox_home(self, task_name: str, home: Path) -> None:
+    def _inventory_sandbox_home(
+        self,
+        task_name: str,
+        home: Path,
+        fixture_mounts: Mapping[str, str] | None = None,
+    ) -> None:
         """Point the pre-run detection inventory at the sandbox home.
 
         Same tripwire, different root: on a sandboxed task the agent's home is
@@ -1069,16 +1096,32 @@ class DefaultEvalHarness(Harness):
         the correct result, not a skipped scan: the sandbox home has no
         prior-run leftovers *by construction*, and anything that does show up
         here (a future harness step seeding the home) gets covered
-        automatically. Best-effort, like the run-level inventory.
+        automatically.
+
+        Fixture mounts are covered separately: they only materialize inside
+        the container, so the host-side scan above cannot see them. Each
+        mounted name gets a container-path rule
+        (:func:`~devops_bench.detection.build_mount_rules`); the per-record
+        prompt filter then authorizes the ones the task itself names, leaving
+        anything the discovery glob swept in that the prompt never asked for
+        — a prior run's leftover on a reused cluster name — flagged.
+        Best-effort, like the run-level inventory.
         """
         if not (self.cheat_detect and self.cheat_inventory):
             return
         try:
-            self._sandbox_inventory_rules[task_name] = build_inventory_rules(
+            rules = build_inventory_rules(
                 home,
                 baseline=DEFAULT_BASELINE
                 | baseline_from_granted_paths(home, self._granted_skill_paths),
             )
+            mounted_names = [
+                PurePosixPath(container_path).name
+                for container_path in (fixture_mounts or {}).values()
+            ]
+            if mounted_names:
+                rules += build_mount_rules(agent_sandbox.CONTAINER_HOME, mounted_names)
+            self._sandbox_inventory_rules[task_name] = rules
         except Exception:  # noqa: BLE001 - detection must never block execution
             _log.exception(
                 "sandbox-home inventory failed for %s; static cheat rules only", task_name
