@@ -634,6 +634,40 @@ class DefaultEvalHarness(Harness):
 
     # -- pipeline ---------------------------------------------------------
 
+    def _inventory_home(
+        self, *, fingerprint_only: frozenset[str] | None = None
+    ) -> tuple[SensitiveAccessRule, ...]:
+        """Snapshot the agent home into prior-run-artifact rules.
+
+        Best-effort by contract: detection must never block execution, so a
+        snapshot failure logs and yields nothing, leaving the caller with the
+        static ruleset alone. Returns nothing too when either cheat-detection
+        toggle is off, which keeps the toggle check in one place.
+
+        Args:
+            fingerprint_only: Passed through to
+                :func:`~devops_bench.detection.build_inventory_rules` — the
+                entry names still allowed to produce content rules.
+
+        Returns:
+            The generated ruleset, empty on failure or when disabled.
+        """
+        if not (self.cheat_detect and self.cheat_inventory):
+            return ()
+        try:
+            home = Path.home()
+            # Skills granted to the agent are material it is told to read,
+            # so the home entry holding them is environment, not leftover.
+            return build_inventory_rules(
+                home,
+                baseline=DEFAULT_BASELINE
+                | baseline_from_granted_paths(home, self._granted_skill_paths),
+                fingerprint_only=fingerprint_only,
+            )
+        except Exception:  # noqa: BLE001 - detection must never block execution
+            _log.exception("home inventory failed; static cheat rules only")
+            return ()
+
     def run(self, tasks: list[Task]) -> list[dict[str, Any]]:
         """Run the full pipeline over ``tasks`` and return scored results.
 
@@ -647,31 +681,36 @@ class DefaultEvalHarness(Harness):
         """
         run_dir = self.reporter.new_run_dir()
 
-        # Inventory the agent home BEFORE any agent executes: whatever is
-        # already there was left by prior runs (or the operator), so this
-        # run's own writes can never match the generated rules. Best-effort:
-        # detection falls back to the static ruleset on any failure.
-        inventory_rules: tuple[SensitiveAccessRule, ...] = ()
-        if self.cheat_detect and self.cheat_inventory:
-            try:
-                home = Path.home()
-                # Skills granted to the agent are material it is told to read,
-                # so the home entry holding them is environment, not leftover.
-                inventory_rules = build_inventory_rules(
-                    home,
-                    baseline=DEFAULT_BASELINE
-                    | baseline_from_granted_paths(home, self._granted_skill_paths),
-                )
-                if inventory_rules:
-                    _log.info(
-                        "cheat detection: %d prior-run-artifact rule(s) from the "
-                        "pre-run home inventory",
-                        len(inventory_rules),
-                    )
-            except Exception:  # noqa: BLE001 - detection must never block execution
-                _log.exception("pre-run inventory failed; static cheat rules only")
+        # Snapshot the home once before anything runs, purely to record which
+        # leftovers predate the batch. Those are genuine prior-run artifacts
+        # and may fingerprint; anything appearing later was created by this
+        # batch and stays path-only, so an honest repeat iteration is not
+        # flagged for rewording the previous one's report.
+        pre_existing: frozenset[str] = frozenset(
+            rule.source for rule in self._inventory_home() if rule.source
+        )
 
-        detailed_results: list[dict[str, Any]] = [self._run_one(task, run_dir) for task in tasks]
+        # Re-inventory before *each* task's agent executes, so a deliverable
+        # an earlier task left in the home is covered for every task after
+        # it. Paired positionally with ``detailed_results`` rather than keyed
+        # by task name: a batch may run the same task more than once, and
+        # each of those iterations needs the snapshot taken before it, not
+        # the last one taken.
+        task_inventories: list[tuple[SensitiveAccessRule, ...]] = []
+        detailed_results: list[dict[str, Any]] = []
+        for task in tasks:
+            rules = self._inventory_home(fingerprint_only=pre_existing)
+            appeared = {rule.source for rule in rules if rule.source} - pre_existing
+            if appeared:
+                _log.info(
+                    "cheat detection: %d home entr(ies) appeared during this batch and "
+                    "are covered for %s: %s",
+                    len(appeared),
+                    task.name,
+                    ", ".join(sorted(appeared)),
+                )
+            task_inventories.append(rules)
+            detailed_results.append(self._run_one(task, run_dir))
 
         # Annotate sensitive-access flags before the first write so both the
         # raw and the scored results.json carry the report. Best-effort and
@@ -682,7 +721,7 @@ class DefaultEvalHarness(Harness):
             # GitOps repo to push to, the deliverable to write) is
             # authorized for that record, so its inventory path rule is
             # dropped. Content fingerprints always apply.
-            for record in detailed_results:
+            for record, inventory_rules in zip(detailed_results, task_inventories, strict=True):
                 try:
                     annotate_records(
                         [record],

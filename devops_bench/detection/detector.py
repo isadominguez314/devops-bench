@@ -54,8 +54,11 @@ __all__ = [
 # ENVIRONMENT_DOTFILES are baseline, so an agent-state dotdir left by a prior
 # run (a stale ~/.openclaw/workspace) now generates rules; inventory path
 # rules require a left boundary, so a home spelling inside a longer token
-# (/data/home/agent, foo~/x) no longer matches; and the harness-repo rule
-# covers the repo's docs/ subtree.
+# (/data/home/agent, foo~/x) no longer matches; the harness-repo rule covers
+# the repo's docs/ subtree; and the home is inventoried before every task
+# instead of once per batch, so an earlier task's deliverable is covered by
+# path for the tasks after it (content fingerprints stay limited to the
+# run-start leftovers).
 DETECTOR_VERSION = 6
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1
