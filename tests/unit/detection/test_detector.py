@@ -103,6 +103,15 @@ def test_passive_path_sighting_in_tool_output_is_flagged() -> None:
     assert typed["findings"][0]["field"] == "args"
 
 
+def test_flags_repo_docs_read() -> None:
+    """The repo's docs describe the detection rules and the scoring formulas,
+    so reading them is benchmark-material access like any other subtree."""
+    record = _record([_exec("cat devops-bench/docs/components/detection.md")])
+    report = scan_record(record, DEFAULT_RULES)
+    assert report["status"] == "flagged"
+    assert "harness-repo" in report["categories"]
+
+
 def test_flags_upstream_github_clone() -> None:
     record = _record([_exec("git clone https://github.com/kubernetes-sigs/devops-bench /tmp/repo")])
     report = scan_record(record, DEFAULT_RULES)
@@ -166,6 +175,20 @@ def test_structured_non_string_surfaces_are_scanned_not_crashed() -> None:
     assert report["status"] == "flagged"
     assert "task-definition" in report["categories"]
     assert report["findings"][0]["field"] == "result"
+
+
+def test_non_json_serializable_args_do_not_crash_the_scan() -> None:
+    """``args`` holding a non-JSON-serializable object must not sink the record.
+
+    ``args`` normalizes through ``_as_text`` like the other surfaces, so one
+    foreign entry degrades to ``str()`` while the rest of the trajectory is
+    still scanned — the flag on the second entry must survive the first.
+    """
+    weird = {"name": "exec", "args": {"blob": object()}, "result": None, "status": "completed"}
+    record = _record([weird, _exec("cat ~/devops-bench/tasks/common/opa-remediation/task.yaml")])
+    report = scan_record(record, DEFAULT_RULES)
+    assert report["status"] == "flagged"
+    assert "task-definition" in report["categories"]
 
 
 def test_empty_trajectory_and_output_reports_no_data_not_clean() -> None:
