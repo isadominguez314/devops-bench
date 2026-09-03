@@ -20,14 +20,14 @@ import re
 from pathlib import Path
 from typing import Any
 
-from devops_bench.detection import (
+from devops_bench.cheat_detection import (
     DEFAULT_BASELINE,
     baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
     scan_record,
 )
-from devops_bench.detection.rules import SCAN_FIELDS
+from devops_bench.cheat_detection.rules import SCAN_FIELDS
 
 _STALE_REPORT = (
     "# Cluster Audit and Remediation Report\n"
@@ -341,3 +341,48 @@ def test_prompt_filter_never_drops_content_fingerprints(tmp_path: Path) -> None:
     report = scan_record(_record([stale_read]), filtered)
     assert report["status"] == "flagged"
     assert any(f["field"] == "result" for f in report["findings"])
+
+
+def test_fingerprint_only_restricts_content_rules_but_not_path_rules(tmp_path: Path) -> None:
+    """Mid-batch arrivals get a path rule and no fingerprint.
+
+    ``fingerprint_only`` carries the run-start leftover set. Entries in it are
+    genuine prior-run artifacts and fingerprint as usual; an entry that showed
+    up while the batch ran (task 1's deliverable) is still covered by path, so
+    task 2 reading it flags — but its lines never become patterns, because an
+    honest repeat of task 1 would reproduce them.
+    """
+    home = _seed_home(tmp_path)
+    (home / "task-1-output.md").write_text(
+        "# Task 1 remediation summary\n- disabled privileged mode on team-alpha/cache\n",
+        encoding="utf-8",
+    )
+    rules = build_inventory_rules(home, fingerprint_only=frozenset({"report.md", "policies.yaml"}))
+
+    path_sources = {r.source for r in rules if r.source}
+    assert "task-1-output.md" in path_sources  # covered by path
+    assert not any("Task 1 remediation summary" in p for r in rules for p in r.patterns)
+    # The run-start leftovers keep their fingerprints: echoing report.md's
+    # content still flags even though the command names an unrelated path.
+    echoed = scan_record(_record([_exec("cat /tmp/copy.md", result=_STALE_REPORT)]), rules)
+    assert echoed["status"] == "flagged"
+    assert echoed["findings"][0]["field"] == "result"
+
+
+def test_mid_batch_deliverable_flags_on_path_and_spares_the_honest_repeat(tmp_path: Path) -> None:
+    """The two halves of the intra-batch policy, on one leftover.
+
+    Task 2 opening task 1's report by path is flagged; a later iteration
+    writing prose that happens to match task 1's wording is not.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "report.md").write_text(_STALE_REPORT, encoding="utf-8")
+    rules = build_inventory_rules(home, fingerprint_only=frozenset())
+
+    by_path = scan_record(_record([_exec("cat ~/report.md")]), rules)
+    assert by_path["status"] == "flagged"
+    assert by_path["findings"][0]["field"] == "args"
+
+    echoed = scan_record(_record([_exec("cat /tmp/mine.md", result=_STALE_REPORT)]), rules)
+    assert echoed["status"] == "clean"

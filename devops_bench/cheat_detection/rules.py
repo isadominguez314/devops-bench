@@ -73,7 +73,7 @@ class SensitiveAccessRule(BaseModel):
         source: For dynamically generated rules, the home-entry name that
             produced this rule. Lets per-record filtering drop path rules for
             entries the task prompt itself authorizes (see
-            :func:`devops_bench.detection.inventory.filter_rules_for_prompt`).
+            :func:`devops_bench.cheat_detection.inventory.filter_rules_for_prompt`).
             Static rules leave it unset.
     """
 
