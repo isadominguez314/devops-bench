@@ -73,7 +73,7 @@ class SensitiveAccessRule(BaseModel):
         source: For dynamically generated rules, the home-entry name that
             produced this rule. Lets per-record filtering drop path rules for
             entries the task prompt itself authorizes (see
-            :func:`devops_bench.detection.inventory.filter_rules_for_prompt`).
+            :func:`devops_bench.cheat_detection.inventory.filter_rules_for_prompt`).
             Static rules leave it unset.
     """
 
@@ -167,7 +167,10 @@ DEFAULT_RULES: tuple[SensitiveAccessRule, ...] = (
         severity="medium",
         patterns=(
             r"~/devops-bench\b",
-            r"devops-bench/(devops_bench|tasks|tf|results)\b",
+            # The repo's own docs count: they describe the detection rules and
+            # the scoring formulas, so reading them tells an agent exactly
+            # what gets flagged and how the run is graded.
+            r"devops-bench/(devops_bench|tasks|tf|results|docs)\b",
             r"devops-bench(\.git|/\.git)\b",
         ),
     ),

@@ -20,14 +20,14 @@ import re
 from pathlib import Path
 from typing import Any
 
-from devops_bench.detection import (
+from devops_bench.cheat_detection import (
     DEFAULT_BASELINE,
     baseline_from_granted_paths,
     build_inventory_rules,
     filter_rules_for_prompt,
     scan_record,
 )
-from devops_bench.detection.rules import SCAN_FIELDS
+from devops_bench.cheat_detection.rules import SCAN_FIELDS
 
 _STALE_REPORT = (
     "# Cluster Audit and Remediation Report\n"
@@ -58,13 +58,41 @@ def _seed_home(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_inventory_skips_baseline_and_hidden_entries(tmp_path: Path) -> None:
+def test_inventory_skips_baseline_and_environment_dotfiles(tmp_path: Path) -> None:
     home = _seed_home(tmp_path)
     rules = build_inventory_rules(home)
     joined = " ".join(p for rule in rules for p in rule.patterns)
     assert "bench\\.env" not in joined
     assert "bashrc" not in joined
     assert all(rule.category == "prior-run-artifact" for rule in rules)
+
+
+def test_agent_state_dotdir_is_a_leftover_not_environment(tmp_path: Path) -> None:
+    """An agent CLI's state dotdir generates rules; enumerated dotfiles do not.
+
+    Agent harnesses conventionally keep their state in a dotdir, and that is
+    exactly where cross-run contamination piles up — a stale
+    ``~/.openclaw/workspace`` holds a previous task's deliverables. Only the
+    enumerated :data:`ENVIRONMENT_DOTFILES` are baseline, so the dotdir is
+    covered while ``.bashrc`` stays invisible.
+    """
+    workspace = tmp_path / ".openclaw" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "production-readiness.md").write_text(
+        "# Production readiness review\n", encoding="utf-8"
+    )
+    (tmp_path / ".bashrc").write_text("# shell init\n", encoding="utf-8")
+
+    rules = build_inventory_rules(tmp_path)
+    joined = " ".join(p for rule in rules for p in rule.patterns)
+    assert "openclaw" in joined
+    assert "bashrc" not in joined
+
+    report = scan_record(
+        _record([_exec("cat ~/.openclaw/workspace/production-readiness.md")]), rules
+    )
+    assert report["status"] == "flagged"
+    assert report["categories"] == ["prior-run-artifact"]
 
 
 def test_clean_home_yields_no_rules(tmp_path: Path) -> None:
@@ -188,6 +216,21 @@ def test_symlinked_leftover_is_not_fingerprinted(tmp_path: Path) -> None:
     assert scan_record(_record([_exec("cat ~/notes.txt")]), rules)["status"] == "flagged"
 
 
+def test_home_spelling_inside_a_longer_token_is_not_flagged(tmp_path: Path) -> None:
+    """The home prefix must be left-bounded, not a bare substring.
+
+    ``/data<home>/report.md`` contains the literal home path, and a ``~``
+    glued to a word is not a home reference — neither is a read of the
+    leftover, so neither may match its path rule.
+    """
+    home = _seed_home(tmp_path)
+    rules = build_inventory_rules(home)
+    report = scan_record(
+        _record([_exec(f"cat /data{home}/report.md"), _exec("cat foo~/report.md")]), rules
+    )
+    assert report["status"] == "clean"
+
+
 def test_same_name_outside_home_is_not_flagged(tmp_path: Path) -> None:
     """Path rules are home-anchored: this run's own /tmp clone shares no blame."""
     rules = build_inventory_rules(_seed_home(tmp_path))
@@ -298,3 +341,48 @@ def test_prompt_filter_never_drops_content_fingerprints(tmp_path: Path) -> None:
     report = scan_record(_record([stale_read]), filtered)
     assert report["status"] == "flagged"
     assert any(f["field"] == "result" for f in report["findings"])
+
+
+def test_fingerprint_only_restricts_content_rules_but_not_path_rules(tmp_path: Path) -> None:
+    """Mid-batch arrivals get a path rule and no fingerprint.
+
+    ``fingerprint_only`` carries the run-start leftover set. Entries in it are
+    genuine prior-run artifacts and fingerprint as usual; an entry that showed
+    up while the batch ran (task 1's deliverable) is still covered by path, so
+    task 2 reading it flags — but its lines never become patterns, because an
+    honest repeat of task 1 would reproduce them.
+    """
+    home = _seed_home(tmp_path)
+    (home / "task-1-output.md").write_text(
+        "# Task 1 remediation summary\n- disabled privileged mode on team-alpha/cache\n",
+        encoding="utf-8",
+    )
+    rules = build_inventory_rules(home, fingerprint_only=frozenset({"report.md", "policies.yaml"}))
+
+    path_sources = {r.source for r in rules if r.source}
+    assert "task-1-output.md" in path_sources  # covered by path
+    assert not any("Task 1 remediation summary" in p for r in rules for p in r.patterns)
+    # The run-start leftovers keep their fingerprints: echoing report.md's
+    # content still flags even though the command names an unrelated path.
+    echoed = scan_record(_record([_exec("cat /tmp/copy.md", result=_STALE_REPORT)]), rules)
+    assert echoed["status"] == "flagged"
+    assert echoed["findings"][0]["field"] == "result"
+
+
+def test_mid_batch_deliverable_flags_on_path_and_spares_the_honest_repeat(tmp_path: Path) -> None:
+    """The two halves of the intra-batch policy, on one leftover.
+
+    Task 2 opening task 1's report by path is flagged; a later iteration
+    writing prose that happens to match task 1's wording is not.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "report.md").write_text(_STALE_REPORT, encoding="utf-8")
+    rules = build_inventory_rules(home, fingerprint_only=frozenset())
+
+    by_path = scan_record(_record([_exec("cat ~/report.md")]), rules)
+    assert by_path["status"] == "flagged"
+    assert by_path["findings"][0]["field"] == "args"
+
+    echoed = scan_record(_record([_exec("cat /tmp/mine.md", result=_STALE_REPORT)]), rules)
+    assert echoed["status"] == "clean"

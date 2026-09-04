@@ -37,6 +37,16 @@ from devops_bench.agents.capabilities import (
     SkillBinding,
 )
 from devops_bench.chaos import ChaosSpec
+from devops_bench.cheat_detection import (
+    DEFAULT_BASELINE,
+    SensitiveAccessRule,
+    annotate_records,
+    baseline_from_granted_paths,
+    build_inventory_rules,
+    build_mount_rules,
+    filter_rules_for_prompt,
+    load_ruleset,
+)
 from devops_bench.core import (
     ConfigError,
     MissingDependencyError,
@@ -47,16 +57,6 @@ from devops_bench.core import (
     get_logger,
 )
 from devops_bench.deployers.factory import get_deployer
-from devops_bench.detection import (
-    DEFAULT_BASELINE,
-    SensitiveAccessRule,
-    annotate_records,
-    baseline_from_granted_paths,
-    build_inventory_rules,
-    build_mount_rules,
-    filter_rules_for_prompt,
-    load_ruleset,
-)
 from devops_bench.evalharness.artifacts import collect_generated_files, snapshot_dir
 from devops_bench.evalharness.base import Harness
 from devops_bench.evalharness.reporter import ResultReporter
@@ -83,6 +83,7 @@ _log = get_logger("evalharness.default")
 # registry, with no edit here.
 _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
     "devops_bench.agents.cli.gemini_cli",
+    "devops_bench.agents.cli.claude_code",
     "devops_bench.agents.cli.openclaw",
     "devops_bench.agents.cli.antigravity",
     "devops_bench.agents.api.agent",
@@ -91,6 +92,7 @@ _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
 # Aliases normalized to canonical agent keys before registry lookup.
 _AGENT_TYPE_ALIASES: dict[str, str] = {
     "gemini-cli": "gemini",
+    "claude-code": "claude",
 }
 
 # Default agent type when neither --agent-type nor BENCH_AGENT_TYPE is set.
@@ -133,6 +135,17 @@ def _ensure_builtin_agents_registered() -> None:
             # raise a clear ``NotRegisteredError`` later if the user selects
             # an agent whose module did not load.
             _log.debug("optional agent module %s not importable: %s", module, exc)
+
+
+def _canonical_agent_type(agent_type: str) -> str:
+    """Normalize an agent-type alias to its canonical registry key.
+
+    The single source of truth for both registry lookup and result recording,
+    so an arm selected via a friendly alias (``claude-code`` / ``gemini-cli``)
+    aggregates under the same ``harness`` / ``setup_id`` as the canonical key
+    instead of splitting into a second dashboard setup.
+    """
+    return _AGENT_TYPE_ALIASES.get(agent_type, agent_type)
 
 
 class DefaultEvalHarness(Harness):
@@ -273,7 +286,7 @@ class DefaultEvalHarness(Harness):
                 canonical key.
         """
         _ensure_builtin_agents_registered()
-        key = _AGENT_TYPE_ALIASES.get(agent_type, agent_type)
+        key = _canonical_agent_type(agent_type)
         agent_cls = AGENTS.get(key)
         if agent_cls is None:
             raise NotRegisteredError(AGENTS.name, key, AGENTS.keys())
@@ -655,6 +668,40 @@ class DefaultEvalHarness(Harness):
 
     # -- pipeline ---------------------------------------------------------
 
+    def _inventory_home(
+        self, *, fingerprint_only: frozenset[str] | None = None
+    ) -> tuple[SensitiveAccessRule, ...]:
+        """Snapshot the agent home into prior-run-artifact rules.
+
+        Best-effort by contract: detection must never block execution, so a
+        snapshot failure logs and yields nothing, leaving the caller with the
+        static ruleset alone. Returns nothing too when either cheat-detection
+        toggle is off, which keeps the toggle check in one place.
+
+        Args:
+            fingerprint_only: Passed through to
+                :func:`~devops_bench.cheat_detection.build_inventory_rules` — the
+                entry names still allowed to produce content rules.
+
+        Returns:
+            The generated ruleset, empty on failure or when disabled.
+        """
+        if not (self.cheat_detect and self.cheat_inventory):
+            return ()
+        try:
+            home = Path.home()
+            # Skills granted to the agent are material it is told to read,
+            # so the home entry holding them is environment, not leftover.
+            return build_inventory_rules(
+                home,
+                baseline=DEFAULT_BASELINE
+                | baseline_from_granted_paths(home, self._granted_skill_paths),
+                fingerprint_only=fingerprint_only,
+            )
+        except Exception:  # noqa: BLE001 - detection must never block execution
+            _log.exception("home inventory failed; static cheat rules only")
+            return ()
+
     def run(self, tasks: list[Task]) -> list[dict[str, Any]]:
         """Run the full pipeline over ``tasks`` and return scored results.
 
@@ -693,34 +740,47 @@ class DefaultEvalHarness(Harness):
 
         run_dir = self.reporter.new_run_dir()
 
-        # Inventory the agent home BEFORE any agent executes: whatever is
-        # already there was left by prior runs (or the operator), so this
-        # run's own writes can never match the generated rules. Best-effort:
-        # detection falls back to the static ruleset on any failure. On a
-        # sandboxed run the operator home is not what the agent sees, so this
-        # run-level inventory is skipped and ``_run_one`` inventories each
-        # task's own sandbox home (``<workspace>/home``) instead.
-        inventory_rules: tuple[SensitiveAccessRule, ...] = ()
-        if self.cheat_detect and self.cheat_inventory and not sandboxed:
-            try:
-                home = Path.home()
-                # Skills granted to the agent are material it is told to read,
-                # so the home entry holding them is environment, not leftover.
-                inventory_rules = build_inventory_rules(
-                    home,
-                    baseline=DEFAULT_BASELINE
-                    | baseline_from_granted_paths(home, self._granted_skill_paths),
-                )
-                if inventory_rules:
-                    _log.info(
-                        "cheat detection: %d prior-run-artifact rule(s) from the "
-                        "pre-run home inventory",
-                        len(inventory_rules),
-                    )
-            except Exception:  # noqa: BLE001 - detection must never block execution
-                _log.exception("pre-run inventory failed; static cheat rules only")
+        # Snapshot the home once before anything runs, purely to record which
+        # leftovers predate the batch. Those are genuine prior-run artifacts
+        # and may fingerprint; anything appearing later was created by this
+        # batch and stays path-only, so an honest repeat iteration is not
+        # flagged for rewording the previous one's report. Skipped entirely
+        # when sandboxed: the operator home is not what the agent sees.
+        pre_existing: frozenset[str] = frozenset()
+        if not sandboxed:
+            pre_existing = frozenset(rule.source for rule in self._inventory_home() if rule.source)
 
-        detailed_results: list[dict[str, Any]] = [self._run_one(task, run_dir) for task in tasks]
+        # Re-inventory before *each* task's agent executes, so a deliverable
+        # an earlier task left in the home is covered for every task after
+        # it. Paired positionally with ``detailed_results`` rather than keyed
+        # by task name: a batch may run the same task more than once, and
+        # each of those iterations needs the snapshot taken before it, not
+        # the last one taken.
+        #
+        # A sandboxed task inventories a different root, and only ``_run_one``
+        # knows it: the agent's home is that task's ``<workspace>/home`` plus
+        # whatever was bind-mounted into it, neither of which exists until the
+        # workspace is built. So the rules are collected *after* the call, from
+        # what ``_inventory_sandbox_home`` recorded, into the same positional
+        # list — the pairing contract is identical either way.
+        task_inventories: list[tuple[SensitiveAccessRule, ...]] = []
+        detailed_results: list[dict[str, Any]] = []
+        for task in tasks:
+            rules = () if sandboxed else self._inventory_home(fingerprint_only=pre_existing)
+            appeared = {rule.source for rule in rules if rule.source} - pre_existing
+            if appeared:
+                _log.info(
+                    "cheat detection: %d home entr(ies) appeared during this batch and "
+                    "are covered for %s: %s",
+                    len(appeared),
+                    task.name,
+                    ", ".join(sorted(appeared)),
+                )
+            record = self._run_one(task, run_dir)
+            if sandboxed:
+                rules = self._sandbox_inventory_rules.get(task.name, ())
+            task_inventories.append(rules)
+            detailed_results.append(record)
 
         # Annotate sensitive-access flags before the first write so both the
         # raw and the scored results.json carry the report, and because
@@ -733,17 +793,12 @@ class DefaultEvalHarness(Harness):
             # GitOps repo to push to, the deliverable to write) is
             # authorized for that record, so its inventory path rule is
             # dropped. Content fingerprints always apply.
-            for record in detailed_results:
-                record_inventory = (
-                    self._sandbox_inventory_rules.get(record.get("name") or "", ())
-                    if sandboxed
-                    else inventory_rules
-                )
+            for record, inventory_rules in zip(detailed_results, task_inventories, strict=True):
                 try:
                     annotate_records(
                         [record],
                         self._cheat_rules
-                        + filter_rules_for_prompt(record_inventory, record.get("input") or ""),
+                        + filter_rules_for_prompt(inventory_rules, record.get("input") or ""),
                     )
                 except Exception:  # noqa: BLE001 - detection must never sink a completed run
                     _log.exception(
@@ -800,14 +855,18 @@ class DefaultEvalHarness(Harness):
         augmentation = derive_augmentation(
             {"use_mcp": self.use_mcp, "skills": list(self._granted_skill_paths)}
         )
-        model = self._agent_config.model or self._agent_config.provider or self.agent_type
+        # Record the canonical harness key so an arm selected via a friendly
+        # alias (e.g. ``claude-code`` / ``gemini-cli``) aggregates with the
+        # canonical key rather than splitting into a second dashboard setup.
+        harness = _canonical_agent_type(self.agent_type)
+        model = self._agent_config.model or self._agent_config.provider or harness
         manifest = Manifest(
             schema_version=SCHEMA_VERSION,
             run_id=run_dir.name,
             t=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            setup_id=results_setup_id(model, self.agent_type, augmentation),
+            setup_id=results_setup_id(model, harness, augmentation),
             model=model,
-            harness=self.agent_type,
+            harness=harness,
             augmentation=augmentation,
         )
         rows = build_rows(detailed_results, manifest)
@@ -1091,7 +1150,7 @@ class DefaultEvalHarness(Harness):
 
         Same tripwire, different root: on a sandboxed task the agent's home is
         ``<workspace>/home``, not the operator's, so the inventory that feeds
-        :func:`~devops_bench.detection.build_inventory_rules` snapshots that
+        :func:`~devops_bench.cheat_detection.build_inventory_rules` snapshots that
         directory instead. Freshly created it is empty — an empty ruleset is
         the correct result, not a skipped scan: the sandbox home has no
         prior-run leftovers *by construction*, and anything that does show up
@@ -1101,7 +1160,7 @@ class DefaultEvalHarness(Harness):
         Fixture mounts are covered separately: they only materialize inside
         the container, so the host-side scan above cannot see them. Each
         mounted name gets a container-path rule
-        (:func:`~devops_bench.detection.build_mount_rules`); the per-record
+        (:func:`~devops_bench.cheat_detection.build_mount_rules`); the per-record
         prompt filter then authorizes the ones the task itself names, leaving
         anything the discovery glob swept in that the prompt never asked for
         — a prior run's leftover on a reused cluster name — flagged.

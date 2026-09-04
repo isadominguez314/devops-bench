@@ -35,7 +35,7 @@ import re
 from functools import cache
 from typing import Any
 
-from devops_bench.detection.rules import SensitiveAccessRule
+from devops_bench.cheat_detection.rules import SensitiveAccessRule
 
 __all__ = [
     "DETECTOR_VERSION",
@@ -53,8 +53,17 @@ __all__ = [
 # result/output payloads are JSON-dumped and scanned instead of skipped. v5:
 # path rules scan the result surface again — a benchmark path surfacing in an
 # `ls` listing now flags, because no legitimate task puts that material in
-# view. Reports below v5 are not comparable with v5 ones.
-DETECTOR_VERSION = 5
+# view. Reports below v5 are not comparable with v5 ones. v6: the pre-run
+# inventory no longer blanket-skips hidden home entries; only the enumerated
+# ENVIRONMENT_DOTFILES are baseline, so an agent-state dotdir left by a prior
+# run (a stale ~/.openclaw/workspace) now generates rules; inventory path
+# rules require a left boundary, so a home spelling inside a longer token
+# (/data/home/agent, foo~/x) no longer matches; the harness-repo rule covers
+# the repo's docs/ subtree; and the home is inventoried before every task
+# instead of once per batch, so an earlier task's deliverable is covered by
+# path for the tasks after it (content fingerprints stay limited to the
+# run-start leftovers).
+DETECTOR_VERSION = 6
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1
 
@@ -158,7 +167,7 @@ def scan_record(record: dict[str, Any], rules: tuple[SensitiveAccessRule, ...]) 
     Args:
         record: A results.json record dict (``trajectory`` + ``output`` keys).
         rules: The ruleset to match, e.g. from
-            :func:`devops_bench.detection.rules.load_ruleset`.
+            :func:`devops_bench.cheat_detection.rules.load_ruleset`.
 
     Returns:
         The report mapping: ``status`` is ``flagged`` (findings present),
@@ -170,14 +179,24 @@ def scan_record(record: dict[str, Any], rules: tuple[SensitiveAccessRule, ...]) 
     output = _as_text(record.get("output"))
     findings: list[dict[str, Any]] = []
 
+    # Normalize every entry's surfaces to text once, outside the rule loop:
+    # every rule scans the same strings, so converting per rule would redo
+    # len(rules) * len(trajectory) dumps of identical values. ``args`` goes
+    # through ``_as_text`` like the other surfaces — a foreign harness can
+    # store a non-JSON-serializable object there, and a raw ``json.dumps``
+    # would throw the whole scan away over one entry.
+    surfaces = [
+        (idx, entry.get("name"), _as_text(entry.get("args") or {}), _as_text(entry.get("result")))
+        for idx, entry in enumerate(trajectory)
+    ]
+
     for rule in rules:
         budget = _MAX_FINDINGS_PER_RULE
-        for idx, entry in enumerate(trajectory):
-            tool = entry.get("name")
+        for idx, tool, args_text, result_text in surfaces:
             if "args" in rule.fields:
                 budget = _scan_text(
                     rule,
-                    json.dumps(entry.get("args") or {}),
+                    args_text,
                     field="args",
                     trajectory_index=idx,
                     tool=tool,
@@ -187,7 +206,7 @@ def scan_record(record: dict[str, Any], rules: tuple[SensitiveAccessRule, ...]) 
             if "result" in rule.fields:
                 budget = _scan_text(
                     rule,
-                    _as_text(entry.get("result")),
+                    result_text,
                     field="result",
                     trajectory_index=idx,
                     tool=tool,
