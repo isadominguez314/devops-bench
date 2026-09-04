@@ -29,6 +29,8 @@ from devops_bench.core.subprocess import CompletedProcess, _build_env, run
 
 __all__ = [
     "apply",
+    "config_value",
+    "create_token",
     "get_resource",
     "is_not_found",
     "port_forward",
@@ -271,6 +273,72 @@ def apply(
     """
     argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
     return _run_kubectl(argv, kubeconfig, context)
+
+
+def config_value(
+    jsonpath: str,
+    *,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> str:
+    """Read one value out of the effective kubeconfig, ``""`` when absent.
+
+    ``--minify`` reduces the view to the selected context before the jsonpath
+    is applied, so ``{.clusters[0]...}`` always refers to that context's own
+    cluster however many the file holds.
+
+    Args:
+        jsonpath: Expression passed to ``-o jsonpath=``, e.g.
+            ``"{.clusters[0].cluster.server}"``.
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubectl context to read (``--context``); ``None``
+            reads the ambient current-context.
+
+    Returns:
+        The stripped value, or ``""`` when the key is absent or kubectl fails
+        — callers decide whether an absent value is fatal.
+    """
+    argv = ["kubectl", "config", "view", "--raw", "--minify", "-o", f"jsonpath={jsonpath}"]
+    completed = _run_kubectl(argv, kubeconfig, context, check=False)
+    return (completed.stdout or "").strip()
+
+
+def create_token(
+    service_account: str,
+    *,
+    namespace: str,
+    duration_sec: float,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> str:
+    """Mint a short-lived ServiceAccount token via ``kubectl create token``.
+
+    The apiserver may return a shorter lifetime than requested when the
+    request exceeds its configured maximum; the token is still valid, just
+    sooner-expiring, so this reports what it was given rather than failing.
+
+    Args:
+        service_account: Name of the ServiceAccount to mint for.
+        namespace: Namespace holding the ServiceAccount (``-n``).
+        duration_sec: Requested token lifetime (``--duration=<n>s``).
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubectl context to pin the call to (``--context``).
+
+    Returns:
+        The bearer token.
+
+    Raises:
+        SubprocessError: If kubectl exits non-zero or times out.
+    """
+    argv = [
+        "kubectl",
+        "create",
+        "token",
+        service_account,
+        f"--duration={int(duration_sec)}s",
+        *_namespace_args(namespace),
+    ]
+    return (_run_kubectl(argv, kubeconfig, context).stdout or "").strip()
 
 
 def rollout_status(

@@ -1063,9 +1063,12 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     kubeconfig = tmp_path / "creds" / "kubeconfig"
     provider = object()
 
-    def fake_build_kubeconfig(got_plan: Any, dest_dir: Path) -> Path:
+    def fake_provision(got_plan: Any, dest_dir: Path, *, token_ttl_sec: int) -> Path:
         assert got_plan is plan
         assert dest_dir == tmp_path / "creds"
+        # The agent's default 600s timeout plus the module's slack: the token
+        # must outlast the run it is minted for.
+        assert token_ttl_sec == 1500
         return kubeconfig
 
     plan_requests: list[tuple[Any, str]] = []
@@ -1078,7 +1081,7 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
         harness_default.agent_sandbox, "build_network_plan", fake_build_network_plan
     )
     monkeypatch.setattr(
-        harness_default.agent_sandbox, "build_agent_kubeconfig", fake_build_kubeconfig
+        harness_default.agent_credentials, "provision_agent_credentials", fake_provision
     )
     monkeypatch.setattr(
         harness_default.agent_sandbox,

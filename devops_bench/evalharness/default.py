@@ -67,6 +67,7 @@ from devops_bench.evalharness.scenario import (
     ScenarioManager,
     pick_free_port,
 )
+from devops_bench.k8s import agent_credentials
 from devops_bench.tasks import Task
 from devops_bench.verification import (
     MIN_LEAF_BUDGET_SECONDS,
@@ -1114,9 +1115,10 @@ class DefaultEvalHarness(Harness):
         Creates the sandbox home (``<workspace>/home`` — the container's
         ``HOME``, kept under the workspace so everything the agent writes
         stays inside the directory the harness already diffs), asks the
-        provider how a container reaches *this run's* cluster, builds the
-        single-cluster kubeconfig from that plan, and discovers the task's
-        seeded fixture mounts keyed on the cluster name. Fixture completeness
+        provider how a container reaches *this run's* cluster, provisions the
+        agent's scoped ServiceAccount credential and renders a single-cluster
+        kubeconfig from that plan, and discovers the task's seeded fixture
+        mounts keyed on the cluster name. Fixture completeness
         is part of the boundary, not a convenience: an under-provisioned agent
         hunts for its missing input (see the proposal doc's first observed
         incident).
@@ -1128,7 +1130,7 @@ class DefaultEvalHarness(Harness):
         Args:
             workspace_path: This task's freshly-created workspace.
             creds_dir: Directory (outside the workspace) for the generated
-                kubeconfig.
+                kubeconfig and the rendered agent RBAC manifest.
             cluster_info: This run's cluster, with ``name`` already resolved
                 to the deployer's own; also the fixture-discovery token.
             provider: The deployer's provider, or ``None`` when it has none.
@@ -1137,13 +1139,18 @@ class DefaultEvalHarness(Harness):
             The completed :class:`~devops_bench.agents.sandbox.SandboxSpec`.
 
         Raises:
-            SandboxError: When no plan or kubeconfig can be built for this
-                cluster; the caller turns that into a failed record rather
-                than falling back to an unsandboxed run.
+            SandboxError: When no plan can be built for this cluster, or no
+                scoped credential can be minted for it; the caller turns that
+                into a failed record rather than falling back to an
+                unsandboxed run.
         """
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
         plan = agent_sandbox.build_network_plan(provider, cluster_info)
-        kubeconfig = agent_sandbox.build_agent_kubeconfig(plan, creds_dir)
+        kubeconfig = agent_credentials.provision_agent_credentials(
+            plan,
+            creds_dir,
+            token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
+        )
         return replace(
             self._agent_config.sandbox,
             network=plan,
