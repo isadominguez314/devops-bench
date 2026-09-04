@@ -26,7 +26,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentResult
 from devops_bench.agents import sandbox as agent_sandbox
@@ -48,6 +48,7 @@ from devops_bench.cheat_detection import (
     load_ruleset,
 )
 from devops_bench.core import (
+    ClusterInfo,
     ConfigError,
     MissingDependencyError,
     NotRegisteredError,
@@ -73,6 +74,9 @@ from devops_bench.verification import (
     VerifierAgent,
     parse_entries,
 )
+
+if TYPE_CHECKING:
+    from devops_bench.providers.base import Provider
 
 __all__ = ["DefaultEvalHarness"]
 
@@ -930,12 +934,15 @@ class DefaultEvalHarness(Harness):
                 # exist. The kubeconfig lands in its own temp dir, NOT the
                 # workspace: the workspace is mounted read-write, and the
                 # credential must only enter through its read-only bind. A
-                # failure here (non-kind context, no CA) raises into this
-                # try and becomes a failed record — never a silent
+                # failure here (an unreachable endpoint, no CA) raises into
+                # this try and becomes a failed record — never a silent
                 # unsandboxed run.
                 creds_dir = Path(tempfile.mkdtemp(prefix="devops-bench-creds-"))
                 completed_spec = self._prepare_sandbox_spec(
-                    workspace_path, creds_dir, active_cluster_name
+                    workspace_path,
+                    creds_dir,
+                    replace(cluster_info, name=active_cluster_name),
+                    deployer.provider,
                 )
                 self._active_sandbox_spec = completed_spec
                 self._inventory_sandbox_home(
@@ -1096,48 +1103,53 @@ class DefaultEvalHarness(Harness):
         return result
 
     def _prepare_sandbox_spec(
-        self, workspace_path: Path, creds_dir: Path, cluster_name: str
+        self,
+        workspace_path: Path,
+        creds_dir: Path,
+        cluster_info: ClusterInfo,
+        provider: Provider | None,
     ) -> agent_sandbox.SandboxSpec:
         """Complete the skeletal sandbox spec for one provisioned task.
 
         Creates the sandbox home (``<workspace>/home`` — the container's
         ``HOME``, kept under the workspace so everything the agent writes
-        stays inside the directory the harness already diffs), builds the
-        network plan and single-cluster kubeconfig for *this run's* cluster
-        — ``cluster_name`` pins both to the ``kind-<cluster>`` context, so a
-        current-context switched after provisioning (an operator mid-run, a
-        parallel harness's ``up()``) can never hand the container another
-        cluster's admin credential — and discovers the task's seeded fixture
-        mounts keyed on the same cluster token. Fixture completeness is part
-        of the boundary, not a convenience: an under-provisioned agent hunts
-        for its missing input (see the proposal doc's first observed
+        stays inside the directory the harness already diffs), asks the
+        provider how a container reaches *this run's* cluster, builds the
+        single-cluster kubeconfig from that plan, and discovers the task's
+        seeded fixture mounts keyed on the cluster name. Fixture completeness
+        is part of the boundary, not a convenience: an under-provisioned agent
+        hunts for its missing input (see the proposal doc's first observed
         incident).
+
+        The plan carries a context pin, so a current-context switched after
+        provisioning (an operator mid-run, a parallel harness's ``up()``) can
+        never hand the container another cluster's credential.
 
         Args:
             workspace_path: This task's freshly-created workspace.
             creds_dir: Directory (outside the workspace) for the generated
                 kubeconfig.
-            cluster_name: This run's cluster name (from the deployer): both
-                the context the plan/kubeconfig are pinned to and the
-                fixture-discovery token.
+            cluster_info: This run's cluster, with ``name`` already resolved
+                to the deployer's own; also the fixture-discovery token.
+            provider: The deployer's provider, or ``None`` when it has none.
 
         Returns:
             The completed :class:`~devops_bench.agents.sandbox.SandboxSpec`.
 
         Raises:
-            SandboxError: When no plan or kubeconfig can be built for the
-                active context; the caller turns that into a failed record
-                rather than falling back to an unsandboxed run.
+            SandboxError: When no plan or kubeconfig can be built for this
+                cluster; the caller turns that into a failed record rather
+                than falling back to an unsandboxed run.
         """
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
-        plan = agent_sandbox.build_network_plan(cluster_name)
+        plan = agent_sandbox.build_network_plan(provider, cluster_info)
         kubeconfig = agent_sandbox.build_agent_kubeconfig(plan, creds_dir)
         return replace(
             self._agent_config.sandbox,
             network=plan,
             workspace=workspace_path,
             kubeconfig=kubeconfig,
-            fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_name),
+            fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
         )
 
     def _inventory_sandbox_home(

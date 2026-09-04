@@ -30,6 +30,7 @@ from ruamel.yaml import YAML
 from devops_bench.core import (
     ClusterInfo,
     ConfigError,
+    NetworkPlan,
     get_bool,
     get_env,
     get_logger,
@@ -248,6 +249,42 @@ class VClusterProvider(Provider):
                 "kubeconfig_path": str(resolved_target),
             }
         )
+
+    def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
+        """Reach a virtual cluster's apiserver from inside a container.
+
+        The endpoint needs no rewriting when the virtual cluster is exposed on
+        a routable address (a LoadBalancer on a remote host cluster, the usual
+        scored configuration). A locally-hosted vcluster publishes a NodePort
+        on loopback instead, and the sandbox's generic loopback rewrite covers
+        that without this provider having to know which case it is in.
+
+        What does matter here is the pin. :meth:`ensure_cluster_credentials`
+        writes the virtual cluster's own single-context kubeconfig, so pinning
+        to that context is what keeps the agent's identity — the ServiceAccount
+        and token minted for it — created *inside* the virtual cluster. Without
+        the pin a current-context pointing at the host cluster would get the
+        agent a credential on the very cluster the vcluster exists to hide.
+
+        Args:
+            cluster_info: The provisioned cluster to reach.
+
+        Returns:
+            A default plan pinned to the virtual cluster's own context, or an
+            unpinned one when that context cannot be read.
+        """
+        if not cluster_info.kubeconfig_path:
+            return NetworkPlan()
+        try:
+            return NetworkPlan(kubectl_context=_get_current_context(cluster_info.kubeconfig_path))
+        except ConfigError as exc:
+            _log.warning(
+                "could not read the virtual cluster's context from %s (%s); the sandbox "
+                "kubeconfig will be built from the ambient current-context",
+                cluster_info.kubeconfig_path,
+                exc,
+            )
+            return NetworkPlan()
 
     @staticmethod
     def _is_safe_scratch_path(path: Path) -> bool:

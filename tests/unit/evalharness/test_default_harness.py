@@ -1056,21 +1056,22 @@ def test_agent_config_snapshot_has_no_sandbox_when_flag_off(
 def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from devops_bench.agents.sandbox import NetworkPlan
+    from devops_bench.core import ClusterInfo, NetworkPlan
 
     harness = _sandboxed_harness(monkeypatch, tmp_path)
     plan = NetworkPlan(docker_network="kind", rewrite_server="https://c1-control-plane:6443")
     kubeconfig = tmp_path / "creds" / "kubeconfig"
+    provider = object()
 
     def fake_build_kubeconfig(got_plan: Any, dest_dir: Path) -> Path:
         assert got_plan is plan
         assert dest_dir == tmp_path / "creds"
         return kubeconfig
 
-    plan_requests: list[str] = []
+    plan_requests: list[tuple[Any, str]] = []
 
-    def fake_build_network_plan(cluster_name: str) -> Any:
-        plan_requests.append(cluster_name)
+    def fake_build_network_plan(got_provider: Any, cluster_info: ClusterInfo) -> Any:
+        plan_requests.append((got_provider, cluster_info.name))
         return plan
 
     monkeypatch.setattr(
@@ -1088,7 +1089,9 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     workspace = tmp_path / "workspace-x"
     workspace.mkdir()
     (tmp_path / "creds").mkdir()
-    spec = harness._prepare_sandbox_spec(workspace, tmp_path / "creds", "c1")  # noqa: SLF001
+    spec = harness._prepare_sandbox_spec(  # noqa: SLF001
+        workspace, tmp_path / "creds", ClusterInfo(name="c1"), provider
+    )
 
     # The sandbox home exists on the host before the agent runs (it is both
     # the container HOME mountpoint and the detection inventory root).
@@ -1098,9 +1101,9 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     assert spec.workspace == workspace
     assert spec.kubeconfig == kubeconfig
     assert spec.fixture_mounts == {"/home/op/repo-c1.git": "/workspace/home/repo-c1.git"}
-    # The run's own cluster name pins the plan (and through it the
+    # The run's own provider and cluster build the plan (and through it the
     # kubeconfig), never the ambient current-context.
-    assert plan_requests == ["c1"]
+    assert plan_requests == [(provider, "c1")]
 
 
 def test_build_agent_config_overlays_the_active_sandbox_spec(
