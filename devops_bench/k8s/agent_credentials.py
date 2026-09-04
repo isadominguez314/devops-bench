@@ -88,12 +88,18 @@ TOKEN_TTL_SLACK_SEC = 900
 POD_SECURITY_BASELINE = "baseline"
 POD_SECURITY_PRIVILEGED = "privileged"
 
-# Namespaces left alone by both halves of the pod-security enforcement. These
-# hold the cluster's own control-plane and storage components, which
-# legitimately run privileged and with host mounts; enforcing on them would
-# break the cluster rather than the agent. ``bench-system`` is exempt because
-# it is the harness's own, not the agent's to deploy into.
-_PSA_EXEMPT_NAMESPACES = frozenset(
+# Namespaces the ADMISSION POLICY leaves alone. They hold the cluster's own
+# control-plane, storage and managed add-on components, which legitimately run
+# privileged and with host mounts; denying them would break the cluster rather
+# than the agent.
+#
+# ``bench-system`` is deliberately NOT in this set. It is skipped by the
+# labeller below — it carries no workload to constrain — but the agent holds
+# ``edit`` cluster-wide and can therefore create pods in it, so exempting it
+# from the policy too would leave a namespace the agent can reach and the
+# control cannot see. Every name here must be one the agent cannot write to,
+# which is also why ``_NAMESPACE_GUARD`` stops it from claiming an unused one.
+_POLICY_EXEMPT_NAMESPACES = frozenset(
     {
         "kube-system",
         "kube-public",
@@ -102,11 +108,21 @@ _PSA_EXEMPT_NAMESPACES = frozenset(
         "gke-managed-system",
         "gmp-system",
         "vcluster",
-        AGENT_NAMESPACE,
     }
 )
 
+# Namespaces the PSA labeller skips: the policy-exempt set, plus the harness's
+# own — which is not the agent's to deploy into and holds only a
+# ServiceAccount.
+_LABEL_EXEMPT_NAMESPACES = _POLICY_EXEMPT_NAMESPACES | {AGENT_NAMESPACE}
+
 _PSA_ENFORCE_LABEL = "pod-security.kubernetes.io/enforce"
+
+# The agent's own apiserver username, as RBAC and admission see it.
+_AGENT_USERNAME = f"system:serviceaccount:{AGENT_NAMESPACE}:{AGENT_SA_NAME}"
+
+# The exempt names as a CEL list literal, for the guard policy's expression.
+_EXEMPT_CEL_LIST = ", ".join(f"'{name}'" for name in sorted(_POLICY_EXEMPT_NAMESPACES))
 
 # The admission-policy backstop, denying the escape the proposal observed:
 # a privileged pod with a hostPath mount, used to read the bench checkout off
@@ -123,6 +139,23 @@ _PSA_ENFORCE_LABEL = "pod-security.kubernetes.io/enforce"
 # ``failurePolicy: Fail`` because a control that fails open is not a control.
 # The binding exempts the system namespaces by name, so a CEL evaluation error
 # can cost the agent a pod but cannot wedge the cluster's own components.
+#
+# ``pods/ephemeralcontainers`` is matched alongside ``pods`` because it is a
+# distinct subresource: a rule naming only ``pods`` matches the empty
+# subresource, so without this ``kubectl debug --profile=sysadmin`` would
+# attach a privileged container to an existing pod and never reach the
+# ``ephemeralContainers`` validation below. ``object`` is the whole Pod on that
+# subresource, so the same expressions apply unchanged.
+#
+# The second policy closes the other way past a name-based exemption: the agent
+# can create namespaces, and several exempt names do not exist on every
+# provider (``gmp-system`` on kind, ``local-path-storage`` on GKE), so it could
+# simply claim one and deploy there. It is a separate policy with its own
+# unselected binding because the pod policy's ``namespaceSelector`` would
+# otherwise exempt the very creation being guarded. Scoping it to the agent's
+# own username via ``matchConditions`` is safe here in a way it would NOT be
+# for pods: a namespace is always created by whoever asked, whereas a pod may
+# be created on the agent's behalf by a controller running as another identity.
 _POD_SECURITY_POLICY_MANIFEST = f"""\
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -135,7 +168,7 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["pods"]
+        resources: ["pods", "pods/ephemeralcontainers"]
   validations:
     - expression: "!has(object.spec.hostNetwork) || !object.spec.hostNetwork"
       message: "hostNetwork is not allowed for benchmark workloads"
@@ -180,7 +213,36 @@ spec:
       matchExpressions:
         - key: kubernetes.io/metadata.name
           operator: NotIn
-          values: [{", ".join(sorted(_PSA_EXEMPT_NAMESPACES))}]
+          values: [{", ".join(sorted(_POLICY_EXEMPT_NAMESPACES))}]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: bench-agent-namespace-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["namespaces"]
+  matchConditions:
+    - name: only-the-sandboxed-agent
+      expression: "request.userInfo.username == '{_AGENT_USERNAME}'"
+  validations:
+    - expression: "!(object.metadata.name in [{_EXEMPT_CEL_LIST}])"
+      message: >-
+        that namespace name is reserved for the cluster's own components and is
+        exempt from the benchmark's pod-security policy
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: bench-agent-namespace-guard
+spec:
+  policyName: bench-agent-namespace-guard
+  validationActions: ["Deny"]
 """
 
 # Ceiling on the lifetime, so a long or unbounded run cannot mint a credential
@@ -332,7 +394,8 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
     and the one an operator can read off a namespace; a
     ValidatingAdmissionPolicy backs them up cluster-wide, covering namespaces
     the agent creates *after* this runs — a label cannot, and one of the tasks
-    asks the agent to create a namespace.
+    asks the agent to create a namespace. A second policy stops the agent from
+    creating a namespace under one of the names the first one exempts.
 
     Namespaces that already carry an ``enforce`` label are left alone: a task
     may assert a specific level as part of its own verification (one asserts
@@ -386,7 +449,7 @@ def _labellable_namespaces(context: str | None) -> list[str]:
     for item in listing.get("items", []):
         meta = item.get("metadata", {})
         name = meta.get("name", "")
-        if not name or name in _PSA_EXEMPT_NAMESPACES:
+        if not name or name in _LABEL_EXEMPT_NAMESPACES:
             continue
         if meta.get("labels", {}).get(_PSA_ENFORCE_LABEL):
             _log.debug("namespace %s already declares a pod-security level; leaving it", name)
