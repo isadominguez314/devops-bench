@@ -31,6 +31,7 @@ from devops_bench.core import (
     ClusterInfo,
     ConfigError,
     NetworkPlan,
+    SandboxError,
     get_bool,
     get_env,
     get_logger,
@@ -270,21 +271,31 @@ class VClusterProvider(Provider):
             cluster_info: The provisioned cluster to reach.
 
         Returns:
-            A default plan pinned to the virtual cluster's own context, or an
-            unpinned one when that context cannot be read.
+            A default plan pinned to the virtual cluster's own context.
+
+        Raises:
+            SandboxError: When that context cannot be read. Degrading to an
+                unpinned plan would mint the agent's identity and token on the
+                ambient current-context, which on a vcluster run is the HOST
+                cluster — precisely the credential this pin exists to withhold.
+                Only sandboxed runs reach this method, so failing here cannot
+                affect an ordinary run.
         """
         if not cluster_info.kubeconfig_path:
-            return NetworkPlan()
+            raise SandboxError(
+                "the virtual cluster reported no kubeconfig path, so the sandbox cannot "
+                "pin to its context; refusing rather than provisioning the agent's "
+                "credential against the ambient context, which is the host cluster"
+            )
         try:
             return NetworkPlan(kubectl_context=_get_current_context(cluster_info.kubeconfig_path))
         except ConfigError as exc:
-            _log.warning(
-                "could not read the virtual cluster's context from %s (%s); the sandbox "
-                "kubeconfig will be built from the ambient current-context",
-                cluster_info.kubeconfig_path,
-                exc,
-            )
-            return NetworkPlan()
+            raise SandboxError(
+                "could not read the virtual cluster's context from "
+                f"{cluster_info.kubeconfig_path} ({exc}); refusing rather than "
+                "provisioning the agent's credential against the ambient context, "
+                "which is the host cluster"
+            ) from exc
 
     @staticmethod
     def _is_safe_scratch_path(path: Path) -> bool:
