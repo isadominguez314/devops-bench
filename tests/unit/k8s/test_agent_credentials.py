@@ -366,6 +366,11 @@ def _policy_docs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
     return [d for d in yaml.safe_load_all(text) if d]
 
 
+def _doc(docs: list[dict], kind: str, name: str) -> dict:
+    """Pick one document out of the multi-doc manifest by kind and name."""
+    return next(d for d in docs if d["kind"] == kind and d["metadata"]["name"] == name)
+
+
 def test_pod_security_policy_denies_the_observed_escape(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -373,7 +378,7 @@ def test_pod_security_policy_denies_the_observed_escape(
     reading the bench checkout off the node's disk. Every ingredient of it must
     have a validation that rejects it."""
     docs = _policy_docs(tmp_path, monkeypatch)
-    policy = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicy")
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
     expressions = " ".join(v["expression"] for v in policy["spec"]["validations"])
 
     assert "hostPath" in expressions
@@ -389,11 +394,25 @@ def test_pod_security_policy_denies_rather_than_warns(
     """Detection is a tripwire; this is meant to be a boundary. A binding in
     Warn mode would let the escape through and merely mention it."""
     docs = _policy_docs(tmp_path, monkeypatch)
-    binding = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicyBinding")
-    policy = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicy")
+    binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
 
     assert binding["spec"]["validationActions"] == ["Deny"]
     assert policy["spec"]["failurePolicy"] == "Fail"
+
+
+def test_pod_security_policy_also_matches_the_ephemeral_container_subresource(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``pods/ephemeralcontainers`` is a distinct subresource, so a rule naming
+    only ``pods`` never sees ``kubectl debug --profile=sysadmin`` — and the
+    ephemeral-container validation below it would be dead code."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
+    resources = policy["spec"]["matchConstraints"]["resourceRules"][0]["resources"]
+
+    assert "pods" in resources
+    assert "pods/ephemeralcontainers" in resources
 
 
 def test_pod_security_policy_exempts_the_clusters_own_components(
@@ -402,13 +421,61 @@ def test_pod_security_policy_exempts_the_clusters_own_components(
     """Control-plane and storage components legitimately run privileged with
     host mounts; enforcing on them would break the cluster, not the agent."""
     docs = _policy_docs(tmp_path, monkeypatch)
-    binding = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicyBinding")
+    binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
     expr = binding["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"][0]
 
     assert expr["key"] == "kubernetes.io/metadata.name"
     assert expr["operator"] == "NotIn"
     assert "kube-system" in expr["values"]
-    assert creds.AGENT_NAMESPACE in expr["values"]
+
+
+def test_pod_security_policy_does_not_exempt_the_harness_namespace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The agent holds ``edit`` cluster-wide, so it can create pods in
+    ``bench-system``. Exempting that namespace would leave it a namespace it
+    can reach and the policy cannot see — a privileged hostPath pod one
+    ``-n bench-system`` away."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
+    expr = binding["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"][0]
+
+    assert creds.AGENT_NAMESPACE not in expr["values"]
+
+
+def test_namespace_guard_denies_claiming_an_exempt_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exemptions are by name and the agent can create namespaces, so without
+    this it could ``create ns gmp-system`` (absent on kind) and deploy there."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
+    binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-namespace-guard")
+    rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
+    expression = policy["spec"]["validations"][0]["expression"]
+
+    assert rule["resources"] == ["namespaces"]
+    assert rule["operations"] == ["CREATE"]
+    assert "'kube-system'" in expression
+    assert "'gmp-system'" in expression
+    assert binding["spec"]["validationActions"] == ["Deny"]
+    # No namespaceSelector: the pod policy's ``NotIn`` would otherwise exempt
+    # the very namespace creation being guarded.
+    assert "namespaceSelector" not in binding["spec"].get("matchResources", {})
+
+
+def test_namespace_guard_applies_only_to_the_agents_own_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cluster add-on recreating its own namespace must not be denied by a
+    policy that fails closed. Safe to scope by user here — unlike a pod, a
+    namespace is always created by whoever asked, never by a controller acting
+    on the agent's behalf."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
+    condition = policy["spec"]["matchConditions"][0]["expression"]
+
+    assert f"system:serviceaccount:{creds.AGENT_NAMESPACE}:{creds.AGENT_SA_NAME}" in condition
 
 
 def test_enforce_pod_security_labels_ordinary_namespaces(
