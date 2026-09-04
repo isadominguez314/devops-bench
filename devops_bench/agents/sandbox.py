@@ -62,6 +62,7 @@ from urllib.parse import urlsplit
 from devops_bench.core import ClusterInfo, NetworkPlan, get_env, get_logger
 from devops_bench.core.errors import SandboxError
 from devops_bench.core.subprocess import CompletedProcess, run
+from devops_bench.k8s import kubectl
 
 if TYPE_CHECKING:
     from devops_bench.providers.base import Provider
@@ -72,7 +73,6 @@ __all__ = [
     "SandboxExecutor",
     "spec_from_env",
     "build_network_plan",
-    "build_agent_kubeconfig",
     "discover_fixture_mounts",
     "filter_boundary_env",
     "container_name_for_workspace",
@@ -266,7 +266,7 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     """
     if plan.rewrite_server:
         return plan
-    server = _kubectl_config_value("{.clusters[0].cluster.server}", context=plan.kubectl_context)
+    server = kubectl.config_value("{.clusters[0].cluster.server}", context=plan.kubectl_context)
     if not server:
         raise SandboxError(
             "could not read the cluster server URL from the run's kubectl context; "
@@ -287,98 +287,6 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
         rewrite_server=f"https://host.docker.internal{port}",
         tls_server_name=plan.tls_server_name or "localhost",
     )
-
-
-def _kubectl_config_value(jsonpath: str, context: str | None = None) -> str:
-    """Read one kubectl config value, empty when absent.
-
-    Pinned to ``context`` when given (``--minify`` then minifies relative to
-    it); otherwise reads the ambient current-context.
-    """
-    argv = ["kubectl", "config", "view", "--raw", "--minify"]
-    if context:
-        argv += ["--context", context]
-    argv += ["-o", f"jsonpath={jsonpath}"]
-    completed = run(argv, check=False)
-    return (completed.stdout or "").strip()
-
-
-def build_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path:
-    """Write the single-cluster kubeconfig the container gets, and return its path.
-
-    The rendered file carries exactly one cluster, one user, and one context:
-    the agent cannot switch to another cluster the operator's kubeconfig
-    happens to know about, and there is no ``exec:`` credential plugin block —
-    a plugin would need ambient cloud credentials the container deliberately
-    lacks.
-
-    The credential is the operator's client certificate for the run's (kind)
-    cluster, which is cluster-admin — so the container boundary is doing all
-    the work and the RBAC boundary none. That is a deliberate, loudly-logged
-    interim state: scoped ServiceAccount tokens arrive with the
-    credential-scoping follow-up.
-
-    Every kubectl read is pinned to ``plan.kubectl_context`` when the plan
-    carries one, so the rendered CA / cert / server always belong to the
-    run's own cluster even if the ambient current-context was switched after
-    provisioning (an operator mid-run, a parallel harness's ``up()``).
-
-    Args:
-        plan: The run's network plan; ``rewrite_server`` replaces the
-            context's server URL, ``tls_server_name`` is rendered when set,
-            and ``kubectl_context`` pins every config read.
-        dest_dir: Directory the kubeconfig is written into. Callers must keep
-            it OUTSIDE the workspace, otherwise the file would also surface
-            read-write under ``/workspace``.
-
-    Returns:
-        Path of the written kubeconfig (mode 0600).
-
-    Raises:
-        SandboxError: When the active context carries no CA or no static
-            client certificate (e.g. an exec-plugin context) — refusing beats
-            handing the container a kubeconfig that cannot authenticate.
-    """
-    ctx = plan.kubectl_context
-    ca = _kubectl_config_value("{.clusters[0].cluster.certificate-authority-data}", context=ctx)
-    if not ca:
-        raise SandboxError("could not read the cluster CA from the run's kubectl context")
-
-    server = plan.rewrite_server or _kubectl_config_value(
-        "{.clusters[0].cluster.server}", context=ctx
-    )
-    if not server:
-        raise SandboxError("could not read the cluster server URL from the run's kubectl context")
-
-    cert = _kubectl_config_value("{.users[0].user.client-certificate-data}", context=ctx)
-    key = _kubectl_config_value("{.users[0].user.client-key-data}", context=ctx)
-    if not (cert and key):
-        raise SandboxError(
-            "the run's kubectl context carries no static client certificate; "
-            "exec-credential-plugin contexts are handled by the credential-scoping "
-            "follow-up, not by reusing the operator's plugin inside the container"
-        )
-    _log.warning(
-        "sandbox kubeconfig reuses the operator's admin client certificate: the "
-        "container boundary is doing all the work and the RBAC boundary none. "
-        "Scoped ServiceAccount credentials arrive with the credential-scoping "
-        "follow-up."
-    )
-
-    cluster_fields = f"server: {server}, certificate-authority-data: {ca}"
-    if plan.tls_server_name:
-        cluster_fields += f", tls-server-name: {plan.tls_server_name}"
-    path = dest_dir / "kubeconfig"
-    path.write_text(
-        "apiVersion: v1\n"
-        "kind: Config\n"
-        f"clusters: [{{name: c, cluster: {{{cluster_fields}}}}}]\n"
-        f"users: [{{name: u, user: {{client-certificate-data: {cert}, client-key-data: {key}}}}}]\n"
-        "contexts: [{name: ctx, context: {cluster: c, user: u}}]\n"
-        "current-context: ctx\n"
-    )
-    path.chmod(0o600)
-    return path
 
 
 def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
