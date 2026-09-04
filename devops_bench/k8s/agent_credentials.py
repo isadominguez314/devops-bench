@@ -55,7 +55,10 @@ __all__ = [
     "AGENT_NAMESPACE",
     "AGENT_SA_NAME",
     "ALLOW_ADMIN_ENV",
+    "POD_SECURITY_BASELINE",
+    "POD_SECURITY_PRIVILEGED",
     "ensure_agent_identity",
+    "enforce_pod_security",
     "mint_agent_token",
     "provision_agent_credentials",
     "render_agent_kubeconfig",
@@ -80,6 +83,105 @@ ALLOW_ADMIN_ENV = "BENCH_SANDBOX_ALLOW_ADMIN_CREDS"
 # Slack added to the agent's own timeout so its token outlasts the work it is
 # for, covering provisioning, teardown, and clock skew against the apiserver.
 TOKEN_TTL_SLACK_SEC = 900
+
+# Pod-security levels a task may declare via ``agent_pod_security:``.
+POD_SECURITY_BASELINE = "baseline"
+POD_SECURITY_PRIVILEGED = "privileged"
+
+# Namespaces left alone by both halves of the pod-security enforcement. These
+# hold the cluster's own control-plane and storage components, which
+# legitimately run privileged and with host mounts; enforcing on them would
+# break the cluster rather than the agent. ``bench-system`` is exempt because
+# it is the harness's own, not the agent's to deploy into.
+_PSA_EXEMPT_NAMESPACES = frozenset(
+    {
+        "kube-system",
+        "kube-public",
+        "kube-node-lease",
+        "local-path-storage",
+        "gke-managed-system",
+        "gmp-system",
+        "vcluster",
+        AGENT_NAMESPACE,
+    }
+)
+
+_PSA_ENFORCE_LABEL = "pod-security.kubernetes.io/enforce"
+
+# The admission-policy backstop, denying the escape the proposal observed:
+# a privileged pod with a hostPath mount, used to read the bench checkout off
+# the node's disk.
+#
+# PSA labels alone cannot cover this. A label is per-namespace, applied to the
+# namespaces that exist when the agent starts — but the agent can create a
+# namespace afterwards (``deploy-hello-app`` literally asks it to) and that
+# one carries no label. A ValidatingAdmissionPolicy is cluster-wide and
+# therefore proof against namespaces that do not exist yet. It also sidesteps
+# a collision: ``deploy-hello-app``'s verifier asserts ``enforce=restricted``
+# on its namespace, which the labeller must not clobber.
+#
+# ``failurePolicy: Fail`` because a control that fails open is not a control.
+# The binding exempts the system namespaces by name, so a CEL evaluation error
+# can cost the agent a pod but cannot wedge the cluster's own components.
+_POD_SECURITY_POLICY_MANIFEST = f"""\
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: bench-agent-pod-security
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: "!has(object.spec.hostNetwork) || !object.spec.hostNetwork"
+      message: "hostNetwork is not allowed for benchmark workloads"
+    - expression: "!has(object.spec.hostPID) || !object.spec.hostPID"
+      message: "hostPID is not allowed for benchmark workloads"
+    - expression: "!has(object.spec.hostIPC) || !object.spec.hostIPC"
+      message: "hostIPC is not allowed for benchmark workloads"
+    - expression: >-
+        !has(object.spec.volumes) ||
+        object.spec.volumes.all(v, !has(v.hostPath))
+      message: "hostPath volumes are not allowed for benchmark workloads"
+    - expression: >-
+        object.spec.containers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.privileged) ||
+          !c.securityContext.privileged)
+      message: "privileged containers are not allowed for benchmark workloads"
+    - expression: >-
+        !has(object.spec.initContainers) ||
+        object.spec.initContainers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.privileged) ||
+          !c.securityContext.privileged)
+      message: "privileged init containers are not allowed for benchmark workloads"
+    - expression: >-
+        !has(object.spec.ephemeralContainers) ||
+        object.spec.ephemeralContainers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.privileged) ||
+          !c.securityContext.privileged)
+      message: "privileged ephemeral containers are not allowed for benchmark workloads"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: bench-agent-pod-security
+spec:
+  policyName: bench-agent-pod-security
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [{", ".join(sorted(_PSA_EXEMPT_NAMESPACES))}]
+"""
 
 # Ceiling on the lifetime, so a long or unbounded run cannot mint a credential
 # that outlives it by hours. There is no matching floor: the slack above is
@@ -222,6 +324,77 @@ def ensure_agent_identity(work_dir: Path, context: str | None = None) -> None:
     )
 
 
+def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
+    """Deny privileged pods, host namespaces, and hostPath mounts cluster-wide.
+
+    Two halves, because neither alone is enough. PSA ``baseline`` labels go on
+    every namespace that exists now, which is the mechanism Kubernetes ships
+    and the one an operator can read off a namespace; a
+    ValidatingAdmissionPolicy backs them up cluster-wide, covering namespaces
+    the agent creates *after* this runs — a label cannot, and one of the tasks
+    asks the agent to create a namespace.
+
+    Namespaces that already carry an ``enforce`` label are left alone: a task
+    may assert a specific level as part of its own verification (one asserts
+    ``restricted``), and overwriting it would fail the task this control is
+    supposed to protect.
+
+    Args:
+        work_dir: Directory to render the policy manifest into before
+            applying. Must not itself be mounted into the container.
+        context: kubectl context to pin every call to.
+
+    Raises:
+        SubprocessError: If the policy cannot be applied. Namespace labelling
+            failures are warned and skipped — the policy is the load-bearing
+            half, and one unlabellable namespace must not fail the run.
+    """
+    manifest = work_dir / "bench-agent-pod-security.yaml"
+    manifest.write_text(_POD_SECURITY_POLICY_MANIFEST)
+    kubectl.apply(str(manifest), context=context)
+
+    for name in _labellable_namespaces(context):
+        try:
+            kubectl.label(
+                "namespace",
+                name,
+                {
+                    _PSA_ENFORCE_LABEL: POD_SECURITY_BASELINE,
+                    "pod-security.kubernetes.io/warn": POD_SECURITY_BASELINE,
+                    "pod-security.kubernetes.io/audit": POD_SECURITY_BASELINE,
+                },
+                overwrite=True,
+                context=context,
+            )
+        except SubprocessError as exc:
+            _log.warning("could not label namespace %s for pod security: %s", name, exc)
+    _log.info("pod security enforced: baseline labels plus the cluster-wide admission policy")
+
+
+def _labellable_namespaces(context: str | None) -> list[str]:
+    """List the namespaces this run should label, skipping the ones it must not.
+
+    Skips the system namespaces outright, and any namespace that already
+    declares an ``enforce`` level — that value belongs to whoever set it.
+    """
+    try:
+        listing = kubectl.get_resource("namespaces", context=context, timeout=60)
+    except SubprocessError as exc:
+        _log.warning("could not list namespaces for pod-security labelling: %s", exc)
+        return []
+    names = []
+    for item in listing.get("items", []):
+        meta = item.get("metadata", {})
+        name = meta.get("name", "")
+        if not name or name in _PSA_EXEMPT_NAMESPACES:
+            continue
+        if meta.get("labels", {}).get(_PSA_ENFORCE_LABEL):
+            _log.debug("namespace %s already declares a pod-security level; leaving it", name)
+            continue
+        names.append(name)
+    return names
+
+
 def mint_agent_token(ttl_sec: int, context: str | None = None) -> str:
     """Mint a short-lived bearer token for the agent's ServiceAccount.
 
@@ -300,8 +473,14 @@ def render_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path, *, user_fields: s
     return path
 
 
-def provision_agent_credentials(plan: NetworkPlan, dest_dir: Path, *, token_ttl_sec: int) -> Path:
-    """Seed the agent's identity, mint its token, and render its kubeconfig.
+def provision_agent_credentials(
+    plan: NetworkPlan,
+    dest_dir: Path,
+    *,
+    token_ttl_sec: int,
+    pod_security: str = POD_SECURITY_BASELINE,
+) -> Path:
+    """Seed the agent's identity and pod security, and render its kubeconfig.
 
     The single entry point the eval harness calls. On any failure to produce a
     scoped credential this raises rather than falling back: a run that quietly
@@ -316,6 +495,9 @@ def provision_agent_credentials(plan: NetworkPlan, dest_dir: Path, *, token_ttl_
         dest_dir: Directory (outside the workspace) for the kubeconfig and the
             rendered RBAC manifest.
         token_ttl_sec: Requested token lifetime; see :func:`token_ttl_for`.
+        pod_security: The task's declared ``agent_pod_security`` level.
+            ``"privileged"`` skips :func:`enforce_pod_security` entirely, for
+            a task whose own subject matter is privileged workloads.
 
     Returns:
         Path of the written kubeconfig (mode 0600).
@@ -324,6 +506,14 @@ def provision_agent_credentials(plan: NetworkPlan, dest_dir: Path, *, token_ttl_
         SandboxError: When no scoped credential can be minted and the admin
             fallback is not explicitly enabled.
     """
+    if pod_security == POD_SECURITY_PRIVILEGED:
+        _log.warning(
+            "task declares agent_pod_security: %s, so privileged pods, host namespaces "
+            "and hostPath mounts are NOT denied for this run",
+            POD_SECURITY_PRIVILEGED,
+        )
+    else:
+        enforce_pod_security(dest_dir, plan.kubectl_context)
     try:
         ensure_agent_identity(dest_dir, plan.kubectl_context)
         token = mint_agent_token(token_ttl_sec, plan.kubectl_context)
