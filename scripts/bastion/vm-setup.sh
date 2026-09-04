@@ -83,6 +83,36 @@ else
     || echo "    WARN: gemini CLI install failed; gcli agent runs will not work until it's installed."
 fi
 
+# Link-local metadata endpoint — blocked for containers only.
+#
+# A sandboxed agent gets a deliberately narrow set of credentials. That is
+# worth nothing while the container can still curl 169.254.169.254 and be
+# handed this VM's service account token, which carries cloud-platform scope
+# and is not scoped to anything the run needs. This is the proposal's second
+# observed incident, and it is the reason the scoped-credential work has to
+# ship with a rule here rather than after it.
+#
+# DOCKER-USER is the chain Docker leaves for exactly this: it is consulted
+# before Docker's own FORWARD rules, and it applies to *forwarded* traffic
+# only. Host processes are unaffected, so ambient (unsandboxed) harness runs
+# and the matrix keep authenticating through the metadata server as before.
+#
+# Known limitation: iptables rules do not survive a reboot, and DOCKER-USER
+# itself is created by dockerd. Re-run this script after a reboot rather than
+# pulling in iptables-persistent for one rule. See docs/components/infra.md.
+echo "==> metadata endpoint block (container egress)"
+if ! command -v iptables >/dev/null 2>&1; then
+  echo "    WARN: iptables not found; containers can still reach the metadata server."
+elif ! sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+  echo "    WARN: no DOCKER-USER chain yet (is dockerd running?); re-run after Docker starts."
+elif sudo iptables -C DOCKER-USER -d 169.254.169.254 -j REJECT >/dev/null 2>&1; then
+  echo "    already blocked."
+else
+  sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT \
+    && echo "    containers can no longer reach 169.254.169.254." \
+    || echo "    WARN: could not install the rule; containers can still reach the metadata server."
+fi
+
 # fortio — the load generator the chaos agent shells out to for `generate_load`
 # faults (e.g. the optimize-scale load spike). The chaos system instruction tells
 # the agent to use the `fortio` binary; without it on PATH the spike is a silent
