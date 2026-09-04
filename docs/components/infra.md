@@ -38,6 +38,7 @@ Each implements the `Provider` interface (`devops_bench/providers/base.py`):
 - `ensure_cluster_credentials()` — make a provisioned cluster reachable (e.g. `gcloud container clusters get-credentials` or extracting and writing virtual cluster kubeconfig) and return its `ClusterInfo`.
 - `resolve_variables()` — fill in default OpenTofu variables (project, location, cluster name, namespace…) without overwriting anything the task set explicitly.
 - `cleanup()` — optional teardown hook (e.g. deleting orphaned host PersistentVolumes and temporary scratch kubeconfigs on cluster destroy).
+- `sandbox_network_plan()` — describe how a [sandboxed agent](agents.md#sandboxing) container reaches this cluster: which Docker network to join, whether the apiserver URL needs rewriting, and which kubectl context pins the run. The base implementation returns a plain bridge with no rewrite, which is correct for any routable endpoint (GKE, a VPC-reachable vcluster), so a new provider gets a working sandbox for free. Only `kind` overrides it, to join the `kind` network and address the control plane by its in-network name. A locally-published apiserver is handled generically: a loopback URL is remapped to `host.docker.internal` with `tls-server-name: localhost`, so TLS stays verified rather than disabled.
 
 All are listed in the `PROVIDERS` registry.
 
@@ -133,6 +134,26 @@ Anything you put in `variables` always wins over the defaults.
 | `ALLOW_REMOTE_HOST_KUBECONTEXT` | Set to `true` to allow vCluster to target non-local host contexts (e.g. standing GKE clusters). |
 
 The `--project` and `--cluster` CLI flags supply the project and cluster name for a run, feeding the same defaults the providers resolve from.
+
+## The bastion
+
+`scripts/bastion/vm-setup.sh` prepares the GCE VM the benchmark matrix runs on: agent CLIs, the chaos load generator, PATH fixes, and MCP skills. It is idempotent — re-run it any time.
+
+It also installs one firewall rule:
+
+```
+sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT
+```
+
+That blocks the link-local metadata endpoint **for containers only**. Without it, a [sandboxed agent](agents.md#sandboxing) can curl the metadata server and be handed the VM's own service account token — `cloud-platform` scoped, and scoped to nothing the run needs — which makes every narrower credential the sandbox mints meaningless. `DOCKER-USER` applies to forwarded traffic, so host processes are untouched: ambient (unsandboxed) harness runs, the matrix, and `gcloud` on the VM all keep working exactly as before.
+
+> [!IMPORTANT]
+> The rule does not survive a reboot, and the `DOCKER-USER` chain is created by dockerd — so re-run `vm-setup.sh` after a reboot, and after installing or restarting Docker. The script warns instead of failing when the chain is missing. Verify with:
+> ```
+> docker run --rm curlimages/curl -s -m 5 -H 'Metadata-Flavor: Google' \
+>   http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token
+> ```
+> It must fail. If it returns a token, the rule is not in place and no sandboxed run on this VM is credential-isolated.
 
 ## Adding a cloud provider (brief)
 
