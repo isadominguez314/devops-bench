@@ -1257,6 +1257,7 @@ class DefaultEvalHarness(Harness):
                     creds_dir,
                     replace(cluster_info, name=active_cluster_name),
                     deployer.provider,
+                    task.agent_pod_security,
                 )
                 self._active_sandbox_spec = completed_spec
                 self._inventory_sandbox_home(
@@ -1525,6 +1526,7 @@ class DefaultEvalHarness(Harness):
         creds_dir: Path,
         cluster_info: ClusterInfo,
         provider: Provider | None,
+        pod_security: str,
     ) -> agent_sandbox.SandboxSpec:
         """Complete the skeletal sandbox spec for one provisioned task.
 
@@ -1550,6 +1552,7 @@ class DefaultEvalHarness(Harness):
             cluster_info: This run's cluster, with ``name`` already resolved
                 to the deployer's own; also the fixture-discovery token.
             provider: The deployer's provider, or ``None`` when it has none.
+            pod_security: The task's declared ``agent_pod_security`` level.
 
         Returns:
             The completed :class:`~devops_bench.agents.sandbox.SandboxSpec`.
@@ -1566,6 +1569,7 @@ class DefaultEvalHarness(Harness):
             plan,
             creds_dir,
             token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
+            pod_security=pod_security,
         )
         return replace(
             self._agent_config.sandbox,
