@@ -21,7 +21,7 @@ import json
 import re
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any, Protocol
 
 from devops_bench.core import get_logger
@@ -33,6 +33,7 @@ __all__ = [
     "create_token",
     "get_resource",
     "is_not_found",
+    "label",
     "port_forward",
     "rollout_status",
     "wait",
@@ -272,6 +273,48 @@ def apply(
         SubprocessError: If kubectl exits non-zero or times out.
     """
     argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
+    return _run_kubectl(argv, kubeconfig, context)
+
+
+def label(
+    resource: str,
+    name: str,
+    labels: Mapping[str, str],
+    *,
+    overwrite: bool = False,
+    namespace: str | None = None,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> CompletedProcess:
+    """Set labels on one resource via ``kubectl label``.
+
+    Args:
+        resource: Resource kind, e.g. ``"namespace"``.
+        name: Name of the resource to label.
+        labels: Label keys to values. Rendered as ``key=value`` arguments in
+            iteration order.
+        overwrite: Pass ``--overwrite``. Without it kubectl refuses to change
+            a label that already has a different value, which is the right
+            default when a pre-existing value is meaningful.
+        namespace: Optional namespace (``-n``).
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubectl context to pin the call to (``--context``).
+
+    Returns:
+        The completed process.
+
+    Raises:
+        SubprocessError: If kubectl exits non-zero or times out.
+    """
+    argv = [
+        "kubectl",
+        "label",
+        resource,
+        name,
+        *(f"{key}={value}" for key, value in labels.items()),
+        *(["--overwrite"] if overwrite else []),
+        *_namespace_args(namespace),
+    ]
     return _run_kubectl(argv, kubeconfig, context)
 
 

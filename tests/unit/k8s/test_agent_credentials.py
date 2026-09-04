@@ -20,6 +20,7 @@ that is what the tests assert on — no cluster and no docker daemon needed.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +45,7 @@ def _patch_kubectl(
     key: str = "a2V5",
     token: str = _TOKEN,
     mint_fails: bool = False,
+    namespaces: dict | None = None,
     calls: list[list[str]] | None = None,
 ) -> list[list[str]]:
     """Answer every kubectl call this module makes, recording the argv.
@@ -52,6 +54,7 @@ def _patch_kubectl(
     command line the module would have run.
     """
     seen = calls if calls is not None else []
+    namespaces = namespaces if namespaces is not None else {"items": []}
     answers = {
         "jsonpath={.clusters[0].cluster.certificate-authority-data}": ca,
         "jsonpath={.clusters[0].cluster.server}": server,
@@ -68,8 +71,12 @@ def _patch_kubectl(
                 raise SubprocessError(argv, 1, stderr="forbidden: cannot create token")
             return SimpleNamespace(returncode=0, stdout=f"{token}\n", stderr="")
         if "apply" in argv:
-            if mint_fails:
+            if mint_fails and "bench-agent-rbac.yaml" in argv[-1]:
                 raise SubprocessError(argv, 1, stderr="forbidden: cannot create clusterroles")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if argv[1:3] == ["get", "namespaces"] or argv[3:5] == ["get", "namespaces"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(namespaces), stderr="")
+        if "label" in argv:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected kubectl argv: {argv}")
 
@@ -340,3 +347,133 @@ def test_provision_refuses_the_fallback_for_an_exec_plugin_context(
 
     with pytest.raises(SandboxError, match="exec"):
         creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+
+
+# -- pod security ------------------------------------------------------------
+
+
+def _ns(name: str, **labels: str) -> dict:
+    return {"metadata": {"name": name, "labels": labels}}
+
+
+def _policy_docs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    _patch_kubectl(monkeypatch)
+    creds.enforce_pod_security(tmp_path)
+    text = (tmp_path / "bench-agent-pod-security.yaml").read_text()
+    return [d for d in yaml.safe_load_all(text) if d]
+
+
+def test_pod_security_policy_denies_the_observed_escape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The proposal's first incident was a privileged pod with a hostPath mount
+    reading the bench checkout off the node's disk. Every ingredient of it must
+    have a validation that rejects it."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicy")
+    expressions = " ".join(v["expression"] for v in policy["spec"]["validations"])
+
+    assert "hostPath" in expressions
+    assert "privileged" in expressions
+    assert "hostNetwork" in expressions
+    assert "hostPID" in expressions
+    assert "hostIPC" in expressions
+
+
+def test_pod_security_policy_denies_rather_than_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Detection is a tripwire; this is meant to be a boundary. A binding in
+    Warn mode would let the escape through and merely mention it."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    binding = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicyBinding")
+    policy = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicy")
+
+    assert binding["spec"]["validationActions"] == ["Deny"]
+    assert policy["spec"]["failurePolicy"] == "Fail"
+
+
+def test_pod_security_policy_exempts_the_clusters_own_components(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Control-plane and storage components legitimately run privileged with
+    host mounts; enforcing on them would break the cluster, not the agent."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    binding = next(d for d in docs if d["kind"] == "ValidatingAdmissionPolicyBinding")
+    expr = binding["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"][0]
+
+    assert expr["key"] == "kubernetes.io/metadata.name"
+    assert expr["operator"] == "NotIn"
+    assert "kube-system" in expr["values"]
+    assert creds.AGENT_NAMESPACE in expr["values"]
+
+
+def test_enforce_pod_security_labels_ordinary_namespaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _patch_kubectl(monkeypatch, namespaces={"items": [_ns("default"), _ns("kube-system")]})
+
+    creds.enforce_pod_security(tmp_path)
+
+    labelled = [c for c in calls if "label" in c]
+    assert len(labelled) == 1
+    assert labelled[0][:4] == ["kubectl", "label", "namespace", "default"]
+    assert "pod-security.kubernetes.io/enforce=baseline" in labelled[0]
+
+
+def test_enforce_pod_security_leaves_a_declared_level_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One task's verifier asserts ``enforce=restricted`` on its own namespace.
+    Overwriting it would fail the task this control exists to protect."""
+    calls = _patch_kubectl(
+        monkeypatch,
+        namespaces={
+            "items": [_ns("hello-app", **{"pod-security.kubernetes.io/enforce": "restricted"})]
+        },
+    )
+
+    creds.enforce_pod_security(tmp_path)
+
+    assert [c for c in calls if "label" in c] == []
+
+
+def test_enforce_pod_security_pins_every_call_to_the_runs_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _patch_kubectl(monkeypatch, namespaces={"items": [_ns("default")]})
+
+    creds.enforce_pod_security(tmp_path, "vcluster-c1")
+
+    assert calls
+    for argv in calls:
+        assert argv[:3] == ["kubectl", "--context", "vcluster-c1"]
+
+
+def test_provision_enforces_pod_security_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A task author who never heard of the key still gets the control."""
+    calls = _patch_kubectl(monkeypatch)
+
+    creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+
+    assert any("bench-agent-pod-security.yaml" in c[-1] for c in calls if "apply" in c)
+
+
+def test_provision_honours_the_privileged_opt_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A task whose subject matter *is* privileged workloads can opt out, and
+    then nothing pod-security-related is applied at all."""
+    calls = _patch_kubectl(monkeypatch)
+
+    creds.provision_agent_credentials(
+        NetworkPlan(),
+        tmp_path,
+        token_ttl_sec=1500,
+        pod_security=creds.POD_SECURITY_PRIVILEGED,
+    )
+
+    assert not any("bench-agent-pod-security.yaml" in c[-1] for c in calls if "apply" in c)
+    assert [c for c in calls if "label" in c] == []

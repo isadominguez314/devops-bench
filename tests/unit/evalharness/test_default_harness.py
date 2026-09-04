@@ -1063,12 +1063,15 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     kubeconfig = tmp_path / "creds" / "kubeconfig"
     provider = object()
 
-    def fake_provision(got_plan: Any, dest_dir: Path, *, token_ttl_sec: int) -> Path:
+    def fake_provision(
+        got_plan: Any, dest_dir: Path, *, token_ttl_sec: int, pod_security: str
+    ) -> Path:
         assert got_plan is plan
         assert dest_dir == tmp_path / "creds"
         # The agent's default 600s timeout plus the module's slack: the token
         # must outlast the run it is minted for.
         assert token_ttl_sec == 1500
+        assert pod_security == "baseline"
         return kubeconfig
 
     plan_requests: list[tuple[Any, str]] = []
@@ -1093,7 +1096,7 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     workspace.mkdir()
     (tmp_path / "creds").mkdir()
     spec = harness._prepare_sandbox_spec(  # noqa: SLF001
-        workspace, tmp_path / "creds", ClusterInfo(name="c1"), provider
+        workspace, tmp_path / "creds", ClusterInfo(name="c1"), provider, "baseline"
     )
 
     # The sandbox home exists on the host before the agent runs (it is both
