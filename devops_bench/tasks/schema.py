@@ -14,7 +14,7 @@
 
 """Typed schema for benchmark task contracts."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -131,10 +131,11 @@ class Task(BaseModel):
         documentation: Documentation entries, each with per-constraint criticality.
         agent_pod_security: Pod-security level enforced on the namespaces a
             sandboxed agent can reach: ``"baseline"`` (the default) or
-            ``"privileged"`` to opt this task out entirely. Only set
-            ``"privileged"`` for a task whose own subject matter is privileged
-            workloads -- it removes the control that denies the privileged-pod
-            and hostPath escape.
+            ``"privileged"`` to opt this task out entirely. Any other value is
+            a validation error rather than a silent fall-back to the default.
+            Only set ``"privileged"`` for a task whose own subject matter is
+            privileged workloads -- it removes the control that denies the
+            privileged-pod and hostPath escape.
         validated: Whether the task has been vetted as correct and is eligible to
             promote to the leaderboard. Defaults to ``False`` so an unvetted task
             never counts until explicitly marked.
@@ -153,7 +154,10 @@ class Task(BaseModel):
     recoverable_safety: list[str] = Field(default_factory=list)
     infrastructure: dict[str, Any] = Field(default_factory=dict)
     documentation: list[DocumentationEntry] = Field(default_factory=list)
-    agent_pod_security: str = "baseline"
+    # Closed set rather than a bare ``str``: an unrecognised level falls
+    # through to enforcement, so a typo would silently ignore the author's
+    # opt-out and fail the task somewhere far from the cause.
+    agent_pod_security: Literal["baseline", "privileged"] = "baseline"
     validated: bool = False
 
     @model_validator(mode="before")
