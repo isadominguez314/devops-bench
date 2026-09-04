@@ -49,7 +49,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from devops_bench.core import get_env, get_logger
+from devops_bench.core import NetworkPlan, get_env, get_logger
 from devops_bench.core.errors import SandboxError, SubprocessError
 from devops_bench.core.subprocess import CompletedProcess, run
 
@@ -135,29 +135,6 @@ _BENCH_REPO_ROOT = Path(__file__).resolve().parents[2]
 def _overlaps_bench_checkout(path: Path) -> bool:
     resolved = path.resolve()
     return resolved.is_relative_to(_BENCH_REPO_ROOT) or _BENCH_REPO_ROOT.is_relative_to(resolved)
-
-
-@dataclass(frozen=True)
-class NetworkPlan:
-    """How the container reaches this run's cluster apiserver.
-
-    Attributes:
-        docker_network: Docker network to join; ``None`` = default bridge.
-        extra_hosts: Additional ``--add-host`` entries (``host:ip``).
-        rewrite_server: Replacement apiserver URL for the generated
-            kubeconfig; ``None`` keeps the context's own server.
-        tls_server_name: ``tls-server-name`` for a rewritten endpoint whose
-            certificate carries a different SAN.
-        kubectl_context: Context every credential read is pinned to, so an
-            ambient current-context switch cannot hand the container another
-            cluster's credential. ``None`` = ambient current-context.
-    """
-
-    docker_network: str | None = None
-    extra_hosts: tuple[str, ...] = ()
-    rewrite_server: str | None = None
-    tls_server_name: str | None = None
-    kubectl_context: str | None = None
 
 
 @dataclass(frozen=True)
