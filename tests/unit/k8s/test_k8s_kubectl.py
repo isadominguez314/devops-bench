@@ -358,3 +358,60 @@ def test_is_not_found_matches_both_renderings_only(stderr: str, expected: bool) 
 
 def test_is_not_found_tolerates_an_exception_without_stderr() -> None:
     assert kubectl.is_not_found(RuntimeError("boom")) is False
+
+
+# --context pinning. The flags have to land immediately after the binary: they
+# are global flags, so kubectl only honours them BEFORE a bare "--" separator.
+
+
+def test_context_flags_follow_the_binary(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.apply("/tmp/manifest.yaml", namespace="prod", context="kind-bench")
+
+    assert mock_run.call_args.args[0] == [
+        "kubectl",
+        "--context",
+        "kind-bench",
+        "apply",
+        "-f",
+        "/tmp/manifest.yaml",
+        "-n",
+        "prod",
+    ]
+
+
+def test_context_lands_before_a_bare_separator() -> None:
+    argv = kubectl._insert_context_args(
+        ["kubectl", "exec", "pod/web", "--", "sh", "-c", "echo hi"], "kind-bench"
+    )
+
+    assert argv.index("--context") < argv.index("--")
+
+
+@pytest.mark.parametrize("context", [None, ""])
+def test_no_context_leaves_argv_untouched(context: str | None) -> None:
+    argv = ["kubectl", "get", "pods"]
+
+    assert kubectl._insert_context_args(argv, context) is argv
+
+
+def test_get_resource_pins_context_alongside_kubeconfig(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed("{}"))
+
+    kubectl.get_resource("pods", kubeconfig="/tmp/kc", context="gke_p_us_c")
+
+    assert mock_run.call_args.args[0][:3] == ["kubectl", "--context", "gke_p_us_c"]
+    assert mock_run.call_args.kwargs["extra_env"] == {"KUBECONFIG": "/tmp/kc"}
+
+
+def test_port_forward_pins_context(mocker: MockerFixture) -> None:
+    proc = mocker.MagicMock()
+    proc.poll.return_value = None
+    mock_popen = mocker.patch("subprocess.Popen", return_value=proc)
+    mocker.patch("time.sleep")
+
+    with kubectl.port_forward("svc/web", 8080, namespace="prod", context="kind-bench"):
+        pass
+
+    assert mock_popen.call_args.args[0][:3] == ["kubectl", "--context", "kind-bench"]
