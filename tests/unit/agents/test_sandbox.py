@@ -27,6 +27,7 @@ from devops_bench.agents import sandbox
 from devops_bench.agents.base import AgentHarness
 from devops_bench.agents.config import AgentConfig
 from devops_bench.agents.result import AgentResult
+from devops_bench.core import ClusterInfo, NetworkPlan
 from devops_bench.core.errors import SandboxError, SubprocessError
 
 
@@ -169,75 +170,127 @@ def test_sweep_stray_containers_is_a_noop_when_none_are_running(
 # -- cluster context and network plan --------------------------------------
 
 
-def test_current_cluster_name_returns_none_for_non_kind_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        sandbox,
-        "run",
-        lambda argv, **kwargs: SimpleNamespace(
-            returncode=0, stdout="some-cloud_project_region_cluster\n", stderr=""
-        ),
-    )
-    assert sandbox.current_cluster_name() is None
+class _FakeProvider:
+    """A provider stand-in returning a fixed plan, as the real hook does."""
+
+    def __init__(self, plan: NetworkPlan) -> None:
+        self.plan = plan
+        self.seen: list[ClusterInfo] = []
+
+    def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
+        self.seen.append(cluster_info)
+        return self.plan
 
 
-def test_current_cluster_name_strips_kind_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        sandbox,
-        "run",
-        lambda argv, **kwargs: SimpleNamespace(returncode=0, stdout="kind-my-cluster\n", stderr=""),
-    )
-    assert sandbox.current_cluster_name() == "my-cluster"
+def _cluster(name: str = "c1") -> ClusterInfo:
+    return ClusterInfo(name=name, kubeconfig_path="/tmp/kc")
 
 
-def _known_contexts(*names: str):
-    """A fake ``run`` answering ``kubectl config get-contexts -o name``."""
+def _plan_run(*, contexts: tuple[str, ...] = (), server: str = ""):
+    """A fake ``run`` answering the two kubectl reads a plan build makes."""
 
     def fake_run(argv, **kwargs):
-        assert argv[:3] == ["kubectl", "config", "get-contexts"]
-        return SimpleNamespace(returncode=0, stdout="\n".join(names) + "\n", stderr="")
+        if argv[:3] == ["kubectl", "config", "get-contexts"]:
+            return SimpleNamespace(returncode=0, stdout="\n".join(contexts) + "\n", stderr="")
+        assert argv[:3] == ["kubectl", "config", "view"]
+        return SimpleNamespace(returncode=0, stdout=server, stderr="")
 
     return fake_run
 
 
-def test_build_network_plan_joins_kind_network_and_rewrites_server(
+def test_build_network_plan_asks_the_provider_and_passes_the_cluster(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sandbox, "run", _known_contexts("kind-c1", "kind-other"))
-    plan = sandbox.build_network_plan("c1")
+    provider = _FakeProvider(
+        NetworkPlan(
+            docker_network="kind",
+            rewrite_server="https://c1-control-plane:6443",
+            kubectl_context="kind-c1",
+        )
+    )
+    monkeypatch.setattr(sandbox, "run", _plan_run(contexts=("kind-c1", "kind-other")))
+
+    plan = sandbox.build_network_plan(provider, _cluster())
+
+    assert [c.name for c in provider.seen] == ["c1"]
     assert plan.docker_network == "kind"
+    # A provider that supplied its own rewrite is left entirely alone: kind's
+    # in-network name verifies against the apiserver cert with no override.
     assert plan.rewrite_server == "https://c1-control-plane:6443"
-    # The plan pins credential reads to the run's own context, so an ambient
-    # current-context switch can never redirect the kubeconfig build.
+    assert plan.tls_server_name is None
     assert plan.kubectl_context == "kind-c1"
 
 
-def test_build_network_plan_falls_back_to_the_current_context_without_a_name(
+@pytest.mark.parametrize(
+    ("server", "expected"),
+    [
+        ("https://127.0.0.1:6443", "https://host.docker.internal:6443"),
+        ("https://localhost:6443", "https://host.docker.internal:6443"),
+        ("https://[::1]:6443", "https://host.docker.internal:6443"),
+        ("https://0.0.0.0:8443", "https://host.docker.internal:8443"),
+    ],
+)
+def test_build_network_plan_rewrites_a_loopback_server(
+    monkeypatch: pytest.MonkeyPatch, server: str, expected: str
+) -> None:
+    """Loopback inside a container is the container, so it must be remapped —
+    and the cert only carries ``localhost``, so TLS is redirected, not disabled."""
+    monkeypatch.setattr(sandbox, "run", _plan_run(server=server))
+
+    plan = sandbox.build_network_plan(_FakeProvider(NetworkPlan()), _cluster())
+
+    assert plan.rewrite_server == expected
+    assert plan.tls_server_name == "localhost"
+
+
+def test_build_network_plan_leaves_a_routable_server_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: "c1")
-    monkeypatch.setattr(sandbox, "run", _known_contexts("kind-c1"))
-    assert sandbox.build_network_plan().kubectl_context == "kind-c1"
+    """A GKE endpoint already means something from a bridge-networked
+    container; rewriting it would break the run this PR exists to enable."""
+    provider = _FakeProvider(NetworkPlan(kubectl_context="gke_p_us-central1_c1"))
+    monkeypatch.setattr(
+        sandbox,
+        "run",
+        _plan_run(contexts=("gke_p_us-central1_c1",), server="https://34.10.0.1"),
+    )
+
+    plan = sandbox.build_network_plan(provider, _cluster())
+
+    assert plan.rewrite_server is None
+    assert plan.tls_server_name is None
+    assert plan.docker_network is None
 
 
-def test_build_network_plan_refuses_a_non_kind_context(
+def test_build_network_plan_accepts_a_deployer_without_a_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sandbox, "current_cluster_name", lambda: None)
-    with pytest.raises(SandboxError, match="not a kind context"):
-        sandbox.build_network_plan()
+    """The no-op deployer has no provider; the run still gets a usable plan
+    from the ambient context rather than a refusal."""
+    monkeypatch.setattr(sandbox, "run", _plan_run(server="https://34.10.0.1"))
+
+    assert sandbox.build_network_plan(None, _cluster()) == NetworkPlan()
 
 
-def test_build_network_plan_refuses_when_the_runs_cluster_has_no_kind_context(
+def test_build_network_plan_refuses_a_context_kubectl_does_not_know(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The run's own cluster (from the deployer), not the ambient context, is
-    authoritative: if kubectl has no ``kind-<cluster>`` context for it, the
-    plan must refuse rather than build against whatever is currently active."""
-    monkeypatch.setattr(sandbox, "run", _known_contexts("kind-someone-elses-cluster"))
+    """The provider names the run's own context. If this kubeconfig never saw
+    it, refuse rather than silently building against whatever is active."""
+    provider = _FakeProvider(NetworkPlan(kubectl_context="kind-c1"))
+    monkeypatch.setattr(sandbox, "run", _plan_run(contexts=("kind-someone-elses-cluster",)))
+
     with pytest.raises(SandboxError, match="kind-c1"):
-        sandbox.build_network_plan("c1")
+        sandbox.build_network_plan(provider, _cluster())
+
+
+def test_build_network_plan_refuses_an_unreadable_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "run", _plan_run(server=""))
+
+    with pytest.raises(SandboxError, match="server URL"):
+        sandbox.build_network_plan(_FakeProvider(NetworkPlan()), _cluster())
 
 
 # -- kubeconfig generation --------------------------------------------------

@@ -22,8 +22,9 @@ from pathlib import Path
 import pytest
 from pytest_mock import MockerFixture
 
-from devops_bench.core import ConfigError
+from devops_bench.core import ClusterInfo, ConfigError, NetworkPlan
 from devops_bench.providers import PROVIDERS, ResolveContext
+from devops_bench.providers.base import Provider
 from devops_bench.providers.gcp import GcpProvider
 from devops_bench.providers.kind import KindProvider
 from devops_bench.providers.vcluster import VClusterProvider
@@ -195,3 +196,77 @@ def test_kind_ensure_cluster_credentials_no_gcloud(mocker: MockerFixture) -> Non
 
 def test_kind_ensure_account_credentials_is_noop() -> None:
     KindProvider().ensure_account_credentials()
+
+
+# -- sandbox network plans --------------------------------------------------
+#
+# Each provider answers how a sandboxed agent container reaches its cluster.
+# The default suits anything already routable; only providers whose endpoint
+# is meaningless from inside a container need to say more.
+
+
+def test_base_provider_defaults_to_a_plain_bridge() -> None:
+    """A provider that overrides nothing still gets a working sandbox: no
+    Docker network, no rewrite, no pin."""
+
+    class _BareProvider(Provider):
+        def ensure_account_credentials(self) -> None: ...
+
+        def ensure_cluster_credentials(self, cluster_name, location, variables, outputs=None):
+            raise NotImplementedError
+
+        def resolve_variables(self, ctx, custom_variables):
+            raise NotImplementedError
+
+    assert _BareProvider().sandbox_network_plan(ClusterInfo(name="c1")) == NetworkPlan()
+
+
+def test_kind_plan_joins_the_kind_network_and_rewrites_the_server() -> None:
+    plan = KindProvider().sandbox_network_plan(ClusterInfo(name="c1"))
+
+    assert plan.docker_network == "kind"
+    assert plan.rewrite_server == "https://c1-control-plane:6443"
+    assert plan.kubectl_context == "kind-c1"
+    # The apiserver cert covers the control-plane node name, so no override.
+    assert plan.tls_server_name is None
+
+
+def test_gcp_plan_pins_the_context_without_rewriting() -> None:
+    """A GKE endpoint routes from a bridge-networked container as-is; all the
+    plan adds is the pin naming this cluster's own context."""
+    info = ClusterInfo(name="c1", location="us-central1-a", project="p")
+
+    plan = GcpProvider().sandbox_network_plan(info)
+
+    assert plan == NetworkPlan(kubectl_context="gke_p_us-central1-a_c1")
+
+
+def test_gcp_plan_omits_the_pin_when_the_cluster_is_underspecified() -> None:
+    """A wrong pin is worse than none: the sandbox refuses a context kubectl
+    does not know, which would fail the run outright."""
+    plan = GcpProvider().sandbox_network_plan(ClusterInfo(name="c1"))
+
+    assert plan.kubectl_context is None
+
+
+def test_vcluster_plan_pins_the_virtual_clusters_own_context(tmp_path: Path) -> None:
+    """The pin is what keeps the agent's ServiceAccount created INSIDE the
+    virtual cluster rather than on the host cluster it exists to hide."""
+    kubeconfig = tmp_path / "vcluster.yaml"
+    kubeconfig.write_text("apiVersion: v1\nkind: Config\ncurrent-context: vcluster-c1\n")
+
+    plan = VClusterProvider().sandbox_network_plan(
+        ClusterInfo(name="c1", kubeconfig_path=str(kubeconfig))
+    )
+
+    assert plan == NetworkPlan(kubectl_context="vcluster-c1")
+
+
+def test_vcluster_plan_degrades_to_no_pin_when_the_context_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    plan = VClusterProvider().sandbox_network_plan(
+        ClusterInfo(name="c1", kubeconfig_path=str(tmp_path / "missing.yaml"))
+    )
+
+    assert plan == NetworkPlan()

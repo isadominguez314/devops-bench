@@ -54,19 +54,23 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
-from devops_bench.core import NetworkPlan, get_env, get_logger
+from devops_bench.core import ClusterInfo, NetworkPlan, get_env, get_logger
 from devops_bench.core.errors import SandboxError
 from devops_bench.core.subprocess import CompletedProcess, run
+
+if TYPE_CHECKING:
+    from devops_bench.providers.base import Provider
 
 __all__ = [
     "NetworkPlan",
     "SandboxSpec",
     "SandboxExecutor",
     "spec_from_env",
-    "current_cluster_name",
     "build_network_plan",
     "build_agent_kubeconfig",
     "discover_fixture_mounts",
@@ -131,6 +135,12 @@ _DENIED_ENV_PREFIXES = ("BENCH_", "TF_")
 # resolution is never a legitimate per-task need.
 _CONTAINER_OWNED_ENV = frozenset({"HOME", "KUBECONFIG", "PATH"})
 
+# Apiserver hostnames that mean "this machine" and therefore mean the wrong
+# machine once the agent is inside a container. ``0.0.0.0`` is a bind-any
+# address rather than a destination, but kubeconfigs in the wild carry it and
+# it is no more routable from the container than the others.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
 
 @dataclass(frozen=True)
 class SandboxSpec:
@@ -186,74 +196,96 @@ def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
     return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip())
 
 
-def current_cluster_name() -> str | None:
-    """Derive the kind cluster name from the active kubectl context.
-
-    The agent harness is handed a workspace and a prompt, never the cluster
-    name, so rather than widen that interface we recover it from the context
-    kind wrote: ``kind-<cluster>``. That is also exactly the prefix of the
-    control-plane container name the sandboxed container needs to reach, so
-    the two stay consistent by construction. Returns ``None`` for a non-kind
-    context.
-    """
-    ctx = run(["kubectl", "config", "current-context"], check=False).stdout or ""
-    ctx = ctx.strip()
-    if not ctx.startswith("kind-"):
-        return None
-    return ctx[len("kind-") :]
-
-
-def build_network_plan(cluster_name: str | None = None) -> NetworkPlan:
+def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> NetworkPlan:
     """Build the :class:`NetworkPlan` for this run's cluster.
 
-    kind only, for now: kind writes ``https://127.0.0.1:<port>`` as the
-    server, which means nothing inside a container — but kind also creates a
-    Docker network named ``kind``, and a container joined to it reaches the
-    apiserver at ``https://<cluster>-control-plane:6443``. The apiserver
-    certificate covers the control-plane node name, so TLS still verifies.
+    Two stages, and the split is what keeps per-provider knowledge out of this
+    module. First the provider answers
+    :meth:`~devops_bench.providers.base.Provider.sandbox_network_plan` with
+    whatever only it can know — a Docker network to join, an in-network
+    hostname, the name of the context it wrote. Then this function applies the
+    one rewrite that needs no provider knowledge at all: a server on host
+    loopback is meaningless from inside a container (it resolves to the
+    container), so it is remapped to ``host.docker.internal``, which
+    :meth:`SandboxExecutor.wrap_argv` always maps to the host gateway.
+
+    That generic step is why most providers need no override. A cloud endpoint
+    routes already and is left alone; a locally-published one is rewritten
+    whether it belongs to kind, a vcluster on a laptop, or something not
+    written yet.
 
     Args:
-        cluster_name: The run's own cluster name (from the deployer). The
-            plan is built for — and pinned to — the ``kind-<cluster_name>``
-            context, never the ambient current-context, which a parallel
-            harness or the operator may have switched since provisioning.
-            ``None`` falls back to deriving the name from the current
-            context, for callers that hold no cluster identity of their own.
+        provider: The run's provider, or ``None`` when the deployer has none
+            (the no-op deployer). ``None`` yields the default plan, built
+            against the ambient current-context — acceptable only because such
+            a run has no cluster identity of its own to pin to.
+        cluster_info: The provisioned cluster the container must reach.
 
     Returns:
-        The kind plan for the run's cluster, with ``kubectl_context`` pinned.
+        The plan for this run, with any loopback server already rewritten.
 
     Raises:
-        SandboxError: When no cluster name can be resolved, or kubectl knows
-            no ``kind-<cluster_name>`` context for the resolved name (a
-            non-kind provider, or a kubeconfig that never saw this cluster).
-            Cloud and vcluster clusters get a per-provider plan hook in the
-            credential-scoping follow-up; refusing here beats running against
-            a server the container cannot reach — or handing it credentials
-            for a different cluster entirely.
+        SandboxError: When the provider names a context kubectl does not know
+            (a kubeconfig that never saw this cluster), or when no server URL
+            can be read for a plan that does not supply its own. Refusing
+            beats running against a server the container cannot reach — or
+            handing it credentials for a different cluster entirely.
     """
-    cluster = cluster_name or current_cluster_name()
-    if cluster is None:
+    plan = provider.sandbox_network_plan(cluster_info) if provider is not None else NetworkPlan()
+    if plan.kubectl_context:
+        known = (
+            run(["kubectl", "config", "get-contexts", "-o", "name"], check=False).stdout or ""
+        ).split()
+        if plan.kubectl_context not in known:
+            raise SandboxError(
+                f"kubectl has no {plan.kubectl_context!r} context for this run's cluster "
+                f"{cluster_info.name!r}; this kubeconfig never saw the cluster the "
+                "provider named — refusing to build a plan from the ambient context"
+            )
+    return _rewrite_loopback_server(plan)
+
+
+def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
+    """Remap a loopback apiserver URL to the host gateway, or pass the plan through.
+
+    ``127.0.0.1`` inside a container is the container, so a kubeconfig
+    published on loopback silently points the agent at nothing. Docker exposes
+    the host as ``host.docker.internal`` (natively on Docker Desktop, via the
+    ``--add-host`` :meth:`SandboxExecutor.wrap_argv` always passes on Linux),
+    so the port still reaches the same listener.
+
+    The apiserver certificate will not carry that name, so ``tls-server-name``
+    is set to ``localhost`` — the SAN a loopback-published cluster does have.
+    That keeps TLS verified rather than disabled: the container still checks
+    the certificate chain and the name, just against the name the certificate
+    was actually issued for.
+
+    A plan that already carries a ``rewrite_server`` is returned untouched: the
+    provider knew better (kind's in-network control-plane name verifies with
+    no override at all).
+    """
+    if plan.rewrite_server:
+        return plan
+    server = _kubectl_config_value("{.clusters[0].cluster.server}", context=plan.kubectl_context)
+    if not server:
         raise SandboxError(
-            "the active kubectl context is not a kind context; the sandbox currently "
-            "only knows how to reach kind clusters (the per-provider network plan "
-            "hook arrives with the credential-scoping follow-up)"
+            "could not read the cluster server URL from the run's kubectl context; "
+            "refusing to build a sandbox network plan from an unknown endpoint"
         )
-    context = f"kind-{cluster}"
-    known = (
-        run(["kubectl", "config", "get-contexts", "-o", "name"], check=False).stdout or ""
-    ).split()
-    if context not in known:
-        raise SandboxError(
-            f"kubectl has no {context!r} context for this run's cluster {cluster!r}; "
-            "either the cluster is not a kind cluster (the per-provider plan hook "
-            "arrives with the credential-scoping follow-up) or this kubeconfig "
-            "never saw it — refusing to build a plan from the ambient context"
-        )
-    return NetworkPlan(
-        docker_network="kind",
-        rewrite_server=f"https://{cluster}-control-plane:6443",
-        kubectl_context=context,
+    parsed = urlsplit(server)
+    if parsed.hostname not in _LOOPBACK_HOSTS:
+        return plan
+    port = f":{parsed.port}" if parsed.port else ""
+    _log.info(
+        "cluster apiserver is published on loopback (%s); the container will reach it "
+        "at host.docker.internal%s",
+        server,
+        port,
+    )
+    return replace(
+        plan,
+        rewrite_server=f"https://host.docker.internal{port}",
+        tls_server_name=plan.tls_server_name or "localhost",
     )
 
 
