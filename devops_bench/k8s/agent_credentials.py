@@ -55,6 +55,7 @@ __all__ = [
     "AGENT_NAMESPACE",
     "AGENT_SA_NAME",
     "ALLOW_ADMIN_ENV",
+    "ALLOW_AMBIENT_ENV",
     "POD_SECURITY_BASELINE",
     "POD_SECURITY_PRIVILEGED",
     "ensure_agent_identity",
@@ -79,6 +80,15 @@ AGENT_SA_NAME = "bench-agent"
 # prefixed it is also on the sandbox's env deny list, so it cannot itself
 # reach the container.
 ALLOW_ADMIN_ENV = "BENCH_SANDBOX_ALLOW_ADMIN_CREDS"
+
+# Escape hatch for provisioning against an UNPINNED cluster — the ambient
+# current-context, because the run's deployer has no provider to ask (the no-op
+# deployer, i.e. ``BENCH_NO_INFRA``). Everything this module creates is
+# cluster-scoped and cluster-wide, so doing that unasked would write a Deny
+# admission policy and a ClusterRoleBinding onto whatever cluster the
+# operator's kubeconfig last pointed at. Opt-in, and ``BENCH_`` prefixed so it
+# cannot itself cross into the container.
+ALLOW_AMBIENT_ENV = "BENCH_SANDBOX_ALLOW_AMBIENT_CLUSTER"
 
 # Slack added to the agent's own timeout so its token outlasts the work it is
 # for, covering provisioning, teardown, and clock skew against the apiserver.
@@ -566,9 +576,17 @@ def provision_agent_credentials(
         Path of the written kubeconfig (mode 0600).
 
     Raises:
-        SandboxError: When no scoped credential can be minted and the admin
-            fallback is not explicitly enabled.
+        SandboxError: When the plan carries no context pin and
+            :data:`ALLOW_AMBIENT_ENV` is unset; when pod security cannot be
+            enforced; or when no scoped credential can be minted — unless the
+            admin fallback is explicitly enabled.
     """
+    _refuse_unpinned_cluster(plan)
+    # One switch covers both failures below, because they have one cause: an
+    # operator whose credential cannot create cluster roles cannot create an
+    # admission policy either.
+    allow_admin = get_bool(ALLOW_ADMIN_ENV, False)
+
     if pod_security == POD_SECURITY_PRIVILEGED:
         _log.warning(
             "task declares agent_pod_security: %s, so privileged pods, host namespaces "
@@ -576,12 +594,31 @@ def provision_agent_credentials(
             POD_SECURITY_PRIVILEGED,
         )
     else:
-        enforce_pod_security(dest_dir, plan.kubectl_context)
+        try:
+            enforce_pod_security(dest_dir, plan.kubectl_context)
+        except SubprocessError as exc:
+            # Inside the same guard as the credential below, and not merely
+            # before it: this is the first cluster-scoped write the module
+            # makes, so letting it escape uncaught would make the escape hatch
+            # unreachable for the very operator it exists for.
+            if not allow_admin:
+                raise SandboxError(
+                    f"could not enforce pod security for the sandboxed agent ({exc}); "
+                    "refusing to run against a cluster where the privileged-pod and "
+                    f"hostPath escape is not denied — set {ALLOW_ADMIN_ENV}=1 to "
+                    "accept that explicitly"
+                ) from exc
+            _log.warning(
+                "%s is set: continuing without pod-security enforcement (%s)",
+                ALLOW_ADMIN_ENV,
+                exc,
+            )
+
     try:
         ensure_agent_identity(dest_dir, plan.kubectl_context)
         token = mint_agent_token(token_ttl_sec, plan.kubectl_context)
     except SubprocessError as exc:
-        if not get_bool(ALLOW_ADMIN_ENV, False):
+        if not allow_admin:
             raise SandboxError(
                 "could not mint a scoped ServiceAccount credential for the sandboxed "
                 f"agent ({exc}); refusing to fall back to the operator's admin "
@@ -595,6 +632,40 @@ def provision_agent_credentials(
         token_ttl_sec,
     )
     return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {token}")
+
+
+def _refuse_unpinned_cluster(plan: NetworkPlan) -> None:
+    """Refuse to write cluster-scoped objects onto an unidentified cluster.
+
+    A plan with no context pin means no provider answered for this run — the
+    no-op deployer, i.e. ``BENCH_NO_INFRA``. Every provider that provisions a
+    cluster pins to it, so the unpinned case is not "some cluster we made" but
+    "whatever the operator's kubeconfig happens to point at", which may well be
+    something that matters. This module would then install a cluster-wide Deny
+    admission policy, relabel its namespaces, and bind ``edit`` on it.
+
+    Raises:
+        SandboxError: When the plan is unpinned and :data:`ALLOW_AMBIENT_ENV`
+            is not set.
+    """
+    if plan.kubectl_context:
+        return
+    current = kubectl.config_value("{.current-context}") or "<unset>"
+    if get_bool(ALLOW_AMBIENT_ENV, False):
+        _log.warning(
+            "%s is set: provisioning the sandboxed agent's identity and pod-security "
+            "policy on the ambient current-context (%s), which no provider vouched for",
+            ALLOW_AMBIENT_ENV,
+            current,
+        )
+        return
+    raise SandboxError(
+        "this run's network plan carries no kubectl context pin, so its deployer has "
+        "no provider to identify the cluster (BENCH_NO_INFRA / the no-op deployer). "
+        "Provisioning would create a cluster-wide admission policy and ClusterRoleBindings "
+        f"on the ambient current-context ({current}) — whatever cluster the operator's "
+        f"kubeconfig last pointed at. Refusing; set {ALLOW_AMBIENT_ENV}=1 to allow it."
+    )
 
 
 def _render_admin_fallback_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path:

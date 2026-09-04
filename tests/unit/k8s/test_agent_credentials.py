@@ -35,6 +35,19 @@ from devops_bench.k8s import kubectl
 _CA = "ZmFrZS1jYQ=="
 _TOKEN = "eyJhbGciOi.fake.token"
 
+# Provisioning refuses an unpinned plan (it would write cluster-scoped objects
+# onto the ambient current-context), so the provisioning tests carry a pin.
+_PINNED = NetworkPlan(kubectl_context="kind-c1")
+
+
+def _applies(argv: list[str], manifest: str) -> bool:
+    """Report whether ``argv`` is a kubectl apply of ``manifest``.
+
+    The manifest is matched anywhere in argv rather than at the tail: a pinned
+    call appends ``--context <name>`` after the ``-f`` path.
+    """
+    return "apply" in argv and any(manifest in arg for arg in argv)
+
 
 def _patch_kubectl(
     monkeypatch: pytest.MonkeyPatch,
@@ -60,6 +73,7 @@ def _patch_kubectl(
         "jsonpath={.clusters[0].cluster.server}": server,
         "jsonpath={.users[0].user.client-certificate-data}": cert,
         "jsonpath={.users[0].user.client-key-data}": key,
+        "jsonpath={.current-context}": "some-ambient-context",
     }
 
     def fake_run(argv, **kwargs):
@@ -306,7 +320,7 @@ def test_provision_gives_the_agent_a_service_account_token_not_a_certificate(
     short-lived SA token, so the RBAC boundary does real work."""
     _patch_kubectl(monkeypatch)
 
-    path = creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+    path = creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
 
     user = yaml.safe_load(path.read_text())["users"][0]["user"]
     assert user == {"token": _TOKEN}
@@ -322,7 +336,7 @@ def test_provision_refuses_to_fall_back_to_the_admin_credential(
     _patch_kubectl(monkeypatch, mint_fails=True)
 
     with pytest.raises(SandboxError, match=creds.ALLOW_ADMIN_ENV):
-        creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
 
     assert not (tmp_path / "kubeconfig").exists()
 
@@ -333,7 +347,7 @@ def test_provision_falls_back_to_the_admin_cert_only_when_told_to(
     monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
     _patch_kubectl(monkeypatch, mint_fails=True)
 
-    path = creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+    path = creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
 
     user = yaml.safe_load(path.read_text())["users"][0]["user"]
     assert user["client-certificate-data"] == "Y2VydA=="
@@ -349,7 +363,7 @@ def test_provision_refuses_the_fallback_for_an_exec_plugin_context(
     _patch_kubectl(monkeypatch, mint_fails=True, cert="", key="")
 
     with pytest.raises(SandboxError, match="exec"):
-        creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
 
 
 # -- pod security ------------------------------------------------------------
@@ -526,9 +540,9 @@ def test_provision_enforces_pod_security_by_default(
     """A task author who never heard of the key still gets the control."""
     calls = _patch_kubectl(monkeypatch)
 
-    creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+    creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
 
-    assert any("bench-agent-pod-security.yaml" in c[-1] for c in calls if "apply" in c)
+    assert any(_applies(c, "bench-agent-pod-security.yaml") for c in calls)
 
 
 def test_provision_honours_the_privileged_opt_out(
@@ -539,11 +553,83 @@ def test_provision_honours_the_privileged_opt_out(
     calls = _patch_kubectl(monkeypatch)
 
     creds.provision_agent_credentials(
-        NetworkPlan(),
+        _PINNED,
         tmp_path,
         token_ttl_sec=1500,
         pod_security=creds.POD_SECURITY_PRIVILEGED,
     )
 
-    assert not any("bench-agent-pod-security.yaml" in c[-1] for c in calls if "apply" in c)
+    assert not any(_applies(c, "bench-agent-pod-security.yaml") for c in calls)
     assert [c for c in calls if "label" in c] == []
+
+
+def test_provision_refuses_a_cluster_no_provider_vouched_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unpinned plan means the no-op deployer, so 'the cluster' is whatever
+    the operator's kubeconfig last pointed at. Provisioning writes a cluster-wide
+    Deny policy and ClusterRoleBindings; doing that unasked to someone's real
+    cluster is not acceptable."""
+    monkeypatch.delenv(creds.ALLOW_AMBIENT_ENV, raising=False)
+    calls = _patch_kubectl(monkeypatch)
+
+    with pytest.raises(SandboxError, match=creds.ALLOW_AMBIENT_ENV):
+        creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+
+    assert not any("apply" in c for c in calls)
+
+
+def test_provision_uses_the_ambient_cluster_only_when_told_to(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(creds.ALLOW_AMBIENT_ENV, "1")
+    _patch_kubectl(monkeypatch)
+
+    path = creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
+
+    assert yaml.safe_load(path.read_text())["users"][0]["user"] == {"token": _TOKEN}
+
+
+def test_provision_fails_loud_when_pod_security_cannot_be_applied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The policy apply is the first cluster-scoped write, so it is what fails
+    for an operator who cannot create cluster-scoped objects. Running the agent
+    anyway would leave the observed escape undenied."""
+    monkeypatch.delenv(creds.ALLOW_ADMIN_ENV, raising=False)
+    calls: list[list[str]] = []
+    _patch_kubectl(monkeypatch, calls=calls)
+    real = kubectl.run
+
+    def fail_the_policy_apply(argv, **kwargs):
+        if _applies(argv, "bench-agent-pod-security.yaml"):
+            raise SubprocessError(argv, 1, stderr="forbidden: cannot create policies")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", fail_the_policy_apply)
+
+    with pytest.raises(SandboxError, match="pod security"):
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+
+def test_the_admin_escape_hatch_also_covers_the_pod_security_apply(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One switch, because both failures have one cause: an operator who cannot
+    create cluster roles cannot create an admission policy either. Before this,
+    the policy apply raised first and the hatch was unreachable."""
+    monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
+    _patch_kubectl(monkeypatch)
+    real = kubectl.run
+
+    def fail_the_policy_apply(argv, **kwargs):
+        if _applies(argv, "bench-agent-pod-security.yaml"):
+            raise SubprocessError(argv, 1, stderr="forbidden: cannot create policies")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", fail_the_policy_apply)
+
+    path = creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+    # The scoped token still gets minted; only the pod-security half was lost.
+    assert yaml.safe_load(path.read_text())["users"][0]["user"] == {"token": _TOKEN}
