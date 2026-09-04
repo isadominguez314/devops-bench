@@ -170,11 +170,18 @@ Two consequences worth knowing:
   cryptographically useless against the host cluster.
 
 The token's lifetime is the agent's `timeout_sec` plus 15 minutes of slack,
-capped at two hours. If a scoped credential cannot be minted the run **fails**;
-it never falls back to your admin credential silently. For local development
-against a cluster where you cannot create cluster roles, set
+capped at two hours. If a scoped credential cannot be minted — or if pod
+security below cannot be applied — the run **fails**; it never falls back to
+your admin credential silently. For local development against a cluster where
+you cannot create cluster-scoped objects, set
 `BENCH_SANDBOX_ALLOW_ADMIN_CREDS=1` to allow the old behaviour explicitly. Never
 use it for a scored run.
+
+Provisioning also refuses a cluster that no provider vouched for. With the no-op
+deployer (`BENCH_NO_INFRA`) there is no context to pin to, so "the cluster"
+would be whatever your kubeconfig last pointed at — and this step writes a
+cluster-wide admission policy and `ClusterRoleBindings`. Set
+`BENCH_SANDBOX_ALLOW_AMBIENT_CLUSTER=1` if that is genuinely what you want.
 
 ### Pod security
 
@@ -184,18 +191,62 @@ Two overlapping controls, applied at the same point:
    starts. Namespaces that already declare an `enforce` level are left alone, so
    a task asserting its own level keeps it.
 2. **A `ValidatingAdmissionPolicy`** denying `hostNetwork` / `hostPID` /
-   `hostIPC`, privileged containers, and `hostPath` volumes — cluster-wide, in
-   `Deny` mode, failing closed, with the cluster's own system namespaces
-   exempted.
+   `hostIPC`, privileged containers (including init and ephemeral ones), and
+   `hostPath` volumes — cluster-wide, in `Deny` mode, failing closed, with the
+   cluster's own system namespaces exempted. It matches
+   `pods/ephemeralcontainers` as well as `pods`, so `kubectl debug` cannot
+   attach a privileged container to an already-admitted pod.
+3. **A second policy guarding the exemption list**, denying the agent the
+   creation of a namespace named after one of the exempt namespaces. The
+   exemptions are by name and several do not exist on every provider
+   (`gmp-system` on kind, `local-path-storage` on GKE), so without this the
+   agent could simply claim an unused one and deploy there.
 
-The policy exists because labels cannot cover a namespace the agent creates
-*after* provisioning, and at least one task asks it to create one. Together they
-deny the privileged-pod-plus-`hostPath` escape that was used to read the
-benchmark's own answer key off a node's disk.
+The first policy exists because labels cannot cover a namespace the agent
+creates *after* provisioning, and at least one task asks it to create one.
+`bench-system` is skipped by the labeller — it holds only a ServiceAccount — but
+is deliberately **not** exempt from the policy, since the agent can create pods
+there. Together these deny the privileged-pod-plus-`hostPath` escape that was
+used to read the benchmark's own answer key off a node's disk.
 
 A task whose subject matter genuinely is privileged workloads opts out with
 `agent_pod_security: privileged` in its `task.yaml` (see
-[Add a task](../how-to/add-a-task.md)). The default is `baseline`.
+[Add a task](../how-to/add-a-task.md)). The default is `baseline`, and any other
+value is a load-time validation error rather than a silent fall-back.
+
+### Known gaps in the RBAC scope
+
+Three are open, all in how the agent's RBAC is scoped rather than in the
+pod-security controls above. None is reachable without a working agent
+credential, and all are fixed by replacing the built-in role with a derived one
+and narrowing the supplement:
+
+- **`edit` bound cluster-wide reaches the system namespaces.** The built-in role
+  carries `impersonate` on `serviceaccounts`, `create` on `serviceaccounts/token`,
+  and `create` on `pods/exec` — so a cluster-wide binding lets the agent mint a
+  token for, or impersonate, any ServiceAccount in `kube-system`, and exec into
+  the privileged pods that live there. That is a path to cluster-admin, and it
+  defeats the deliberate omission of write on `rbac.authorization.k8s.io`.
+- **`edit` carries read and write on `secrets`.** The built-in role includes
+  them, unlike `view`, which excludes them deliberately; bound cluster-wide that
+  reaches every namespace. Nothing in the supplement adds this — it is inherited,
+  and it is not narrowed anywhere. What the exposure is worth depends on the run:
+  the cluster is disposable and its workloads are synthetic, so ordinarily this
+  leaks fixture data. It matters for a task that seeds a real credential into a
+  Secret, and for the controller and syncer Secrets a task did not author. Under
+  vcluster it stops at the virtual cluster; the host cluster's Secrets are not
+  reachable with this token.
+- **The supplement grants `update`/`patch` on namespaces**, so the agent can
+  strip the `pod-security.kubernetes.io/*` labels the harness just applied. The
+  admission policies are unaffected — the agent has no write on
+  `admissionregistration.k8s.io` — so this removes the PSA half of the
+  enforcement, not the load-bearing half.
+
+Until these are closed, treat the pod-security controls as the boundary and the
+RBAC scope as best-effort. Narrowing the role is not a blind edit: the tasks were
+authored against admin, so a scope that is too tight fails them in ways that read
+as agent error. An A/B soak of sandboxed against ambient runs is what shows which
+tasks need which verbs.
 
 ### Model credentials
 
