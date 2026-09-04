@@ -143,7 +143,9 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     ``config.model`` onto ``GEMINI_MODEL``. OTLP telemetry exporters are disabled
     so they don't hang on broken endpoints. The model is never hardcoded; it
     flows from ``config.model``. A keyless backend (e.g. Vertex/ADC) writes no
-    key.
+    key. A Vertex backend additionally writes the google-genai routing vars
+    (``GOOGLE_GENAI_USE_VERTEXAI`` plus project/location), since the SDK
+    otherwise talks to the Gemini API regardless of the configured provider.
 
     Args:
         config: Resolved :class:`AgentConfig` for this run.
@@ -165,6 +167,20 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         "OTEL_LOGS_EXPORTER": "none",
         "OTEL_SDK_DISABLED": "true",
     }
+    if spec.backend == "vertex":
+        # The google-genai SDK the CLI embeds reads these three; without the
+        # switch it defaults to the Gemini API and ignores the Vertex routing.
+        # Project/location env spellings follow the antigravity harness so an
+        # operator configures both agents the same way.
+        overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        if project:
+            overlay["GOOGLE_CLOUD_PROJECT"] = project
+        overlay["GOOGLE_CLOUD_LOCATION"] = (
+            os.environ.get("GOOGLE_CLOUD_LOCATION")
+            or os.environ.get("GCP_LOCATION")
+            or "us-central1"
+        )
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
