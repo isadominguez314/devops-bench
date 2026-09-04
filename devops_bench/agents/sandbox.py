@@ -57,7 +57,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from devops_bench.core import get_env, get_logger
+from devops_bench.core import NetworkPlan, get_env, get_logger
 from devops_bench.core.errors import SandboxError
 from devops_bench.core.subprocess import CompletedProcess, run
 
@@ -130,42 +130,6 @@ _DENIED_ENV_PREFIXES = ("BENCH_", "TF_")
 # PATH *inside* the boundary — redirecting the agent's home or credential
 # resolution is never a legitimate per-task need.
 _CONTAINER_OWNED_ENV = frozenset({"HOME", "KUBECONFIG", "PATH"})
-
-
-@dataclass(frozen=True)
-class NetworkPlan:
-    """How the container reaches this run's cluster apiserver.
-
-    In PR terms this is the de-kinding seam: kind needs special knowledge (its
-    Docker network, a rewritten server URL), while a cloud cluster's endpoint
-    already means something from a bridge-networked container. A provider hook
-    returning this plan arrives with the credential work; until then
-    :func:`build_network_plan` fills it for kind and refuses everything else.
-
-    Attributes:
-        docker_network: Docker network to join, or ``None`` for the default
-            bridge.
-        extra_hosts: Additional ``--add-host`` entries (``host:ip`` strings).
-            ``host.docker.internal:host-gateway`` is always added regardless,
-            so loopback-published endpoints stay reachable on Linux too.
-        rewrite_server: Replacement apiserver URL for the generated
-            kubeconfig, or ``None`` to keep the context's own server.
-        tls_server_name: Value for the kubeconfig's ``tls-server-name`` when
-            the rewritten endpoint's certificate carries a different SAN.
-        kubectl_context: kubectl context every credential read for this plan
-            is pinned to (``--context``). ``None`` falls back to the ambient
-            current-context — only acceptable when the caller has no cluster
-            identity of its own; the eval harness always pins, so a
-            current-context switched under it (an operator, a parallel
-            harness) can never hand the container another cluster's admin
-            credential.
-    """
-
-    docker_network: str | None = None
-    extra_hosts: tuple[str, ...] = ()
-    rewrite_server: str | None = None
-    tls_server_name: str | None = None
-    kubectl_context: str | None = None
 
 
 @dataclass(frozen=True)
