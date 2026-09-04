@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from pytest_mock import MockerFixture
 
-from devops_bench.core import ClusterInfo, ConfigError, NetworkPlan
+from devops_bench.core import ClusterInfo, ConfigError, NetworkPlan, SandboxError
 from devops_bench.providers import PROVIDERS, ResolveContext
 from devops_bench.providers.base import Provider
 from devops_bench.providers.gcp import GcpProvider
@@ -262,11 +262,17 @@ def test_vcluster_plan_pins_the_virtual_clusters_own_context(tmp_path: Path) -> 
     assert plan == NetworkPlan(kubectl_context="vcluster-c1")
 
 
-def test_vcluster_plan_degrades_to_no_pin_when_the_context_is_unreadable(
-    tmp_path: Path,
-) -> None:
-    plan = VClusterProvider().sandbox_network_plan(
-        ClusterInfo(name="c1", kubeconfig_path=str(tmp_path / "missing.yaml"))
-    )
+def test_vcluster_plan_refuses_rather_than_dropping_the_pin(tmp_path: Path) -> None:
+    """An unpinned plan is not a degraded plan here, it is the wrong cluster:
+    the agent's identity and token would be minted against the ambient
+    context, which on a vcluster run is the HOST cluster the virtual one exists
+    to hide."""
+    with pytest.raises(SandboxError, match="host cluster"):
+        VClusterProvider().sandbox_network_plan(
+            ClusterInfo(name="c1", kubeconfig_path=str(tmp_path / "missing.yaml"))
+        )
 
-    assert plan == NetworkPlan()
+
+def test_vcluster_plan_refuses_without_a_kubeconfig_path() -> None:
+    with pytest.raises(SandboxError, match="host cluster"):
+        VClusterProvider().sandbox_network_plan(ClusterInfo(name="c1"))
