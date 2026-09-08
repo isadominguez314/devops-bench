@@ -26,8 +26,15 @@ Control probes come first and are not optional. If the token is broken, every
 escape probe "passes" for the wrong reason, and a green run would mean nothing.
 
 Usage:
-    uv run python hack/sandbox_probe.py --context <kubectl-context> \\
-        --image <sandbox-image> [--host-apiserver https://...]
+    uv run python hack/sandbox_probe.py --provider kind --cluster-name kind \\
+        --image <sandbox-image>
+
+The network plan is built through the shipped
+``agents.sandbox.build_network_plan`` rather than assembled here, so the
+container reaches the apiserver exactly the way a real run does. Hand-building
+the plan is what made an earlier version of this script unable to connect at
+all: kind writes ``https://127.0.0.1:<port>`` as its server, which from inside
+a container is the container.
 
 This is scratch validation tooling, not part of the sandboxing PR stack. It is
 the seed of the e2e boundary test planned for PR 4.
@@ -43,9 +50,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from devops_bench.agents.sandbox import SandboxExecutor, SandboxSpec
-from devops_bench.core.context import NetworkPlan
+from devops_bench.agents.sandbox import SandboxExecutor, SandboxSpec, build_network_plan
+from devops_bench.core.context import ClusterInfo, NetworkPlan
 from devops_bench.k8s import agent_credentials as creds
+from devops_bench.providers.base import Provider
+from devops_bench.providers.gcp import GcpProvider
+from devops_bench.providers.kind import KindProvider
+from devops_bench.providers.vcluster import VClusterProvider
 
 # Written into the workspace rather than piped: the container runs without
 # ``-i`` by design, so ``kubectl apply -f -`` would read an empty stdin and
@@ -342,6 +353,47 @@ def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) 
     return f"the vcluster token got HTTP {code} from the HOST apiserver; expected 401/403"
 
 
+def _provider_and_cluster(args: argparse.Namespace) -> tuple[Provider | None, ClusterInfo]:
+    """Build the run's provider and cluster description from the CLI args.
+
+    The point of going through a real provider is that the plan it returns is
+    the plan a real run gets. A hand-built plan can be wrong in exactly the way
+    the code under test is supposed to prevent.
+
+    Args:
+        args: Parsed command line.
+
+    Returns:
+        The provider (``None`` for ``--provider none``) and its cluster info.
+
+    Raises:
+        SystemExit: When the chosen provider is missing a required argument.
+    """
+    cluster = ClusterInfo(
+        name=args.cluster_name or "",
+        location=args.location,
+        project=args.project,
+        **({"kubeconfig_path": args.cluster_kubeconfig} if args.cluster_kubeconfig else {}),
+    )
+    if args.provider == "none":
+        return None, cluster
+    if args.provider == "kind":
+        if not args.cluster_name:
+            raise SystemExit("--provider kind needs --cluster-name (the kind cluster name)")
+        return KindProvider(), cluster
+    if args.provider == "gcp":
+        if not (args.cluster_name and args.location and args.project):
+            raise SystemExit("--provider gcp needs --cluster-name, --location and --project")
+        return GcpProvider(), cluster
+    if not args.cluster_kubeconfig:
+        raise SystemExit(
+            "--provider vcluster needs --cluster-kubeconfig (the virtual cluster's own "
+            "kubeconfig, usually $TMPDIR/vcluster-<name>-kubeconfig.yaml); the provider "
+            "reads its context from that file"
+        )
+    return VClusterProvider(), cluster
+
+
 def main() -> int:
     """Provision, probe, report.
 
@@ -349,9 +401,29 @@ def main() -> int:
         0 when every probe passed, 1 otherwise.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--context", required=True, help="kubectl context of the run's cluster")
     parser.add_argument("--image", required=True, help="sandbox image (BENCH_SANDBOX_IMAGE)")
-    parser.add_argument("--docker-network", default=None, help="docker network to join (kind)")
+    parser.add_argument(
+        "--provider",
+        choices=("none", "kind", "gcp", "vcluster"),
+        default="none",
+        help="build the network plan through this provider's sandbox_network_plan hook",
+    )
+    parser.add_argument("--cluster-name", default=None, help="cluster name (kind, gcp)")
+    parser.add_argument("--location", default=None, help="cloud region or zone (gcp)")
+    parser.add_argument("--project", default=None, help="cloud project (gcp)")
+    parser.add_argument(
+        "--cluster-kubeconfig",
+        default=None,
+        help="the cluster's own kubeconfig; required for vcluster, whose context is read from it",
+    )
+    parser.add_argument(
+        "--context",
+        default=None,
+        help="kubectl context; required only for --provider none, else a cross-check",
+    )
+    parser.add_argument(
+        "--docker-network", default=None, help="docker network override (--provider none only)"
+    )
     parser.add_argument(
         "--host-apiserver",
         default=None,
@@ -362,7 +434,20 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    plan = NetworkPlan(kubectl_context=args.context, docker_network=args.docker_network)
+    provider, cluster = _provider_and_cluster(args)
+    if provider is None:
+        if not args.context:
+            raise SystemExit("--provider none needs --context")
+        plan = NetworkPlan(kubectl_context=args.context, docker_network=args.docker_network)
+    else:
+        plan = build_network_plan(provider, cluster)
+
+    context = plan.kubectl_context or args.context
+    if not context:
+        raise SystemExit("the plan named no context and none was given; refusing to run unpinned")
+    if args.context and args.context != context:
+        print(f"    NOTE: --context {args.context} overridden by the provider's {context}")
+    print(f"==> plan: {plan}")
 
     with tempfile.TemporaryDirectory(prefix="bench-probe-") as tmp:
         workspace = Path(tmp) / "workspace"
@@ -371,12 +456,12 @@ def main() -> int:
         creds_dir = Path(tmp) / "creds"
         creds_dir.mkdir()
 
-        print(f"==> provisioning the agent credential against {args.context}")
+        print(f"==> provisioning the agent credential against {context}")
         kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
         print(f"    kubeconfig: {kubeconfig}")
 
         print("==> checking the admission policies compiled")
-        problems = _check_policies(args.context)
+        problems = _check_policies(context)
         for line in problems:
             print(f"    FAIL {line}")
 
@@ -408,7 +493,7 @@ def main() -> int:
                     [
                         "kubectl",
                         "--context",
-                        args.context,
+                        context,
                         "delete",
                         "namespace",
                         namespace,
