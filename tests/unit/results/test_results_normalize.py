@@ -460,3 +460,25 @@ def test_build_rows_carries_cache_write() -> None:
     row = build_rows([record], _manifest())[0]
     assert row.cache_write_tokens == 200
     assert row.total_tokens == 1245
+
+
+def test_normalize_tokens_reads_cli_camelcase_buckets() -> None:
+    # The CLI harnesses emit camelCase. Only snake_case was recognised, so every
+    # openclaw row lost its cache breakdown on ingest while ``total`` survived
+    # (spelled the same either way) — the published board showed a cached-token
+    # figure for the API-shaped arms and a blank for all 94 openclaw rows.
+    tokens = {
+        "input": 58,
+        "output": 11613,
+        "cacheRead": 1613330,
+        "cacheWrite": 225457,
+        "reasoningTokens": 175,
+        "total": 1850458,
+    }
+    assert normalize_tokens(tokens) == (58, 11613, 1613330, 175, 225457, 1850458)
+
+
+def test_normalize_tokens_snake_case_still_wins_when_both_present() -> None:
+    # Canonical spelling keeps precedence; the camelCase aliases are additions,
+    # not replacements.
+    assert normalize_tokens({"cached": 1, "cacheRead": 2})[2] == 1
