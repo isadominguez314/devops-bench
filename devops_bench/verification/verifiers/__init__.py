@@ -14,6 +14,7 @@
 
 """Concrete single-condition verifiers."""
 
+from devops_bench.verification.verifiers.git_repo_sync import GitRepoSyncVerifier
 from devops_bench.verification.verifiers.identity_preserved import (
     IdentityPreservedVerifier,
 )
@@ -24,6 +25,7 @@ from devops_bench.verification.verifiers.resource_property import (
 from devops_bench.verification.verifiers.scaling_complete import ScalingCompleteVerifier
 
 __all__ = [
+    "GitRepoSyncVerifier",
     "IdentityPreservedVerifier",
     "PodHealthyVerifier",
     "ResourcePropertyVerifier",
