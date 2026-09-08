@@ -1564,9 +1564,9 @@ def test_invalidated_entry_leaves_the_correctness_denominator(isolated_env: None
     scores = rollup(report)
     assert scores.declared == 2
     assert scores.errored == 1
-    # One of two objectives was observed, and it passed, so correctness is over
-    # the observed entry alone — the un-injected one contributes to neither the
-    # numerator nor the denominator.
-    assert scores.correctness == 1.0
-    # It shows up in coverage instead, which is what disqualifies the run.
+    # An errored entry means the report is a fragment of what the task
+    # declared, so correctness is withheld outright rather than computed over
+    # the observed entry alone.
+    assert scores.correctness is None
+    # The gap shows up in coverage instead, which is what disqualifies the run.
     assert 1 - (scores.errored / scores.declared) == 0.5
