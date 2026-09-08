@@ -177,6 +177,15 @@ you cannot create cluster-scoped objects, set
 `BENCH_SANDBOX_ALLOW_ADMIN_CREDS=1` to allow the old behaviour explicitly. Never
 use it for a scored run.
 
+**On GKE this is an IAM question, not a Kubernetes RBAC one.** GKE gates the
+admission-policy resources behind the `container.thirdPartyObjects.*`
+permissions, which `roles/container.developer` does not carry, so an operator
+who can otherwise deploy freely still cannot apply the policy below — and the
+run refuses. Grant `roles/container.admin`, or a custom role including those
+permissions, to whatever identity runs the harness. A vcluster run is
+unaffected: the policy is applied inside the virtual cluster, where the
+generated kubeconfig is already admin.
+
 Provisioning also refuses a cluster that no provider vouched for. With the no-op
 deployer (`BENCH_NO_INFRA`) there is no context to pin to, so "the cluster"
 would be whatever your kubeconfig last pointed at — and this step writes a
