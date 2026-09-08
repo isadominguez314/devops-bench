@@ -82,9 +82,25 @@ _OUTPUT_TOKEN_KEYS = (
     "completion_tokens",
     "output_tokens",
 )
-_CACHED_TOKEN_KEYS = ("cached", "cache_read_input_tokens", "cached_content_token_count")
-_CACHE_WRITE_TOKEN_KEYS = ("cache_write", "cache_creation_input_tokens")
-_REASONING_TOKEN_KEYS = ("reasoning", "thoughts_token_count", "reasoning_tokens")
+# ``cacheRead`` / ``cacheWrite`` / ``reasoningTokens`` are what the CLI
+# harnesses actually emit. Without them every openclaw row normalized its cache
+# buckets to None while ``total`` survived (spelled the same either way), so the
+# published board showed a cached-token figure for the API-shaped arms and a
+# blank for all 94 openclaw rows — which reads as "openclaw does not cache"
+# rather than "the number was dropped on ingest".
+_CACHED_TOKEN_KEYS = (
+    "cached",
+    "cacheRead",
+    "cache_read_input_tokens",
+    "cached_content_token_count",
+)
+_CACHE_WRITE_TOKEN_KEYS = ("cache_write", "cacheWrite", "cache_creation_input_tokens")
+_REASONING_TOKEN_KEYS = (
+    "reasoning",
+    "reasoningTokens",
+    "thoughts_token_count",
+    "reasoning_tokens",
+)
 _TOTAL_TOKEN_KEYS = ("total", "total_tokens", "total_token_count")
 
 # Runs of characters outside ``[a-z0-9]`` collapse to a single ``-``. Mirrors the
