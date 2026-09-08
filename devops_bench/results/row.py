@@ -64,6 +64,14 @@ class Manifest(BaseModel):
             ``api``).
         augmentation: Capability tokens active for the run (e.g.
             ``["mcp", "skills"]``); an empty list denotes the baseline arm.
+        judge_model: The model that scored this run's judged metrics, as
+            resolved at scoring time. ``None`` when nothing judged ran.
+            Recorded because it is otherwise unrecoverable: the judge is chosen
+            from ``JUDGE_MODEL`` at scoring time, and when that is unset it
+            silently falls back to the agent's own model — so two arms can be
+            graded by different judges, or by themselves, with no trace in any
+            artifact. A whole 132-run corpus was published before anyone could
+            establish which judge scored which arm.
     """
 
     model_config = _MODEL_CONFIG
@@ -75,6 +83,7 @@ class Manifest(BaseModel):
     model: str
     harness: str
     augmentation: list[str]
+    judge_model: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``manifest.json``."""

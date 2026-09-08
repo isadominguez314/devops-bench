@@ -168,6 +168,50 @@ def chaos_invalidated_entries(
     }
 
 
+def _resolve_model_name(judge: Any) -> str | None:
+    """Name the model behind a built judge, or ``None`` if there is none.
+
+    Args:
+        judge: The judge object handed to the metrics pipeline, or ``None``.
+
+    Returns:
+        The resolved model identifier, preferring the judge's own label and
+        falling back to the wrapped client's.
+    """
+    if judge is None:
+        return None
+    for attr in ("_model_name", "model_name"):
+        name = getattr(judge, attr, None)
+        if isinstance(name, str) and name:
+            return name
+    client = getattr(judge, "client", None)
+    name = getattr(client, "model_name", None)
+    return name if isinstance(name, str) and name else None
+
+
+def _verification_status(
+    parse_errors: Sequence[Any],
+    invalidated: Mapping[str, str],
+) -> str:
+    """Name what the verification pass actually was, worst case first.
+
+    Args:
+        parse_errors: Spec entries that failed to parse.
+        invalidated: Entries dropped because their chaos disruption never
+            landed, as returned by :func:`chaos_invalidated_entries`.
+
+    Returns:
+        ``"parse_error"`` when any entry failed to parse (the report is a
+        fragment of an unknown whole), else ``"chaos_invalidated"`` when the
+        planned disruption never fired, else ``"evaluated"``.
+    """
+    if parse_errors:
+        return "parse_error"
+    if invalidated:
+        return "chaos_invalidated"
+    return "evaluated"
+
+
 def _ensure_builtin_agents_registered() -> None:
     """Import the builtin agent modules so their registrations fire.
 
@@ -245,6 +289,9 @@ class DefaultEvalHarness(Harness):
         self.project_id = project_id
         self.cluster_name = cluster_name
         self._judge_model = judge_model
+        # Resolved during scoring and recorded on the manifest; stays None when
+        # nothing judged ran.
+        self._judge_model_name: str | None = _resolve_model_name(judge_model)
         self.results_root = results_root
         resolved_agent_type = (
             agent_type
@@ -1121,6 +1168,7 @@ class DefaultEvalHarness(Harness):
             model=model,
             harness=harness,
             augmentation=augmentation,
+            judge_model=self._judge_model_name,
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
@@ -1314,16 +1362,23 @@ class DefaultEvalHarness(Harness):
                 verification_report: list[dict[str, Any]] = []
                 verification_status = "skipped_no_infra"
             else:
+                invalidated = chaos_invalidated_entries(chaos_specs, chaos_report)
                 verification_report = self._run_verification(
                     entries,
-                    invalidated=chaos_invalidated_entries(chaos_specs, chaos_report),
+                    invalidated=invalidated,
                     hold_observations=hold_observations,
                 )
                 # A spec that partially (or entirely) failed to parse must not
                 # read as an ordinary "evaluated" run: "parse_error" wins over
                 # "evaluated" outright, since the entries that DID parse are
                 # only ever a fragment of what the task actually declared.
-                verification_status = "parse_error" if verification_parse_errors else "evaluated"
+                # "chaos_invalidated" ranks below it and above "evaluated": the
+                # spec was fine, but the scenario the task exists to measure
+                # never happened, which is a property of the whole run rather
+                # than of one entry. Naming it here means an operator reading
+                # the record sees why the run is invalid without inferring it
+                # from a coverage number.
+                verification_status = _verification_status(verification_parse_errors, invalidated)
 
             result = self._build_success_record(
                 task=task,
@@ -1360,15 +1415,19 @@ class DefaultEvalHarness(Harness):
                     partial_chaos_report: dict[str, Any] = {}
                     if scenario_manager is not None:
                         partial_chaos_report, _ = scenario_manager.get_reports()
+                    exception_invalidated = chaos_invalidated_entries(
+                        chaos_specs, partial_chaos_report
+                    )
                     exception_verification_report = self._run_verification(
                         entries,
-                        invalidated=chaos_invalidated_entries(chaos_specs, partial_chaos_report),
+                        invalidated=exception_invalidated,
                         hold_observations=hold_observations,
                     )
                     # Mirrors the success path: a partially-parsed spec must
-                    # not read as an ordinary "evaluated" run.
-                    exception_verification_status = (
-                        "parse_error" if verification_parse_errors else "evaluated"
+                    # not read as an ordinary "evaluated" run, and neither must
+                    # one whose planned disruption never fired.
+                    exception_verification_status = _verification_status(
+                        verification_parse_errors, exception_invalidated
                     )
                 except Exception:  # noqa: BLE001 - a crash here must not mask the original failure
                     _log.exception(
@@ -1806,4 +1865,10 @@ class DefaultEvalHarness(Harness):
             # isolated by the pipeline's per-metric guard.
             _log.exception("judge unavailable; scoring deterministic metrics only")
             judge_model = None
+        # Capture the judge that actually graded this batch, for the manifest.
+        # Read off the built object rather than re-reading JUDGE_MODEL: when
+        # that env is unset the adapter falls back to the agent's own model,
+        # and the fallback is exactly the case worth recording.
+        self._judge_model_name = _resolve_model_name(judge_model)
+        _log.info("scoring with judge model %r", self._judge_model_name)
         evaluate_metrics_batch(scorable, judge_model, use_mcp=self.use_mcp)

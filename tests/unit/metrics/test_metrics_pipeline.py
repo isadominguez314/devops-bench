@@ -841,3 +841,98 @@ def test_batch_survives_a_real_out_of_range_sub_score(
     assert results[0]["scores"]["ChecklistScore"]["score"] == pytest.approx(1.4)
     assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
     assert "ChecklistScore" in results[1]["scores"]
+
+
+# --- withheld correctness must not fall back to the judge ---------------------
+
+
+class _WithheldWithChecklist:
+    """Emits the withheld marker alongside a passing judged checklist.
+
+    The shape a run has when its deterministic objectives went unobserved but
+    the judge still read the transcript and liked what it saw.
+    """
+
+    name = "checklist"
+
+    def applies(self, ctx: MetricContext) -> bool:
+        return True
+
+    def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+        yield MetricScore(name="VerificationCorrectnessWithheld", score=1.0, success=True)
+        yield MetricScore(name="ChecklistScore", score=0.8, success=True)
+
+
+def test_withheld_correctness_refuses_the_judge_fallback(registry: Registry[Any]) -> None:
+    """An abstained deterministic channel leaves the record unscored.
+
+    Regression for the published 0.8: an objective errored out of the
+    deterministic path, correctness vanished, and ``ChecklistScore`` silently
+    took its place — publishing a confident number for a check nobody observed.
+    """
+    registry.register("checklist")(_WithheldWithChecklist)
+    results = [_result()]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    assert results[0]["scores"]["ChecklistScore"]["score"] == pytest.approx(0.8)
+    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+
+
+def test_checklist_still_scores_when_a_task_declares_no_objectives(
+    registry: Registry[Any],
+) -> None:
+    """No marker, no suppression: the judge is the intended channel here.
+
+    ``multi-region-failover`` is deliberately safeguard-only, so its
+    correctness has always come from the checklist. Suppressing that would
+    delete the task's score rather than protect it.
+    """
+
+    class _ChecklistOnly:
+        name = "checklist"
+
+        def applies(self, ctx: MetricContext) -> bool:
+            return True
+
+        def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+            yield MetricScore(name="ChecklistScore", score=0.8, success=True)
+
+    registry.register("checklist")(_ChecklistOnly)
+    results = [_result()]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    assert results[0]["scores"][pipeline.OUTCOME_SCORE_KEY]["score"] == pytest.approx(0.8)
+
+
+def test_agent_error_run_gets_no_composite(registry: Registry[Any]) -> None:
+    """A run whose agent never finished cannot be credited for the end state.
+
+    Two runs in the published corpus ended ``agent_error`` and still carried a
+    perfect 1.0.
+    """
+
+    class _PerfectChecklist:
+        name = "checklist"
+
+        def applies(self, ctx: MetricContext) -> bool:
+            return True
+
+        def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+            yield MetricScore(name="ChecklistScore", score=1.0, success=True)
+
+    registry.register("checklist")(_PerfectChecklist)
+    errored = _result("errored")
+    errored["status"] = "agent_error"
+    ok = _result("ok")
+    ok["status"] = "success"
+    results = [errored, ok]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    # Sub-scores survive for triage; only the composite is withheld, and the
+    # healthy record in the same batch still scores.
+    assert results[0]["scores"]["ChecklistScore"]["score"] == pytest.approx(1.0)
+    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+    assert results[1]["scores"][pipeline.OUTCOME_SCORE_KEY]["score"] == pytest.approx(1.0)

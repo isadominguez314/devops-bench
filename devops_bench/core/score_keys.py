@@ -33,6 +33,7 @@ __all__ = [
     "TOOL_INVOCATION_KEY",
     "VERIFICATION_CATASTROPHIC_KEY",
     "VERIFICATION_CORRECTNESS_KEY",
+    "VERIFICATION_CORRECTNESS_WITHHELD_KEY",
     "VERIFICATION_COVERAGE_KEY",
     "VERIFICATION_RECOVERABLE_KEY",
 ]
@@ -49,6 +50,12 @@ VERIFICATION_CORRECTNESS_KEY = "VerificationCorrectness"
 VERIFICATION_RECOVERABLE_KEY = "VerificationRecoverable"
 VERIFICATION_CATASTROPHIC_KEY = "VerificationCatastrophic"
 VERIFICATION_COVERAGE_KEY = "VerificationCoverage"
+#: Marker, not a measurement: ``1.0`` means the deterministic channel abstained
+#: from correctness because an objective went unobserved or the spec failed to
+#: parse. It exists so the scoring layer can tell that case apart from a task
+#: that simply declares no objectives — the first must not fall back to the
+#: judge, the second is designed to. Never a component of the composite.
+VERIFICATION_CORRECTNESS_WITHHELD_KEY = "VerificationCorrectnessWithheld"
 
 # --- judged signals, from prose checklists on the task ------------------------
 #: Correctness, and its fallback for tasks that author no checklist.

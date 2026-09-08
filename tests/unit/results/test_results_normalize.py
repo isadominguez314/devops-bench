@@ -406,6 +406,7 @@ def test_manifest_to_dict_keys():
         "model",
         "harness",
         "augmentation",
+        "judgeModel",
     }
 
 
