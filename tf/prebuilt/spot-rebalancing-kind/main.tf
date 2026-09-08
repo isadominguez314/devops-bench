@@ -72,6 +72,14 @@ resource "kind_cluster" "default" {
 resource "local_file" "rightsizing_report" {
   filename = pathexpand(local.report_path)
   content  = file("${path.module}/manifests/rightsizing-report.json")
+
+  # World-readable on purpose. The agent may not be the user that provisioned:
+  # seeded as root into a 0700 home, or as one uid while the agent runs as
+  # another, the report is present but unreadable, and the agent guesses its
+  # own rightsizing numbers instead. The verifiers encode this report's exact
+  # values, so a guess fails checks the agent was never able to satisfy. There
+  # is nothing secret here — it is task input, not answer material.
+  file_permission = "0644"
 }
 
 # Outside-the-cluster setup: label/taint the node pools and deploy the fleet. The

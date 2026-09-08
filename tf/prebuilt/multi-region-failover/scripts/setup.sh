@@ -196,6 +196,15 @@ git -C "$WORK" -c init.defaultBranch=main commit -q -m "storefront desired state
 git -C "$WORK" branch -M main
 git -C "$WORK" push -q "$REPO_PATH" main
 
+# The agent may not be the user that provisioned. Seeding as root into a 0700
+# home, or as one uid while the agent runs as another, leaves the fixture
+# present but unreadable — which the agent experiences as "the file my prompt
+# named does not exist" and works around by reconstructing what it can. Make
+# the repo group/other readable, and make its parents traversable, so the path
+# resolves for whoever the agent turns out to be.
+chmod -R a+rX "$REPO_PATH" 2>/dev/null || true
+chmod a+x "$(dirname "$REPO_PATH")" 2>/dev/null || true
+
 echo "==> Setup complete."
 echo "    Global endpoint : http://${LB_IP}/   (currently 5xx — primary region down)"
 echo "    Contexts        : east (primary, node pool deleted), west (standby, healthy)"

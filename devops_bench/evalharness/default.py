@@ -59,6 +59,7 @@ from devops_bench.core import (
 from devops_bench.deployers.factory import get_deployer
 from devops_bench.evalharness.artifacts import collect_generated_files, snapshot_dir
 from devops_bench.evalharness.base import Harness
+from devops_bench.evalharness.fixtures import check_prompt_fixtures
 from devops_bench.evalharness.hold import (
     HOLD_POLL_INTERVAL_SEC,
     HoldObservation,
@@ -1152,6 +1153,7 @@ class DefaultEvalHarness(Harness):
         result: dict[str, Any] | None = None
         workspace_path: Path | None = None
         creds_dir: Path | None = None
+        completed_spec: agent_sandbox.SandboxSpec | None = None
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
         # Tracked from parse time so the exception path can also tell whether a
@@ -1204,6 +1206,24 @@ class DefaultEvalHarness(Harness):
             target_dep, ns = self._resolve_deployment_and_namespace(task)
 
             prompt = self.replace_placeholders(task.prompt, active_cluster_name, target_dep, ns)
+            # Before the agent starts, confirm the home fixtures this prompt
+            # promises are actually where it says. A missing one does not fail
+            # the agent, it makes it hunt the filesystem and get graded on what
+            # it could reconstruct — indistinguishable, from the score, from a
+            # model that simply did worse. Raises unless BENCH_REQUIRE_FIXTURES
+            # is off; skipped when a sandbox mount plan already carried the
+            # fixtures in, since host paths then say nothing about the agent's
+            # view.
+            # Unsandboxed, the agent inherits this process's HOME, so the
+            # default (Path.home()) is the agent's own view. Sandboxed, its HOME
+            # is the workspace copy — and if a mount plan filled that, the check
+            # is skipped entirely rather than second-guessing the bind.
+            check_prompt_fixtures(
+                prompt,
+                task.name,
+                home=(workspace_path / "home") if completed_spec is not None else None,
+                mounted=bool(completed_spec is not None and completed_spec.fixture_mounts),
+            )
             # Resolved here, before the agent runs, so a failure mid-execution
             # still records the substituted checklists rather than raw
             # placeholders.

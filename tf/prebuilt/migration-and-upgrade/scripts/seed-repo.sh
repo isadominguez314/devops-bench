@@ -53,5 +53,11 @@ rm -rf "${WORK}"
 # (git init --bare defaults HEAD to the nonexistent 'master').
 git -c safe.bareRepository=all -C "${REPO_PATH}" symbolic-ref HEAD refs/heads/main
 
+# The agent may not be the user that provisioned. Seeding as root into a 0700
+# home, or as one uid while the agent runs as another, leaves the repo present
+# but unreadable — which the agent experiences as "the repo my prompt named
+# does not exist".
+chmod -R a+rX "${REPO_PATH}" 2>/dev/null || true
+chmod a+x "$(dirname "${REPO_PATH}")" 2>/dev/null || true
 
 echo "==> Repo seeded. Clone with: git clone ${REPO_PATH}"
