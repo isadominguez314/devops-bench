@@ -21,7 +21,7 @@ from typing import Any
 
 from deepeval.test_case import LLMTestCase
 
-from devops_bench.core import get_bool, get_logger, score_keys
+from devops_bench.core import get_bool, get_logger, is_unscoreable_run, score_keys
 
 # Imported for their @METRICS.register side effects.
 from devops_bench.metrics import (
@@ -169,7 +169,20 @@ def _finalize_outcome_score(scores: dict[str, Any]) -> None:
     fired = [k for k in _CATASTROPHIC_KEYS if _score_value(scores.get(k)) == 0.0]
     catastrophic = bool(fired)
 
-    measured_correctness = _first_score(scores, _CORRECTNESS_KEYS)
+    if _score_value(scores.get(score_keys.VERIFICATION_CORRECTNESS_WITHHELD_KEY)) == 1.0:
+        # The deterministic channel abstained: an objective went unobserved, or
+        # the spec did not parse. Falling through to ``ChecklistScore`` here
+        # would let a judge's reading of prose stand in for a measurement that
+        # was never taken — the exact path that published a confident 0.8 for a
+        # run whose one objective had actually failed. Withhold every
+        # correctness source instead, so the record scores null and drops out
+        # of the leaderboard rather than publishing a number nobody measured.
+        # Deliberately not triggered when a task declares no objectives at all
+        # (multi-region-failover is safeguard-only by design): there the judge
+        # IS the intended correctness channel, and the marker is never emitted.
+        measured_correctness = None
+    else:
+        measured_correctness = _first_score(scores, _CORRECTNESS_KEYS)
     correctness = measured_correctness
     if correctness is None:
         if not catastrophic:
@@ -330,7 +343,7 @@ def evaluate_metrics_batch(
         len(detailed_results),
     )
     if use_mcp is None:
-        use_mcp = get_bool("BENCH_USE_MCP", True)
+        use_mcp = get_bool("BENCH_USE_MCP", False)
 
     builtin_set = set(_BUILTIN_METRIC_KEYS)
     # Builtin metrics in the pinned (results.json) order, then any third-party
@@ -363,6 +376,21 @@ def evaluate_metrics_batch(
         # like the metric loop: a malformed sub-score raises out of the scoring
         # formula, and must cost this record its composite rather than abort the
         # remaining records in the batch.
+        if is_unscoreable_run(res):
+            # The agent did not complete its turn, so whatever the cluster
+            # looks like now is not a result it can be credited or blamed for.
+            # The sub-scores stay for triage; only the composite is withheld,
+            # which leaves the row null and out of the leaderboard. Observed
+            # corpus-side: two agent_error runs published a perfect 1.0.
+            _log.warning(
+                "no composite outcome score for %s: status=%r, errors=%d, trajectory steps=%d",
+                res.get("name"),
+                res.get("status"),
+                len(res.get("errors") or []),
+                len(res.get("trajectory") or []),
+            )
+            res["scores"] = scores
+            continue
         try:
             _finalize_outcome_score(scores)
         except Exception:  # noqa: BLE001 - one record must not abort the batch

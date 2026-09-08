@@ -406,6 +406,7 @@ def test_manifest_to_dict_keys():
         "model",
         "harness",
         "augmentation",
+        "judgeModel",
     }
 
 
@@ -482,3 +483,46 @@ def test_normalize_tokens_snake_case_still_wins_when_both_present() -> None:
     # Canonical spelling keeps precedence; the camelCase aliases are additions,
     # not replacements.
     assert normalize_tokens({"cached": 1, "cacheRead": 2})[2] == 1
+
+
+# -- correctness withheld / unattributable runs ------------------------------
+
+
+def test_row_correctness_is_null_when_the_deterministic_channel_abstained():
+    # The row carries its own copy of the correctness preference chain, so
+    # suppressing the judge fallback in the composite is not enough: the
+    # dashboard averages correctnessScore over every row, including rows whose
+    # outcomeScore is null. Without this the withheld run still contributes a
+    # judge-derived correctness to the published column.
+    record = {
+        "name": "t",
+        "folder": "f",
+        "status": "success",
+        "scores": {
+            "VerificationCorrectnessWithheld": 1.0,
+            "ChecklistScore": {"score": 0.8, "success": True, "reason": "4/5"},
+        },
+    }
+    assert build_rows([record], _manifest())[0].to_dict()["correctnessScore"] is None
+
+
+def test_row_correctness_is_null_for_a_run_the_agent_never_completed():
+    record = {
+        "name": "t",
+        "folder": "f",
+        "status": "agent_error",
+        "scores": {"ChecklistScore": {"score": 1.0, "success": True, "reason": "5/5"}},
+    }
+    assert build_rows([record], _manifest())[0].to_dict()["correctnessScore"] is None
+
+
+def test_row_correctness_survives_an_ordinary_judge_graded_run():
+    # A task that declares no objectives intends the judge to grade it; the
+    # withheld marker is absent, so nothing is suppressed.
+    record = {
+        "name": "t",
+        "folder": "f",
+        "status": "success",
+        "scores": {"ChecklistScore": {"score": 0.8, "success": True, "reason": "4/5"}},
+    }
+    assert build_rows([record], _manifest())[0].to_dict()["correctnessScore"] == 0.8

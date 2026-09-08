@@ -226,3 +226,43 @@ def test_parse_error_count_forces_correctness_to_none_even_when_every_parsed_ent
         parse_error_count=1,
     )
     assert scores.correctness is None
+
+
+# --- withheld vs simply-absent correctness ------------------------------------
+
+
+def test_errored_objective_marks_correctness_withheld() -> None:
+    """An unobserved objective abstains, and says so."""
+    scores = rollup(
+        [
+            {"role": "objective", "status": "pass"},
+            {"role": "objective", "status": "error"},
+        ]
+    )
+    assert scores.correctness is None
+    assert scores.correctness_withheld is True
+
+
+def test_parse_errors_mark_correctness_withheld() -> None:
+    """A spec that did not parse abstains for the same reason."""
+    scores = rollup([{"role": "objective", "status": "pass"}], parse_error_count=1)
+    assert scores.correctness is None
+    assert scores.correctness_withheld is True
+
+
+def test_a_task_with_no_objectives_is_absent_not_withheld() -> None:
+    """Safeguard-only tasks intend the judge to grade correctness.
+
+    Same ``correctness is None`` as the two cases above, opposite meaning: the
+    scoring layer may fall back to the checklist here and must not there.
+    """
+    scores = rollup([{"role": "safeguard", "severity": "recoverable", "status": "pass"}])
+    assert scores.correctness is None
+    assert scores.correctness_withheld is False
+
+
+def test_a_clean_report_is_not_withheld() -> None:
+    """A fully observed report reports a number and no abstention."""
+    scores = rollup([{"role": "objective", "status": "pass"}])
+    assert scores.correctness == 1.0
+    assert scores.correctness_withheld is False

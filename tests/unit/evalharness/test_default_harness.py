@@ -1570,3 +1570,41 @@ def test_invalidated_entry_leaves_the_correctness_denominator(isolated_env: None
     assert scores.correctness is None
     # The gap shows up in coverage instead, which is what disqualifies the run.
     assert 1 - (scores.errored / scores.declared) == 0.5
+
+
+# --- chaos invalidation is a run-level status, not just an entry error --------
+
+
+def test_verification_status_names_chaos_invalidation() -> None:
+    """A run whose disruption never fired says so, instead of looking ordinary."""
+    assert harness_default._verification_status([], {"Spike Verification": "never fired"}) == (  # noqa: SLF001
+        "chaos_invalidated"
+    )
+
+
+def test_parse_error_outranks_chaos_invalidation() -> None:
+    """A spec nobody could parse is the worse problem, so it wins the label."""
+    assert (
+        harness_default._verification_status(  # noqa: SLF001
+            [{"error": "bad"}], {"Spike Verification": "never fired"}
+        )
+        == "parse_error"
+    )
+
+
+def test_verification_status_is_evaluated_when_nothing_went_wrong() -> None:
+    assert harness_default._verification_status([], {}) == "evaluated"  # noqa: SLF001
+
+
+def test_resolve_model_name_prefers_the_judges_own_label() -> None:
+    """The manifest records the judge that actually graded, fallback included."""
+    from types import SimpleNamespace
+
+    judge = SimpleNamespace(_model_name="gemini-3.1-pro-preview")
+    assert harness_default._resolve_model_name(judge) == "gemini-3.1-pro-preview"  # noqa: SLF001
+
+    # No label of its own: fall through to the wrapped client's.
+    wrapped = SimpleNamespace(client=SimpleNamespace(model_name="claude-opus-5"))
+    assert harness_default._resolve_model_name(wrapped) == "claude-opus-5"  # noqa: SLF001
+
+    assert harness_default._resolve_model_name(None) is None  # noqa: SLF001

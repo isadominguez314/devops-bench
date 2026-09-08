@@ -53,6 +53,14 @@ class RollupScores:
         declared: Count of every entry seen, evaluated or not.
         errored: Count of entries whose status is "error" (could not be
             evaluated), a subset of ``declared``.
+        correctness_withheld: ``True`` when ``correctness`` is ``None`` because
+            the deterministic channel *abstained* — an objective errored, or
+            the spec failed to parse — as opposed to the task simply declaring
+            no objectives. The two look identical in ``correctness`` but mean
+            opposite things downstream: a task with no objectives intends the
+            judge to grade correctness, while a task whose objectives went
+            unobserved has a broken measurement that a judge score would paper
+            over. Only the former may fall back to the judge.
     """
 
     correctness: float | None
@@ -60,6 +68,7 @@ class RollupScores:
     catastrophic: float | None
     declared: int
     errored: int
+    correctness_withheld: bool = False
 
 
 def rollup(evaluated: Iterable[Mapping[str, Any]], *, parse_error_count: int = 0) -> RollupScores:
@@ -134,10 +143,9 @@ def rollup(evaluated: Iterable[Mapping[str, Any]], *, parse_error_count: int = 0
                 if not success:
                     catastrophic_failed = True
 
+    withheld = bool(parse_error_count or objective_errored)
     correctness = (
-        None
-        if parse_error_count or objective_errored
-        else (objective_passed / objective_total if objective_total else None)
+        None if withheld else (objective_passed / objective_total if objective_total else None)
     )
 
     return RollupScores(
@@ -146,4 +154,5 @@ def rollup(evaluated: Iterable[Mapping[str, Any]], *, parse_error_count: int = 0
         catastrophic=((0.0 if catastrophic_failed else 1.0) if catastrophic_seen else None),
         declared=declared,
         errored=errored,
+        correctness_withheld=withheld,
     )

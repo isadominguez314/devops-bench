@@ -74,7 +74,10 @@ def test_it_evaluates_parse_errors_alone_with_an_empty_report() -> None:
         }
     )
     scores = {s.name: s.score for s in VerificationMetric().evaluate(ctx)}
-    assert scores == {"VerificationCoverage": 1.0}
+    # The withheld marker rides along so the scoring layer can tell this
+    # abstention apart from a task that declares no objectives, and refuse the
+    # judge fallback here.
+    assert scores == {"VerificationCoverage": 1.0, "VerificationCorrectnessWithheld": 1.0}
     assert "VerificationCorrectness" not in scores
     assert "VerificationRecoverable" not in scores
     assert "VerificationCatastrophic" not in scores
