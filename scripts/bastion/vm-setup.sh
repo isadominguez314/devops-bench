@@ -97,20 +97,47 @@ fi
 # only. Host processes are unaffected, so ambient (unsandboxed) harness runs
 # and the matrix keep authenticating through the metadata server as before.
 #
+# Port 53 has to stay open, or the block takes DNS down with it. On a GCP VM
+# the metadata address is also the resolver: /etc/resolv.conf is the
+# systemd-resolved stub, dockerd follows it to /run/systemd/resolve/resolv.conf,
+# finds 169.254.169.254 there, and copies that into every container on the
+# default bridge. A blanket REJECT then leaves the container unable to resolve
+# anything at all -- the agent CLI fails with a transport error that names no
+# name server, so it reads as a network outage rather than as this rule.
+#
+# kind hides the bug, which is why it took a GKE run to find: containers on a
+# user-defined network resolve through Docker's embedded server at 127.0.0.11,
+# and dockerd forwards those queries from the host namespace, where DOCKER-USER
+# does not apply. Only the default bridge -- what every non-kind provider gets
+# -- queries the metadata address directly.
+#
+# Narrowing to protocol and port keeps the boundary: the token endpoints are
+# HTTP on port 80, so they stay rejected, and a DNS answer cannot carry a
+# credential. Order matters. -I inserts at the head of the chain, so the ACCEPT
+# rules go in *after* the REJECT to end up above it.
+#
 # Known limitation: iptables rules do not survive a reboot, and DOCKER-USER
 # itself is created by dockerd. Re-run this script after a reboot rather than
-# pulling in iptables-persistent for one rule. See docs/components/infra.md.
+# pulling in iptables-persistent for these rules. See docs/components/infra.md.
 echo "==> metadata endpoint block (container egress)"
 if ! command -v iptables >/dev/null 2>&1; then
   echo "    WARN: iptables not found; containers can still reach the metadata server."
 elif ! sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
   echo "    WARN: no DOCKER-USER chain yet (is dockerd running?); re-run after Docker starts."
-elif sudo iptables -C DOCKER-USER -d 169.254.169.254 -j REJECT >/dev/null 2>&1; then
-  echo "    already blocked."
 else
-  sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT \
-    && echo "    containers can no longer reach 169.254.169.254." \
-    || echo "    WARN: could not install the rule; containers can still reach the metadata server."
+  if sudo iptables -C DOCKER-USER -d 169.254.169.254 -j REJECT >/dev/null 2>&1; then
+    echo "    already blocked."
+  else
+    sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT \
+      && echo "    containers can no longer reach 169.254.169.254." \
+      || echo "    WARN: could not install the rule; containers can still reach the metadata server."
+  fi
+  for proto in udp tcp; do
+    sudo iptables -C DOCKER-USER -d 169.254.169.254 -p "$proto" --dport 53 -j ACCEPT >/dev/null 2>&1 \
+      || sudo iptables -I DOCKER-USER -d 169.254.169.254 -p "$proto" --dport 53 -j ACCEPT \
+      || echo "    WARN: could not permit $proto/53; container DNS will fail on this host."
+  done
+  echo "    DNS to 169.254.169.254 still permitted (port 53 only)."
 fi
 
 # fortio — the load generator the chaos agent shells out to for `generate_load`
