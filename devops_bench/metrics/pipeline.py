@@ -21,7 +21,7 @@ from typing import Any
 
 from deepeval.test_case import LLMTestCase
 
-from devops_bench.core import get_bool, get_logger, score_keys
+from devops_bench.core import get_bool, get_logger, is_unscoreable_run, score_keys
 
 # Imported for their @METRICS.register side effects.
 from devops_bench.metrics import (
@@ -64,11 +64,6 @@ _log = get_logger("metrics.pipeline")
 #: the sub-scores after all metrics run (see :func:`_finalize_outcome_score`);
 #: the flat leaderboard row reads its ``outcomeScore`` from this key.
 OUTCOME_SCORE_KEY = score_keys.OUTCOME_SCORE_KEY
-
-# Run statuses that cannot carry a composite score whatever the sub-scores say:
-# the agent never finished its turn, so the end state is not attributable to it.
-# ``failed`` records never reach scoring at all; ``agent_error`` ones do.
-_UNSCOREABLE_STATUSES = frozenset({"agent_error"})
 
 # Sub-score keys read to assemble the composite, in preference order. Sourced
 # from ``core.score_keys`` so the emitters, this assembly, and
@@ -348,7 +343,7 @@ def evaluate_metrics_batch(
         len(detailed_results),
     )
     if use_mcp is None:
-        use_mcp = get_bool("BENCH_USE_MCP", True)
+        use_mcp = get_bool("BENCH_USE_MCP", False)
 
     builtin_set = set(_BUILTIN_METRIC_KEYS)
     # Builtin metrics in the pinned (results.json) order, then any third-party
@@ -381,17 +376,18 @@ def evaluate_metrics_batch(
         # like the metric loop: a malformed sub-score raises out of the scoring
         # formula, and must cost this record its composite rather than abort the
         # remaining records in the batch.
-        status = str(res.get("status") or "")
-        if status in _UNSCOREABLE_STATUSES:
+        if is_unscoreable_run(res):
             # The agent did not complete its turn, so whatever the cluster
             # looks like now is not a result it can be credited or blamed for.
             # The sub-scores stay for triage; only the composite is withheld,
             # which leaves the row null and out of the leaderboard. Observed
             # corpus-side: two agent_error runs published a perfect 1.0.
             _log.warning(
-                "no composite outcome score for %s: run status is %r",
+                "no composite outcome score for %s: status=%r, errors=%d, trajectory steps=%d",
                 res.get("name"),
-                status,
+                res.get("status"),
+                len(res.get("errors") or []),
+                len(res.get("trajectory") or []),
             )
             res["scores"] = scores
             continue

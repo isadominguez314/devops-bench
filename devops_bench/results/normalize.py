@@ -27,6 +27,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
 from devops_bench.core import score_keys
+from devops_bench.core.run_status import is_unscoreable_run
 from devops_bench.results.row import Manifest, ResultRow
 
 __all__ = [
@@ -177,6 +178,35 @@ def _first_token(tokens: Mapping[str, Any], keys: tuple[str, ...]) -> int | None
     return None
 
 
+def _correctness_unpublishable(scores: Mapping[str, Any] | None, record: Mapping[str, Any]) -> bool:
+    """Whether this row must publish no ``correctnessScore`` at all.
+
+    The row carries its own copy of the correctness preference chain, so
+    suppressing the judge fallback in the composite is not enough: the
+    dashboard averages ``correctnessScore`` across every row, including rows
+    whose ``outcomeScore`` is null. Without this, a run that withheld its
+    composite still contributes a judge-derived correctness to the published
+    column — the exact number the withholding exists to keep out.
+
+    Two cases, matching the scoring layer:
+
+    * the deterministic channel abstained (an objective errored, or the spec
+      failed to parse), and
+    * the agent never finished its turn, so the end state is not attributable
+      to it.
+
+    Args:
+        scores: The record's ``scores`` mapping.
+        record: The full record, read for its run ``status``.
+
+    Returns:
+        ``True`` when the row must report ``None`` for correctness.
+    """
+    if extract_score(scores, score_keys.VERIFICATION_CORRECTNESS_WITHHELD_KEY) == 1.0:
+        return True
+    return is_unscoreable_run(record)
+
+
 class NormalizedTokens(NamedTuple):
     """Per-bucket token counts flattened from a provider ``tokens`` dict.
 
@@ -297,7 +327,11 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
     for record in records:
         scores = record.get("scores")
         tokens = normalize_tokens(record.get("tokens"))
-        correctness = _first_score(scores, _CORRECTNESS_KEYS)
+        correctness = (
+            None
+            if _correctness_unpublishable(scores, record)
+            else _first_score(scores, _CORRECTNESS_KEYS)
+        )
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
         rows.append(
             ResultRow(

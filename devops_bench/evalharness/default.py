@@ -302,7 +302,12 @@ class DefaultEvalHarness(Harness):
         self.no_infra = no_infra if no_infra is not None else get_bool("BENCH_NO_INFRA")
         self.no_teardown = no_teardown if no_teardown is not None else get_bool("BENCH_NO_TEARDOWN")
         # Resolved once so capabilities and scoring observe the same value.
-        self.use_mcp: bool = get_bool("BENCH_USE_MCP", True)
+        # Defaults OFF: the flag alone adds the ``mcp`` augmentation token, which
+        # changes ``setup_id`` and therefore which arm a row aggregates into. A
+        # default-on flag is how 104 published runs claimed an MCP augmentation
+        # when only 2 ever called an MCP tool. Opt in explicitly to compare an
+        # MCP arm against the baseline.
+        self.use_mcp: bool = get_bool("BENCH_USE_MCP", False)
         # Trajectory-based cheating detection annotates each record with a
         # ``cheating_report`` and never touches ``validated``. The report is
         # not inert, though: ``IntegrityMetric`` reads it during the later
