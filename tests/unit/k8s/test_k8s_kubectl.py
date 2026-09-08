@@ -494,3 +494,43 @@ def test_exec_pod_separates_the_command_from_kubectl_flags(mocker: MockerFixture
     argv = mock_run.call_args.args[0]
     assert argv[: argv.index("--")] == ["kubectl", "exec", "prober"]
     assert argv[argv.index("--") + 1 :] == ["curl", "-s", "http://orders-api/health"]
+
+
+def test_apply_threads_context_into_argv(mocker: MockerFixture) -> None:
+    # Applying a cluster-scoped object against whichever cluster the ambient
+    # current-context happens to name is the failure the pin exists to stop.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.apply("/tmp/manifest.yaml", namespace="prod", context="kind-bench")
+
+    assert mock_run.call_args.args[0] == [
+        "kubectl",
+        "apply",
+        "-f",
+        "/tmp/manifest.yaml",
+        "-n",
+        "prod",
+        "--context",
+        "kind-bench",
+    ]
+
+
+def test_get_resource_pins_context_alongside_kubeconfig(mocker: MockerFixture) -> None:
+    # The kubeconfig overlay alone is not a pin: one file routinely holds
+    # several contexts, so the read still needs to say which.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed("{}"))
+
+    kubectl.get_resource("pods", kubeconfig="/tmp/kc", context="gke_p_us_c")
+
+    assert mock_run.call_args.args[0][-2:] == ["--context", "gke_p_us_c"]
+    assert mock_run.call_args.kwargs["extra_env"] == {"KUBECONFIG": "/tmp/kc"}
+
+
+def test_apply_and_get_resource_omit_the_flag_without_a_context(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed("{}"))
+
+    kubectl.apply("/tmp/manifest.yaml")
+    kubectl.get_resource("pods")
+
+    for call in mock_run.call_args_list:
+        assert "--context" not in call.args[0]
