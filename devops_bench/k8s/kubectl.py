@@ -21,7 +21,7 @@ import json
 import re
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any, Protocol
 
 from devops_bench.core import get_logger
@@ -29,9 +29,12 @@ from devops_bench.core.subprocess import CompletedProcess, _build_env, run
 
 __all__ = [
     "apply",
+    "config_value",
+    "create_token",
     "exec_pod",
     "get_resource",
     "is_not_found",
+    "label",
     "port_forward",
     "rollout_status",
     "run_pod",
@@ -217,7 +220,9 @@ def get_resource(
     *,
     selector: str | None = None,
     namespace: str | None = None,
+    all_namespaces: bool = False,
     kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
     timeout: float | None = None,
 ) -> dict[str, Any]:
     """Fetch a resource (or list) as parsed JSON via ``kubectl get -o json``.
@@ -227,7 +232,14 @@ def get_resource(
         name: Optional specific resource name.
         selector: Optional label selector (``-l``).
         namespace: Optional namespace (``-n``).
+        all_namespaces: List across every namespace (``-A``). Without it a
+            namespaced kind is read from the kubeconfig's current namespace,
+            which for a cluster-wide question is silently the wrong answer
+            rather than an error. Ignored when ``namespace`` is given.
         kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubeconfig context to pin the call to. A read left
+            unpinned silently answers for whichever cluster the ambient
+            current-context points at.
         timeout: Optional seconds before the subprocess is killed. ``None``
             (the default) blocks indefinitely, so pass one whenever the API
             server might accept a connection and never respond.
@@ -247,9 +259,9 @@ def get_resource(
         *_selector_args(selector),
         "-o",
         "json",
-        *_namespace_args(namespace),
+        *(_namespace_args(namespace) if namespace or not all_namespaces else ["-A"]),
     ]
-    completed = _run_kubectl(argv, kubeconfig, timeout=timeout)
+    completed = _run_kubectl(argv, kubeconfig, context=context, timeout=timeout)
     return json.loads(completed.stdout)
 
 
@@ -305,6 +317,7 @@ def apply(
     *,
     namespace: str | None = None,
     kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
 ) -> CompletedProcess:
     """Apply a manifest file or directory via ``kubectl apply -f``.
 
@@ -312,6 +325,9 @@ def apply(
         path: Manifest file, directory, or URL passed to ``-f``.
         namespace: Optional namespace (``-n``).
         kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubeconfig context to pin the call to. Writing a
+            cluster-scoped object to the wrong cluster is the failure this
+            prevents, so any caller that knows its own cluster passes one.
 
     Returns:
         The completed process.
@@ -320,7 +336,115 @@ def apply(
         SubprocessError: If kubectl exits non-zero or times out.
     """
     argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
-    return _run_kubectl(argv, kubeconfig)
+    return _run_kubectl(argv, kubeconfig, context=context)
+
+
+def label(
+    resource: str,
+    name: str,
+    labels: Mapping[str, str],
+    *,
+    overwrite: bool = False,
+    namespace: str | None = None,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> CompletedProcess:
+    """Set labels on one resource via ``kubectl label``.
+
+    Args:
+        resource: Resource kind, e.g. ``"namespace"``.
+        name: Name of the resource to label.
+        labels: Label keys to values. Rendered as ``key=value`` arguments in
+            iteration order.
+        overwrite: Pass ``--overwrite``. Without it kubectl refuses to change
+            a label that already has a different value, which is the right
+            default when a pre-existing value is meaningful.
+        namespace: Optional namespace (``-n``).
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubectl context to pin the call to (``--context``).
+
+    Returns:
+        The completed process.
+
+    Raises:
+        SubprocessError: If kubectl exits non-zero or times out.
+    """
+    argv = [
+        "kubectl",
+        "label",
+        resource,
+        name,
+        *(f"{key}={value}" for key, value in labels.items()),
+        *(["--overwrite"] if overwrite else []),
+        *_namespace_args(namespace),
+    ]
+    return _run_kubectl(argv, kubeconfig, context=context)
+
+
+def config_value(
+    jsonpath: str,
+    *,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> str:
+    """Read one value out of the effective kubeconfig, ``""`` when absent.
+
+    ``--minify`` reduces the view to the selected context before the jsonpath
+    is applied, so ``{.clusters[0]...}`` always refers to that context's own
+    cluster however many the file holds.
+
+    Args:
+        jsonpath: Expression passed to ``-o jsonpath=``, e.g.
+            ``"{.clusters[0].cluster.server}"``.
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubectl context to read (``--context``); ``None``
+            reads the ambient current-context.
+
+    Returns:
+        The stripped value, or ``""`` when the key is absent or kubectl fails
+        — callers decide whether an absent value is fatal.
+    """
+    argv = ["kubectl", "config", "view", "--raw", "--minify", "-o", f"jsonpath={jsonpath}"]
+    completed = _run_kubectl(argv, kubeconfig, context=context, check=False)
+    return (completed.stdout or "").strip()
+
+
+def create_token(
+    service_account: str,
+    *,
+    namespace: str,
+    duration_sec: float,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> str:
+    """Mint a short-lived ServiceAccount token via ``kubectl create token``.
+
+    The apiserver may return a shorter lifetime than requested when the
+    request exceeds its configured maximum; the token is still valid, just
+    sooner-expiring, so this reports what it was given rather than failing.
+
+    Args:
+        service_account: Name of the ServiceAccount to mint for.
+        namespace: Namespace holding the ServiceAccount (``-n``).
+        duration_sec: Requested token lifetime (``--duration=<n>s``).
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubectl context to pin the call to (``--context``).
+
+    Returns:
+        The bearer token.
+
+    Raises:
+        SubprocessError: If kubectl exits non-zero or times out.
+    """
+    argv = [
+        "kubectl",
+        "create",
+        "token",
+        service_account,
+        f"--duration={int(duration_sec)}s",
+        *_namespace_args(namespace),
+    ]
+    return (_run_kubectl(argv, kubeconfig, context=context).stdout or "").strip()
 
 
 def rollout_status(

@@ -22,7 +22,7 @@ from devops_bench.core.config import (
     require_env,
     resolve_tf_root,
 )
-from devops_bench.core.context import ClusterInfo, RunContext
+from devops_bench.core.context import ClusterInfo, NetworkPlan, RunContext
 from devops_bench.core.errors import (
     AlreadyRegisteredError,
     ConfigError,
@@ -42,6 +42,7 @@ from devops_bench.core.run_status import UNSCOREABLE_RUN_STATUSES, is_unscoreabl
 
 __all__ = [
     "ClusterInfo",
+    "NetworkPlan",
     "RunContext",
     "RunEnv",
     "Registry",
