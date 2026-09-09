@@ -1617,3 +1617,67 @@ def test_resolve_model_name_prefers_the_judges_own_label() -> None:
     assert harness_default._resolve_model_name(wrapped) == "claude-opus-5"  # noqa: SLF001
 
     assert harness_default._resolve_model_name(None) is None  # noqa: SLF001
+
+
+# --- requires_unsandboxed: a task the boundary would make impossible ---------
+
+
+def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -> None:
+    """secret-rotation drives Secret Manager through ADC, which the sandbox strips.
+
+    Clearing the field matters rather than merely skipping spec completion: the
+    agent's own gate reads ``config.sandbox is not None``, so a leftover
+    skeletal spec would refuse the run or hand the executor half a boundary.
+    """
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    from dataclasses import replace as _replace
+
+    harness._agent_config = _replace(  # noqa: SLF001
+        harness._agent_config,  # noqa: SLF001
+        sandbox=harness_default.agent_sandbox.SandboxSpec(image="img"),
+    )
+
+    harness._sandbox_exempt_task = True  # noqa: SLF001
+    assert harness.build_agent_config().sandbox is None
+
+    harness._sandbox_exempt_task = False  # noqa: SLF001
+    assert harness.build_agent_config().sandbox is not None
+
+
+def test_secret_rotation_declares_requires_unsandboxed() -> None:
+    """The exemption travels with the task that needs it, not with a runner flag.
+
+    Loaded through the real loader, not read as raw YAML: ``Task.from_dict``
+    builds an explicit field mapping and ``Task`` ignores unknown keys, so a key
+    missing from that mapping is dropped silently — a raw-YAML assertion stays
+    green while the harness sees the ``False`` default. The raw-YAML check stays
+    alongside as a spec-content check, but the loader path is the coverage.
+    """
+    import pathlib
+
+    import yaml as _yaml
+
+    from devops_bench.tasks.loader import FileSystemTaskLoader
+
+    tasks = FileSystemTaskLoader().load_tasks("tasks/gcp/secret-rotation/task.yaml")
+    assert len(tasks) == 1
+    assert tasks[0].requires_unsandboxed is True
+
+    spec = _yaml.safe_load(
+        pathlib.Path("tasks/gcp/secret-rotation/task.yaml").read_text(encoding="utf-8")
+    )
+    assert spec.get("requires_unsandboxed") is True
+
+
+def test_no_other_task_opts_out_of_the_sandbox() -> None:
+    """Exactly one exemption; a second would need its own justification."""
+    import pathlib
+
+    import yaml as _yaml
+
+    exempt = [
+        p.parent.name
+        for p in sorted(pathlib.Path("tasks").glob("*/*/task.yaml"))
+        if (_yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("requires_unsandboxed")
+    ]
+    assert exempt == ["secret-rotation"]

@@ -349,6 +349,8 @@ class DefaultEvalHarness(Harness):
         # task name), replacing the operator-home inventory that no longer
         # describes what the agent can see.
         self._active_sandbox_spec: agent_sandbox.SandboxSpec | None = None
+        # Set per task from ``Task.requires_unsandboxed``; see build_agent_config.
+        self._sandbox_exempt_task: bool = False
         self._sandbox_inventory_rules: dict[str, tuple[SensitiveAccessRule, ...]] = {}
         self.default_target_deployment = default_target_deployment
         self.default_namespace = default_namespace
@@ -420,6 +422,13 @@ class DefaultEvalHarness(Harness):
             task-completed spec ``_run_one`` prepared; everything else is
             unchanged.
         """
+        if self._sandbox_exempt_task:
+            # A task that declared ``requires_unsandboxed``. Clearing the field
+            # rather than leaving the skeletal spec in place is the whole point:
+            # the agent's own gate reads ``config.sandbox is not None``, so a
+            # leftover spec would either refuse the run or hand the executor an
+            # incomplete boundary.
+            return replace(self._agent_config, sandbox=None)
         if self._active_sandbox_spec is not None:
             return replace(self._agent_config, sandbox=self._active_sandbox_spec)
         return self._agent_config
@@ -430,7 +439,8 @@ class DefaultEvalHarness(Harness):
         Called exactly once, from :meth:`__init__`. Starts from
         :meth:`AgentConfig.from_env` so existing ``AGENT_*`` knobs continue
         to flow through (``model``, ``provider``, ``api_key``, ``target``,
-        ``timeout``, ``max_turns``, ``extra_env``), then replaces
+        ``timeout``, ``max_turns``, ``extra_env``, ``extra_flags``), then
+        replaces
         capabilities with the orchestrator-owned aggregate so the agent
         cannot see a granted MCP binding when ``use_mcp`` is False.
         """
@@ -445,6 +455,12 @@ class DefaultEvalHarness(Harness):
             max_turns=base.max_turns,
             capabilities=capabilities,
             extra_env=base.extra_env,
+            # Rebuilding field-by-field silently drops anything not named
+            # here. Omitting extra_flags meant AGENT_EXTRA_FLAGS parsed fine
+            # and then never reached the binary, so agy kept its 5m default
+            # --print-timeout and every run longer than that died mid-task
+            # with "timeout waiting for response".
+            extra_flags=base.extra_flags,
             sandbox=base.sandbox,
         )
 
@@ -1254,7 +1270,20 @@ class DefaultEvalHarness(Harness):
             # the directory the agent actually writes to (its CLI wrapper's
             # working directory), not the harness process's launch cwd.
             workspace_path = Path(tempfile.mkdtemp(prefix="devops-bench-workspace-"))
-            if self._agent_config.sandbox is not None:
+            if self._agent_config.sandbox is not None and task.requires_unsandboxed:
+                # The task declared that it cannot run behind the boundary —
+                # secret-rotation drives Secret Manager through ADC, and ADC is
+                # exactly what the sandbox strips. Skip the sandbox for this
+                # task instead of failing it, and say so: an operator who asked
+                # for a sandboxed matrix must be able to see which tasks did not
+                # get one, rather than discovering it in the manifest later.
+                _log.warning(
+                    "task %s declares requires_unsandboxed; running it OUTSIDE the "
+                    "agent sandbox even though a sandbox was requested",
+                    task.name,
+                )
+                self._sandbox_exempt_task = True
+            elif self._agent_config.sandbox is not None:
                 # First moment both the cluster endpoint and the workspace
                 # exist. The kubeconfig lands in its own temp dir, NOT the
                 # workspace: the workspace is mounted read-write, and the
@@ -1526,6 +1555,7 @@ class DefaultEvalHarness(Harness):
             # The completed spec is task-scoped state; the generated
             # kubeconfig it points at dies with the task either way.
             self._active_sandbox_spec = None
+            self._sandbox_exempt_task = False
             if creds_dir is not None:
                 shutil.rmtree(creds_dir, ignore_errors=True)
 
