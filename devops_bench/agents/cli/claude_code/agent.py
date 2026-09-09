@@ -63,7 +63,7 @@ from devops_bench.agents.shared.cli_capabilities import (
 )
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.config import get_bool
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
 __all__ = ["ClaudeCodeAgent"]
@@ -192,6 +192,12 @@ def _build_env(config: AgentConfig, *, config_dir: str | None) -> dict[str, str]
     ``GCP_PROJECT_ID`` / ``GCP_VERTEX_LOCATION`` onto the CLI's equivalents. The
     model is never set here — it flows through the ``--model`` argv flag.
 
+    A *sandboxed* Vertex run additionally gets the metadata-emulator env from
+    :func:`~devops_bench.core.model_providers.sandbox_credential_env`: the
+    container cannot reach the real metadata server, so ambient ADC is gone and
+    the credential has to be minted and injected. See
+    :doc:`/components/agents`.
+
     Args:
         config: Resolved :class:`AgentConfig` for this run.
         config_dir: Per-run ``CLAUDE_CONFIG_DIR`` path, or ``None`` when the
@@ -201,7 +207,8 @@ def _build_env(config: AgentConfig, *, config_dir: str | None) -> dict[str, str]
         A mapping suitable for ``core.subprocess.run``'s ``extra_env``.
 
     Raises:
-        ConfigError: If ``config.provider`` is not a known provider.
+        ConfigError: If ``config.provider`` is not a known provider, or if a
+            sandboxed keyless run cannot be given a model credential.
     """
     # Resolve unconditionally so an unknown provider fails loud even on a keyless
     # (Vertex/Bedrock) run, not only when a key happens to be set.
@@ -225,6 +232,8 @@ def _build_env(config: AgentConfig, *, config_dir: str | None) -> dict[str, str]
         # only fall back to "global" when neither is set (never clobber it).
         region = os.environ.get("GCP_VERTEX_LOCATION") or os.environ.get("CLOUD_ML_REGION")
         overlay["CLOUD_ML_REGION"] = region or "global"
+        if config.sandbox is not None:
+            overlay.update(sandbox_credential_env(spec, project=project))
     elif spec.backend == "bedrock":
         overlay["CLAUDE_CODE_USE_BEDROCK"] = "1"
     if config_dir is not None:

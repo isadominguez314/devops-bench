@@ -40,6 +40,7 @@ from devops_bench.agents.cli.claude_code import ClaudeCodeAgent, parse_stream_js
 from devops_bench.agents.cli.claude_code import agent as claude_mod
 from devops_bench.agents.cli.claude_code.agent import _build_argv, _build_env
 from devops_bench.agents.result import TOKEN_BUCKETS, empty_tokens
+from devops_bench.agents.sandbox import SandboxSpec
 from devops_bench.core.errors import ConfigError, SubprocessError
 from devops_bench.results.normalize import normalize_tokens
 
@@ -766,6 +767,54 @@ def test_build_env_vertex_region_defaults_to_global(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("GCP_PROJECT_ID", "proj-42")
     env = _build_env(AgentConfig(provider="anthropic-vertex"), config_dir=None)
     assert env["CLOUD_ML_REGION"] == "global"
+
+
+def test_build_env_unsandboxed_vertex_does_not_mint_a_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unsandboxed run keeps ambient ADC, so the emulator must never start —
+    # minting there would burn an impersonation call for nothing.
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj-42")
+    monkeypatch.setattr(
+        claude_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("recipe called for an unsandboxed run"),
+    )
+    env = _build_env(AgentConfig(provider="anthropic-vertex"), config_dir=None)
+    assert "GCE_METADATA_HOST" not in env
+
+
+def test_build_env_sandboxed_vertex_injects_emulator_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj-42")
+    seen: dict[str, object] = {}
+
+    def _fake(spec, *, project=None, service_account=None):  # type: ignore[no-untyped-def]
+        seen["backend"] = spec.backend
+        seen["project"] = project
+        return {"GCE_METADATA_HOST": "host.docker.internal:5001"}
+
+    monkeypatch.setattr(claude_mod, "sandbox_credential_env", _fake)
+    cfg = AgentConfig(provider="anthropic-vertex", sandbox=SandboxSpec(image="img:dev"))
+    env = _build_env(cfg, config_dir=None)
+    assert env["GCE_METADATA_HOST"] == "host.docker.internal:5001"
+    # The project the emulator serves must be the one the CLI is pointed at.
+    assert seen == {"backend": "vertex", "project": "proj-42"}
+
+
+def test_build_env_sandboxed_key_based_provider_does_not_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A key crosses the boundary by value; no metadata emulator is involved.
+    monkeypatch.setattr(
+        claude_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("recipe called for a key-based provider"),
+    )
+    cfg = AgentConfig(provider="anthropic", api_key="sk-abc", sandbox=SandboxSpec(image="img:dev"))
+    env = _build_env(cfg, config_dir=None)
+    assert env["ANTHROPIC_API_KEY"] == "sk-abc"
 
 
 def test_build_env_keyless_bedrock_sets_switch() -> None:
