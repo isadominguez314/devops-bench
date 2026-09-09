@@ -358,14 +358,49 @@ than infer it from failures.
 
 ### Model credentials
 
-The sandbox strips `CLOUDSDK_CONFIG` and `GOOGLE_APPLICATION_CREDENTIALS`, and
-on the bastion the link-local metadata endpoint is blocked for containers (see
-[infrastructure](infra.md)). Vertex authenticates through Application Default
-Credentials, which is precisely that chain — so **a sandboxed Vertex run cannot
-authenticate and will fail loudly** rather than degrading to an unsandboxed one.
-Use an API-key provider for sandboxed runs: `AGENT_PROVIDER=google`, with the key
-in `AGENT_API_KEY`. Ambient, unsandboxed runs are unaffected and Vertex keeps
-working for them.
+A key-based provider needs nothing special: the key is in the resolved overlay
+and crosses the boundary by value like any other variable.
+
+A **keyless** backend does not have that luxury. The sandbox strips
+`CLOUDSDK_CONFIG` and `GOOGLE_APPLICATION_CREDENTIALS`, and on the bastion the
+link-local metadata endpoint is blocked for containers (see
+[infrastructure](infra.md)) — and Application Default Credentials is exactly
+that chain. So each keyless backend needs its own *mint-and-inject recipe*: mint
+a narrow, short-lived credential host-side, inject it explicitly. The recipes
+live in `core/model_providers.py` (`sandbox_credential_env`), keyed off the
+provider's backend, never in the sandbox module — cloud-specific code stays out
+of the boundary code.
+
+#### Vertex: a metadata-server emulator
+
+Vertex's recipe is a small HTTP server the harness runs on the host, speaking
+the subset of the GCE metadata protocol Google's auth libraries use to obtain a
+token. The container is pointed at it with `GCE_METADATA_HOST`,
+`GCE_METADATA_IP` and `METADATA_SERVER_DETECTION=assume-present`, reaching it at
+`host.docker.internal` (the executor `--add-host`s that to the host gateway on
+every run). The token behind it is minted by impersonating a service account
+that holds `roles/aiplatform.user` and nothing else, refilled in place, and
+never minted at all if the run does not call the model.
+
+Only the token-related paths are served; everything else is a 404, so this is an
+emulator of three endpoints and not a proxy onto the host's real metadata
+server. Requests must carry `Metadata-Flavor: Google`, as the real server
+requires.
+
+Two things have to be set up before a sandboxed Vertex run:
+
+| Variable | Meaning |
+| --- | --- |
+| `BENCH_VERTEX_SANDBOX_SA` | The service account to impersonate. Give it `roles/aiplatform.user` on the project and nothing else. |
+| `GOOGLE_CLOUD_PROJECT` (or `GCP_PROJECT`) | The project the run bills to; the emulator serves it to the SDK. |
+
+plus `roles/iam.serviceAccountTokenCreator` for the *host's own* identity on
+that service account. Anything missing fails loud — a sandboxed run never
+degrades to an unsandboxed one to get a credential.
+
+Bedrock has no recipe yet; a sandboxed `anthropic-bedrock` run is refused with
+an error saying so. Ambient, unsandboxed runs of either are unaffected: they are
+host processes with the operator's own ADC.
 
 > [!IMPORTANT]
 > **`AGENT_API_KEY` is the only variable the host reads the key from**
