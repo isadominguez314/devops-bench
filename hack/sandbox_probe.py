@@ -101,6 +101,21 @@ _ORDINARY_POD = json.dumps(
 
 _METADATA_URL = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 
+# A namespace carrying the addon manager's label and absent from the exempt
+# NAME list, created host-side so the by-label binding has something only it
+# can match. The agent cannot build this itself: ``bench-agent-namespace-guard``
+# denies it the label, which the ``review:claim-managed-label`` probe asserts.
+_MANAGED_NAMESPACE = "bench-probe-managed"
+
+_MANAGED_NAMESPACE_YAML = f"""\
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {_MANAGED_NAMESPACE}
+  labels:
+    {creds._ADDON_MANAGER_LABEL}: Reconcile
+"""
+
 
 @dataclass
 class Probe:
@@ -159,13 +174,45 @@ def _running_pod_in_kube_system(context: str) -> str | None:
     return completed.stdout.strip() or None
 
 
-def _probes(workspace_pod_path: str, exec_target: str | None) -> list[Probe]:
+def _ensure_managed_namespace(context: str) -> str | None:
+    """Create the labelled namespace the by-label binding needs.
+
+    Host-side, and before the credential is provisioned: on a real cluster a
+    managed namespace already exists when the run starts, and creating it first
+    also puts it in front of the PSA labeller, which must skip it.
+
+    Args:
+        context: kubectl context to create it in.
+
+    Returns:
+        The namespace name, or ``None`` when it could not be created — in which
+        case the probe below must not run, since a missing namespace produces a
+        refusal of its own that has nothing to do with the boundary.
+    """
+    completed = subprocess.run(
+        ["kubectl", "--context", context, "apply", "-f", "-"],
+        input=_MANAGED_NAMESPACE_YAML,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        print(f"    {completed.stderr.strip()}")
+        return None
+    return _MANAGED_NAMESPACE
+
+
+def _probes(
+    workspace_pod_path: str, exec_target: str | None, managed_namespace: str | None
+) -> list[Probe]:
     """Build the probe list.
 
     Args:
         workspace_pod_path: Container path of the hostPath manifest.
         exec_target: A running kube-system pod to attempt exec into, or
             ``None`` to skip that probe.
+        managed_namespace: A namespace carrying the addon manager label, or
+            ``None`` to skip the by-label probe.
 
     Returns:
         Controls first, then the escapes, then the informational checks.
@@ -347,6 +394,34 @@ def _probes(workspace_pod_path: str, exec_target: str | None) -> list[Probe]:
                 "addonmanager.kubernetes.io/mode=Reconcile",
             ],
             expect_stderr="exempt",
+        ),
+        *(
+            [
+                Probe(
+                    name="review:managed-label-namespace",
+                    why="the exemption has two bindings and only one of them "
+                    "has ever fired. On GKE every managed namespace is also on "
+                    "the exempt NAME list, so by-name matches first and "
+                    "by-label -- the half that covers managed namespaces this "
+                    "code has never heard of -- is untested. This namespace "
+                    "carries the label and is absent from the list, so a deny "
+                    "here can only have come from by-label, which is what the "
+                    "expected substring asserts. Deliberately unprivileged, "
+                    "for the same reason as the Deployment above",
+                    argv=[
+                        "kubectl",
+                        "create",
+                        "deployment",
+                        "bench-probe-managed-deploy",
+                        "-n",
+                        managed_namespace,
+                        "--image=busybox",
+                    ],
+                    expect_stderr="by-label",
+                )
+            ]
+            if managed_namespace
+            else []
         ),
         # -- informational: read the output, there is no pass/fail here --
         Probe(
@@ -575,6 +650,11 @@ def main() -> int:
         creds_dir = Path(tmp) / "creds"
         creds_dir.mkdir()
 
+        print(f"==> creating the labelled namespace {_MANAGED_NAMESPACE}")
+        managed_namespace = _ensure_managed_namespace(context)
+        if not managed_namespace:
+            print("    FAIL setup:managed-namespace (the by-label binding stays untested)")
+
         print(f"==> provisioning the agent credential against {context}")
         kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
         print(f"    kubeconfig: {kubeconfig}")
@@ -593,7 +673,9 @@ def main() -> int:
             print("    NOTE: no running kube-system pod; skipping the exec probe")
 
         failures = list(problems)
-        for probe in _probes("/workspace/probe-hostpath.yaml", exec_target):
+        if not managed_namespace:
+            failures.append("setup:managed-namespace")
+        for probe in _probes("/workspace/probe-hostpath.yaml", exec_target, managed_namespace):
             passed, detail = _run_probe(executor, probe)
             verdict = "PASS" if passed else "FAIL"
             print(f"\n==> [{verdict}] {probe.name}")
@@ -636,7 +718,7 @@ def main() -> int:
             )
 
         if not args.keep:
-            for namespace in ("bench-probe-ok",):
+            for namespace in ("bench-probe-ok", _MANAGED_NAMESPACE):
                 subprocess.run(
                     [
                         "kubectl",
