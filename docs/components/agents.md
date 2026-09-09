@@ -252,6 +252,17 @@ is deliberately **not** exempt from the policy, since the agent can create pods
 there. Together these deny the privileged-pod-plus-`hostPath` escape that was
 used to read the benchmark's own answer key off a node's disk.
 
+**The cluster must be Kubernetes 1.30 or newer.** Three of the four controls are
+`ValidatingAdmissionPolicy` objects, and `admissionregistration.k8s.io/v1` only
+reached GA in 1.30 — 1.29 serves `v1beta1`, behind a feature gate. The harness
+checks for the `v1` resource before it applies anything and refuses by name if
+it is missing, rather than letting the apply fail with kubectl's `no matches for
+kind`, which reads like a typo in our own manifest. This is deliberately *not*
+routed through `BENCH_SANDBOX_ALLOW_ADMIN_CREDS`: that hatch is for an operator
+whose credential cannot write cluster-scoped objects, and no credential makes a
+1.29 apiserver serve a v1 policy. For kind, the floor is why `node_image`
+defaults to a digest-pinned `v1.30.0`; lowering it breaks every sandboxed run.
+
 A task whose subject matter genuinely is privileged workloads opts out with
 `agent_pod_security: privileged` in its `task.yaml` (see
 [Add a task](../how-to/add-a-task.md)). The default is `baseline`, and any other

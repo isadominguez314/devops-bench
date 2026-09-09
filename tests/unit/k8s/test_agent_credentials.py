@@ -59,6 +59,7 @@ def _patch_kubectl(
     token: str = _TOKEN,
     mint_fails: bool = False,
     namespaces: dict | None = None,
+    policy_api: bool = True,
     calls: list[list[str]] | None = None,
 ) -> list[list[str]]:
     """Answer every kubectl call this module makes, recording the argv.
@@ -91,8 +92,20 @@ def _patch_kubectl(
             if mint_fails and "bench-agent-rbac.yaml" in argv[-1]:
                 raise SubprocessError(argv, 1, stderr="forbidden: cannot create clusterroles")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if argv[1:3] == ["get", "namespaces"] or argv[3:5] == ["get", "namespaces"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(namespaces), stderr="")
+        if "get" in argv:
+            # Read off the verb rather than a fixed index: the context flags go
+            # in ahead of the resource on a pinned call, and ``-A`` after it.
+            resource = argv[argv.index("get") + 1]
+            if resource == "namespaces":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(namespaces), stderr="")
+            if resource == creds._POLICY_API_RESOURCE:
+                if not policy_api:
+                    raise SubprocessError(
+                        argv,
+                        1,
+                        stderr=f'error: the server doesn\'t have a resource type "{resource}"',
+                    )
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"items": []}), stderr="")
         if "label" in argv:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected kubectl argv: {argv}")
@@ -675,6 +688,38 @@ def test_enforce_pod_security_pins_every_call_to_the_runs_context(
     assert calls
     for argv in calls:
         assert argv[-2:] == ["--context", "vcluster-c1"]
+
+
+# -- the cluster version floor -----------------------------------------------
+
+
+def test_enforce_pod_security_refuses_a_cluster_too_old_for_the_policy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``admissionregistration.k8s.io/v1`` reached GA in 1.30; a 1.29 apiserver
+    serves only ``v1beta1``. Left unchecked the apply dies with kubectl's ``no
+    matches for kind``, which reads like a typo in our own manifest."""
+    calls = _patch_kubectl(monkeypatch, policy_api=False)
+
+    with pytest.raises(SandboxError, match=creds._MIN_CLUSTER_VERSION):
+        creds.enforce_pod_security(tmp_path)
+
+    # Named before anything is written, so the operator is not left wondering
+    # which half of the provisioning got applied.
+    assert not any("apply" in c for c in calls)
+
+
+def test_the_version_refusal_is_not_the_admin_escape_hatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The hatch exists for an operator whose credential cannot write
+    cluster-scoped objects. No credential makes a 1.29 apiserver serve a v1
+    policy, so letting the run continue would just skip the backstop."""
+    monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
+    _patch_kubectl(monkeypatch, policy_api=False)
+
+    with pytest.raises(SandboxError, match=creds._MIN_CLUSTER_VERSION):
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
 
 
 def test_provision_enforces_pod_security_by_default(
