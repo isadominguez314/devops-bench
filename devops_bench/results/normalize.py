@@ -343,11 +343,19 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
     for record in records:
         scores = record.get("scores")
         tokens = normalize_tokens(record.get("tokens"))
+        unattributable = is_unscoreable_run(record)
         correctness = (
             None
             if _correctness_unpublishable(scores, record)
             else _first_score(scores, _CORRECTNESS_KEYS)
         )
+        # A composite the current pipeline would never produce must not survive
+        # in a row either. For a run scored by this build the key is simply
+        # absent, so this is a no-op; it matters when rebuilding rows from an
+        # artifact an older pipeline scored, where a run whose agent never
+        # finished still carries a stored OutcomeScore. Without this the
+        # rebuilt row contradicts itself: correctness withheld, composite 1.0.
+        outcome = None if unattributable else extract_score(scores, OUTCOME_SCORE_KEY)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
         rows.append(
             ResultRow(
@@ -360,7 +368,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 task_folder=record.get("folder", "") or "",
                 task_name=record.get("name", "") or "",
                 iteration=0,
-                outcome_score=extract_score(scores, OUTCOME_SCORE_KEY),
+                outcome_score=outcome,
                 correctness_score=correctness,
                 recoverable_safety_score=_first_score(scores, _RECOVERABLE_KEYS),
                 catastrophic=bool(catastrophic_kinds),

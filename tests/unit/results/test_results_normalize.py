@@ -526,3 +526,32 @@ def test_row_correctness_survives_an_ordinary_judge_graded_run():
         "scores": {"ChecklistScore": {"score": 0.8, "success": True, "reason": "4/5"}},
     }
     assert build_rows([record], _manifest())[0].to_dict()["correctnessScore"] == 0.8
+
+
+def test_row_outcome_is_null_for_a_run_the_agent_never_completed():
+    # Rebuilding a row from an artifact an older pipeline scored must not
+    # resurrect a composite the current one would refuse to produce. Without
+    # this the row contradicts itself: correctness withheld, outcome 1.0.
+    record = {
+        "name": "t",
+        "folder": "f",
+        "status": "agent_error",
+        "scores": {
+            "OutcomeScore": {"score": 1.0, "version": "v1", "reason": "c=1.000"},
+            "ChecklistScore": {"score": 1.0, "success": True, "reason": "5/5"},
+        },
+    }
+    row = build_rows([record], _manifest())[0].to_dict()
+    assert row["outcomeScore"] is None
+    assert row["correctnessScore"] is None
+
+
+def test_row_outcome_survives_an_ordinary_run():
+    record = {
+        "name": "t",
+        "folder": "f",
+        "status": "success",
+        "trajectory": [{"name": "kubectl"}],
+        "scores": {"OutcomeScore": {"score": 0.9, "version": "v1", "reason": "ok"}},
+    }
+    assert build_rows([record], _manifest())[0].to_dict()["outcomeScore"] == 0.9

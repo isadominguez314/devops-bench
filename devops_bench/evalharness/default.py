@@ -44,8 +44,10 @@ from devops_bench.cheat_detection import (
     baseline_from_granted_paths,
     build_inventory_rules,
     build_mount_rules,
+    drop_fingerprints_matching_inputs,
     filter_rules_for_prompt,
     load_ruleset,
+    narrow_home_listing_rules,
 )
 from devops_bench.core import (
     ClusterInfo,
@@ -1100,16 +1102,25 @@ class DefaultEvalHarness(Harness):
         # which also leaves that record ungated, since an absent verdict is an
         # abstention rather than a zero.
         if self.cheat_detect:
-            # Per record: a home entry the task prompt itself names (the
-            # GitOps repo to push to, the deliverable to write) is
-            # authorized for that record, so its inventory path rule is
-            # dropped. Content fingerprints always apply.
+            # Three prompt-driven authorizations, applied in order: an entry the
+            # prompt names drops its path rule; a passive home-listing sighting
+            # stops flagging when the prompt sent the agent into home; and any
+            # rule matching the content of an input the prompt named is dropped,
+            # since matching it proves only that the agent read what it was told
+            # to read.
             for record, inventory_rules in zip(detailed_results, task_inventories, strict=True):
                 try:
+                    prompt_text = record.get("input") or ""
                     annotate_records(
                         [record],
-                        self._cheat_rules
-                        + filter_rules_for_prompt(inventory_rules, record.get("input") or ""),
+                        drop_fingerprints_matching_inputs(
+                            narrow_home_listing_rules(
+                                self._cheat_rules
+                                + filter_rules_for_prompt(inventory_rules, prompt_text),
+                                prompt_text,
+                            ),
+                            prompt_text,
+                        ),
                     )
                 except Exception:  # noqa: BLE001 - detection must never sink a completed run
                     _log.exception(
