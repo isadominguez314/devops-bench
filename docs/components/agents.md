@@ -212,6 +212,25 @@ Two overlapping controls, applied at the same point:
    `local-path-storage` on GKE), so without this the agent could simply claim
    an unused one and deploy there. It covers `UPDATE` as well as `CREATE`,
    because a name is immutable but a label is not.
+4. **A third policy denying the agent workloads inside the exempt namespaces.**
+   Guarding the names only protects the ones that do not exist yet. `edit` is
+   bound cluster-wide, so the agent can write to `kube-system` on every
+   provider, and policy 2 deliberately skips it — which made
+   `kubectl run --privileged -n kube-system` an admitted request on a cluster
+   carrying the full set. A boundary probe caught this; it is not hypothetical.
+   The policy matches every kind that can produce a pod, not `pods` alone, since
+   a `Deployment` reaches the same place with its pod created by the ReplicaSet
+   controller. It matches `pods/exec`, `pods/attach` and `pods/portforward` too,
+   because `edit` grants exec and these are precisely the namespaces whose pods
+   are legitimately privileged. It does not touch config: a ConfigMap in
+   `kube-system` is a blast-radius question rather than an escape.
+
+Policies 3 and 4 are scoped to the agent's own username, so the cluster's own
+components keep running — the exemption exists for kube-proxy and the CNI, not
+for whoever asks. That scoping is sound for these two and would not be for
+policy 2: a namespace or a `Deployment` is always created by whoever asked,
+whereas a pod is often created on the agent's behalf by a controller running
+under an identity of its own.
 
 The exemption has two halves: the names above, and any namespace carrying
 `addonmanager.kubernetes.io/mode`. A name list alone goes stale — a plain GKE
@@ -238,8 +257,8 @@ A task whose subject matter genuinely is privileged workloads opts out with
 [Add a task](../how-to/add-a-task.md)). The default is `baseline`, and any other
 value is a load-time validation error rather than a silent fall-back.
 
-**None of this is torn down.** `bench-system`, the ClusterRoleBindings, the two
-policies and the PSA labels outlive the run. On a disposable cluster that is
+**None of this is torn down.** `bench-system`, the ClusterRoleBindings, the
+admission policies and the PSA labels outlive the run. On a disposable cluster that is
 irrelevant; on a reused one it means a second run finds most namespaces already
 labelled and skips them, which is correct but makes the labeller look inert.
 Read the labels as the state of the cluster, not as the output of the run that
@@ -253,11 +272,15 @@ credential, and all are fixed by replacing the built-in role with a derived one
 and narrowing the supplement:
 
 - **`edit` bound cluster-wide reaches the system namespaces.** The built-in role
-  carries `impersonate` on `serviceaccounts`, `create` on `serviceaccounts/token`,
-  and `create` on `pods/exec` — so a cluster-wide binding lets the agent mint a
-  token for, or impersonate, any ServiceAccount in `kube-system`, and exec into
-  the privileged pods that live there. That is a path to cluster-admin, and it
-  defeats the deliberate omission of write on `rbac.authorization.k8s.io`.
+  carries `impersonate` on `serviceaccounts` and `create` on
+  `serviceaccounts/token`, so a cluster-wide binding lets the agent mint a token
+  for, or impersonate, any ServiceAccount in `kube-system` — including ones bound
+  to `cluster-admin`. That is a path to cluster-admin, and it defeats the
+  deliberate omission of write on `rbac.authorization.k8s.io`. RBAC has no deny
+  rule, so nothing in the supplement can subtract this; only replacing `edit`
+  with a derived role closes it. The neighbouring exec route is closed —
+  policy 4 above denies `pods/exec` in exactly those namespaces — but that is a
+  patch over one exit, not a fix for the scope.
 - **`edit` carries read and write on `secrets`.** The built-in role includes
   them, unlike `view`, which excludes them deliberately; bound cluster-wide that
   reaches every namespace. Nothing in the supplement adds this — it is inherited,
