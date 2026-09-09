@@ -33,8 +33,10 @@ Two defects make a stored grade wrong rather than merely stale:
   have; the integrity gate then zeroed an otherwise good score. Re-scanning is
   local and free.
 
-The original ``results.json`` is copied to ``results.pre-rejudge.json`` before
-anything is written, so the published record stays auditable.
+The original ``results.json`` is preserved before anything is written, in a
+sibling tree mirroring the corpus layout (``--backup-root``), so the correction
+stays auditable while the published tree keeps exactly its three artifacts per
+run.
 
 **Requires two fixes to be present in the tree**: the checklist withholding an
 unjudged item instead of failing it, and the detector's prompt-authorization
@@ -58,8 +60,20 @@ import sys
 from pathlib import Path
 from typing import Any
 
-#: Copy of the published record, written once before the first rewrite.
-BACKUP_NAME = "results.pre-rejudge.json"
+#: Default sibling prefix holding each run's pre-re-judge record, mirroring the
+#: corpus layout. A sibling rather than a file beside the run so the published
+#: tree keeps exactly three artifacts per run and can be synced wholesale.
+DEFAULT_BACKUP_DIRNAME = "rejudge-backups"
+
+
+def _backup_path(run_dir: Path, backup_root: Path | None) -> Path:
+    """Where this run's pre-re-judge record is preserved.
+
+    Mirrors ``<combo>/<task>/<run_id>/results.json`` under the backup root, so
+    a path in either tree names the same run.
+    """
+    root = backup_root or run_dir.parents[2].parent / DEFAULT_BACKUP_DIRNAME
+    return root / run_dir.parents[1].name / run_dir.parent.name / run_dir.name / "results.json"
 
 
 def _load(path: Path) -> Any:
@@ -116,8 +130,19 @@ def _fixes_present() -> tuple[bool, list[str]]:
     return (not missing), missing
 
 
-def rejudge_run(run_dir: Path, judge: Any, *, write: bool) -> dict[str, Any]:
-    """Re-run detection and the metrics for one stored run."""
+def rejudge_run(
+    run_dir: Path, judge: Any, *, write: bool, backup_root: Path | None = None
+) -> dict[str, Any]:
+    """Re-run detection and the metrics for one stored run.
+
+    Args:
+        run_dir: The ``<combo>/<task>/<run_id>`` directory to re-score.
+        judge: The judge handed to the metrics pipeline.
+        write: Whether to save; otherwise the metrics run and are discarded.
+        backup_root: Where the pre-re-judge record is preserved. The mirror
+            keeps the published tree to its three artifacts per run, so a
+            consumer that syncs it does not also ship superseded scores.
+    """
     from devops_bench.cheat_detection import (
         annotate_records,
         drop_fingerprints_matching_inputs,
@@ -159,8 +184,9 @@ def rejudge_run(run_dir: Path, judge: Any, *, write: bool) -> dict[str, Any]:
     }
 
     if write:
-        backup = run_dir / BACKUP_NAME
+        backup = _backup_path(run_dir, backup_root)
         if not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(run_dir / "results.json", backup)
         (run_dir / "results.json").write_text(
             json.dumps(results, indent=2) + "\n", encoding="utf-8"
@@ -195,6 +221,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("root", type=Path, help="corpus root: <combo>/<task>/<run_id>/")
     parser.add_argument("--write", action="store_true", help="save re-judged scores")
+    parser.add_argument(
+        "--backup-root",
+        type=Path,
+        default=None,
+        help=f"where pre-re-judge records are preserved "
+        f"(default: a sibling '{DEFAULT_BACKUP_DIRNAME}/' mirroring the corpus layout)",
+    )
     parser.add_argument(
         "--check",
         action="store_true",
@@ -240,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         print("dry run: pass --write to save (metrics still run, results discarded)\n")
 
     for run_dir, _dead, _flagged in targets:
-        s = rejudge_run(run_dir, judge, write=args.write)
+        s = rejudge_run(run_dir, judge, write=args.write, backup_root=args.backup_root)
         print(
             f"  {run_dir.parent.name:22s} checks {s['checks_before']}->{s['checks_after']}  "
             f"outcome {s['outcome_before']}->{s['outcome_after']}  "
