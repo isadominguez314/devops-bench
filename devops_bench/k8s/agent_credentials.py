@@ -107,8 +107,15 @@ POD_SECURITY_PRIVILEGED = "privileged"
 # labeller below — it carries no workload to constrain — but the agent holds
 # ``edit`` cluster-wide and can therefore create pods in it, so exempting it
 # from the policy too would leave a namespace the agent can reach and the
-# control cannot see. Every name here must be one the agent cannot write to,
-# which is also why ``_NAMESPACE_GUARD`` stops it from claiming an unused one.
+# control cannot see.
+#
+# Every name here must be one the agent cannot write to. That is not a property
+# of the names, it is a thing that has to be enforced, and enforcing it takes
+# two more policies: ``bench-agent-namespace-guard`` stops the agent claiming an
+# exempt name that does not exist yet, and
+# ``bench-agent-exempt-namespace-guard`` stops it putting a workload into one
+# that does. Without the second, a probe found the whole control was one
+# ``-n kube-system`` away from irrelevant.
 _POLICY_EXEMPT_NAMESPACES = frozenset(
     {
         "kube-system",
@@ -194,6 +201,40 @@ _EXEMPT_CEL_LIST = ", ".join(f"'{name}'" for name in sorted(_POLICY_EXEMPT_NAMES
 # ``patch`` on namespaces, so exempting by ``_ADDON_MANAGER_LABEL`` without
 # this would hand it a one-command escape: label a namespace it already owns
 # and every pod in it stops being checked.
+#
+# The third policy is the one that makes the exemption safe at all, and it is
+# here because a probe showed the first two were not enough. Guarding the
+# *names* leaves the namespaces that already exist wide open: ``edit`` is bound
+# cluster-wide, so the agent can write to ``kube-system`` on any cluster, and
+# the pod policy deliberately skips it. ``kubectl run --privileged
+# -n kube-system`` was therefore admitted on a cluster carrying the full policy
+# set — the exact escape this module exists to deny, reachable by appending a
+# flag. So the agent is denied workload writes into the exempt namespaces
+# outright, which is what the "cannot write to" claim above always assumed.
+#
+# Scoped to the agent's username, because the cluster's own components must
+# keep running: the exemption exists for kube-proxy and the CNI, not for
+# whoever asks. Username scoping is sound here for the same reason it is for
+# namespaces and is NOT for the pod policy — a controller never creates a pod
+# in these namespaces on the agent's behalf, since the workload object it would
+# have to be told to create is itself denied, at the agent's own username, one
+# admission earlier.
+#
+# It covers every kind that can produce a pod rather than pods alone, because
+# a Deployment reaches the same place with the pod created by the ReplicaSet
+# controller under an identity of its own; and ``pods/exec`` alongside them,
+# because ``edit`` grants exec and half the pods in ``kube-system`` are
+# privileged, so a shell in one is the same escape by a longer route. It does
+# not cover config: a ConfigMap in ``kube-system`` is a blast-radius question,
+# not an escape, and denying those would break tasks for no boundary gain.
+#
+# Two bindings, because it has to select exactly what the pod policy skips and
+# a ``namespaceSelector`` ANDs its expressions. "Not by name AND not by label"
+# inverts to "by name OR by label", and an OR takes one binding each. Scoping
+# by selector rather than testing ``namespaceObject`` in the expression also
+# keeps ``failurePolicy: Fail`` cheap: a CEL error here can only block agent
+# writes to namespaces where they are denied anyway, instead of every pod on
+# the cluster.
 _POD_SECURITY_POLICY_MANIFEST = f"""\
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -289,6 +330,71 @@ metadata:
 spec:
   policyName: bench-agent-namespace-guard
   validationActions: ["Deny"]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: bench-agent-exempt-namespace-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources:
+          - pods
+          - pods/ephemeralcontainers
+          - replicationcontrollers
+          - podtemplates
+      - apiGroups: ["apps"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments", "daemonsets", "statefulsets", "replicasets"]
+      - apiGroups: ["batch"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs", "cronjobs"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+  matchConditions:
+    - name: only-the-sandboxed-agent
+      expression: "request.userInfo.username == '{_AGENT_USERNAME}'"
+  validations:
+    - expression: "false"
+      message: >-
+        this namespace holds the cluster's own components and is exempt from the
+        benchmark's pod-security policy, so the sandboxed agent may not run a
+        workload in it or exec into one
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: bench-agent-exempt-namespace-guard-by-name
+spec:
+  policyName: bench-agent-exempt-namespace-guard
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values: [{", ".join(sorted(_POLICY_EXEMPT_NAMESPACES))}]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: bench-agent-exempt-namespace-guard-by-label
+spec:
+  policyName: bench-agent-exempt-namespace-guard
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchExpressions:
+        - key: {_ADDON_MANAGER_LABEL}
+          operator: Exists
 """
 
 # Ceiling on the lifetime, so a long or unbounded run cannot mint a credential
@@ -440,8 +546,10 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
     and the one an operator can read off a namespace; a
     ValidatingAdmissionPolicy backs them up cluster-wide, covering namespaces
     the agent creates *after* this runs — a label cannot, and one of the tasks
-    asks the agent to create a namespace. A second policy stops the agent from
-    creating a namespace under one of the names the first one exempts.
+    asks the agent to create a namespace. Two further policies close the ways
+    round the first one's exemptions: the agent may not claim an exempt
+    namespace that does not exist yet, and may not run a workload in — or exec
+    into one in — an exempt namespace that does.
 
     Namespaces that already carry an ``enforce`` label are left alone: a task
     may assert a specific level as part of its own verification (one asserts
