@@ -36,10 +36,11 @@ Two defects make a stored grade wrong rather than merely stale:
 The original ``results.json`` is copied to ``results.pre-rejudge.json`` before
 anything is written, so the published record stays auditable.
 
-**Requires the fixes on the sandbox/scoring branch to be present** — on an
-unfixed tree this re-runs the same broken judge and the same broken rules, and
-faithfully reproduces the numbers it was meant to correct. ``--check`` verifies
-that before doing any work.
+**Requires two fixes to be present in the tree**: the checklist withholding an
+unjudged item instead of failing it, and the detector's prompt-authorization
+filters. Without them this re-runs the same broken judge and the same rules,
+and faithfully reproduces the numbers it was meant to correct — so ``--check``
+verifies both before any work, and ``--write`` refuses without them.
 
 Usage::
 
