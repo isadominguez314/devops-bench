@@ -194,7 +194,7 @@ cluster-wide admission policy and `ClusterRoleBindings`. Set
 
 ### Pod security
 
-Two overlapping controls, applied at the same point:
+Overlapping controls, applied at the same point:
 
 1. **PSA `baseline` labels** on every namespace that exists when the agent
    starts. Namespaces that already declare an `enforce` level are left alone, so
@@ -224,10 +224,27 @@ Two overlapping controls, applied at the same point:
    because `edit` grants exec and these are precisely the namespaces whose pods
    are legitimately privileged. It does not touch config: a ConfigMap in
    `kube-system` is a blast-radius question rather than an escape.
+5. **A fourth policy denying the agent a shell into pods that predate all of
+   the above.** Admission only sees requests, so nothing here retracts a pod
+   that already exists — and the deployer runs *before* credentials are
+   provisioned. Some fixtures deploy privileged workloads on purpose:
+   `opa-remediation` ships two, because remediating them is the task. Those pods
+   stay, and `edit` grants `pods/exec` cluster-wide, so a shell into one is node
+   root by a route policy 2 never sees. Before the agent starts, the harness
+   scans every namespace for pods policy 2 would have rejected — skipping the
+   ones policy 4 already covers — and renders their `namespace/name` into a
+   policy denying the agent `exec`, `attach` and `port-forward` into exactly
+   those. They are named individually rather than matched on a property because
+   admission cannot see the target pod's spec on a `CONNECT`: the object on an
+   exec request is a `PodExecOptions`, so a name list is the only thing there is
+   to test. The list stays correct for the run — policy 2 denies these pods on
+   `CREATE`, so a name that leaves it cannot come back. It is applied even when
+   the list is empty, since nothing here is torn down and a reused cluster would
+   otherwise keep the previous run's list.
 
-Policies 3 and 4 are scoped to the agent's own username, so the cluster's own
+Policies 3, 4 and 5 are scoped to the agent's own username, so the cluster's own
 components keep running — the exemption exists for kube-proxy and the CNI, not
-for whoever asks. That scoping is sound for these two and would not be for
+for whoever asks. That scoping is sound for these three and would not be for
 policy 2: a namespace or a `Deployment` is always created by whoever asked,
 whereas a pod is often created on the agent's behalf by a controller running
 under an identity of its own.
@@ -252,7 +269,7 @@ is deliberately **not** exempt from the policy, since the agent can create pods
 there. Together these deny the privileged-pod-plus-`hostPath` escape that was
 used to read the benchmark's own answer key off a node's disk.
 
-**The cluster must be Kubernetes 1.30 or newer.** Three of the four controls are
+**The cluster must be Kubernetes 1.30 or newer.** Four of the five controls are
 `ValidatingAdmissionPolicy` objects, and `admissionregistration.k8s.io/v1` only
 reached GA in 1.30 — 1.29 serves `v1beta1`, behind a feature gate. The harness
 checks for the `v1` resource before it applies anything and refuses by name if

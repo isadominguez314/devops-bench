@@ -405,6 +405,60 @@ spec:
           operator: Exists
 """
 
+_NONCONFORMANT_GUARD_NAME = "bench-agent-nonconformant-pod-guard"
+
+
+def _render_nonconformant_pod_guard(pods: list[str]) -> str:
+    """Render the policy denying the agent a shell into named pods.
+
+    Args:
+        pods: ``namespace/name`` of every pod to deny, possibly empty.
+
+    Returns:
+        A multi-document manifest: the policy and its binding.
+    """
+    # An empty CEL list literal has no element type to infer, and a policy that
+    # fails to compile under `failurePolicy: Fail` denies every exec the agent
+    # attempts -- the opposite of inert. So the empty case gets a constant.
+    if pods:
+        listed = ", ".join(f"'{pod}'" for pod in pods)
+        expression = f"!((request.namespace + '/' + request.name) in [{listed}])"
+    else:
+        expression = "true"
+
+    return f"""\
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {_NONCONFORMANT_GUARD_NAME}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CONNECT"]
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+  matchConditions:
+    - name: only-the-sandboxed-agent
+      expression: "request.userInfo.username == '{_AGENT_USERNAME}'"
+  validations:
+    - expression: "{expression}"
+      message: >-
+        this pod was created before the benchmark's pod-security policy was
+        applied and would not be admitted under it, so the sandboxed agent may
+        not open a shell, attach, or port-forward into it
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {_NONCONFORMANT_GUARD_NAME}
+spec:
+  policyName: {_NONCONFORMANT_GUARD_NAME}
+  validationActions: ["Deny"]
+"""
+
+
 # Ceiling on the lifetime, so a long or unbounded run cannot mint a credential
 # that outlives it by hours. There is no matching floor: the slack above is
 # already the minimum any run gets. The apiserver may shorten the result
@@ -564,6 +618,14 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
     ``restricted``), and overwriting it would fail the task this control is
     supposed to protect.
 
+    A third half, and the reason for the scan at the end: admission control
+    only sees requests, so nothing here retroactively covers pods that already
+    exist. The deployer runs first and some fixtures deploy privileged
+    workloads on purpose — ``opa-remediation`` ships two, because remediating
+    them is the task. Those pods stay, and the agent holds ``pods/exec``
+    cluster-wide, so a shell into one is node root by a route this policy never
+    sees. :func:`_deny_shell_into_nonconformant_pods` closes it.
+
     Args:
         work_dir: Directory to render the policy manifest into before
             applying. Must not itself be mounted into the container.
@@ -575,15 +637,18 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
             is for an operator whose credential cannot write cluster-scoped
             objects, and no credential makes a 1.29 apiserver serve a v1
             policy.
-        SubprocessError: If the policy cannot be applied. Namespace labelling
-            failures are warned and skipped — the policy is the load-bearing
-            half, and one unlabellable namespace must not fail the run.
+        SubprocessError: If the policy cannot be applied, or the pods it cannot
+            retroactively cover cannot be listed. Namespace labelling failures
+            are warned and skipped — the policies are the load-bearing half,
+            and one unlabellable namespace must not fail the run.
     """
     _require_policy_api(context)
 
     manifest = work_dir / "bench-agent-pod-security.yaml"
     manifest.write_text(_POD_SECURITY_POLICY_MANIFEST)
     kubectl.apply(str(manifest), context=context)
+
+    _deny_shell_into_nonconformant_pods(work_dir, context)
 
     for name in _labellable_namespaces(context):
         try:
@@ -626,6 +691,127 @@ def _require_policy_api(context: str | None) -> None:
             f"Kubernetes {_MIN_CLUSTER_VERSION} — upgrade the cluster (for kind, the "
             "node_image variable) rather than running the agent without the backstop"
         ) from exc
+
+
+def _policy_exempt_namespaces(context: str | None) -> set[str]:
+    """Name the namespaces the exempt-namespace guard already covers.
+
+    Mirrors that guard's two bindings — the name list and the addon manager's
+    label — so a caller asking "can the agent reach into this namespace at
+    all?" gets the same answer admission would give.
+
+    Args:
+        context: kubectl context to pin the listing to.
+
+    Returns:
+        Exempt namespace names present on the cluster.
+
+    Raises:
+        SubprocessError: If the namespaces cannot be listed.
+    """
+    listing = kubectl.get_resource("namespaces", context=context, timeout=60)
+    exempt = set()
+    for item in listing.get("items", []):
+        meta = item.get("metadata", {})
+        name = meta.get("name", "")
+        if name and (
+            name in _POLICY_EXEMPT_NAMESPACES or _ADDON_MANAGER_LABEL in meta.get("labels", {})
+        ):
+            exempt.add(name)
+    return exempt
+
+
+def _violates_pod_security(spec: dict) -> bool:
+    """Report whether a pod spec is one :data:`_POD_SECURITY_POLICY_MANIFEST` denies.
+
+    Kept deliberately in lockstep with that policy's CEL rather than with PSA
+    ``baseline``, which is broader: a pod this returns False for is one the
+    policy would admit, and claiming more than that would be a lie about what
+    the guard below covers.
+
+    Args:
+        spec: The pod's ``.spec``.
+
+    Returns:
+        True when the policy would reject it.
+    """
+    if spec.get("hostNetwork") or spec.get("hostPID") or spec.get("hostIPC"):
+        return True
+    if any("hostPath" in volume for volume in spec.get("volumes") or []):
+        return True
+    for key in ("containers", "initContainers", "ephemeralContainers"):
+        for container in spec.get(key) or []:
+            if (container.get("securityContext") or {}).get("privileged"):
+                return True
+    return False
+
+
+def _nonconformant_pods(context: str | None) -> list[str]:
+    """List ``namespace/name`` for running pods the policy would have rejected.
+
+    Only pods outside the exempt namespaces: inside them non-conformance is
+    expected and the exempt-namespace guard already denies the agent every way
+    in, so listing them here would bury the interesting ones.
+
+    Args:
+        context: kubectl context to pin the listing to.
+
+    Returns:
+        Sorted ``namespace/name`` strings.
+
+    Raises:
+        SubprocessError: If the pods or namespaces cannot be listed.
+    """
+    exempt = _policy_exempt_namespaces(context)
+    listing = kubectl.get_resource("pods", all_namespaces=True, context=context, timeout=60)
+    found = []
+    for item in listing.get("items", []):
+        meta = item.get("metadata", {})
+        namespace, name = meta.get("namespace", ""), meta.get("name", "")
+        if not namespace or not name or namespace in exempt:
+            continue
+        if _violates_pod_security(item.get("spec", {})):
+            found.append(f"{namespace}/{name}")
+    return sorted(found)
+
+
+def _deny_shell_into_nonconformant_pods(work_dir: Path, context: str | None = None) -> None:
+    """Deny the agent a shell into pods the policy could not stop being created.
+
+    The pods are named individually rather than matched by a property, because
+    admission cannot see the target pod's spec on a ``CONNECT``: the object on
+    an exec request is a ``PodExecOptions``, so there is nothing to test. A
+    list is the only thing a policy can check, and it stays correct for the run
+    — the pod-security policy denies these pods on CREATE, so a name that
+    leaves the list cannot come back.
+
+    Applied even when nothing is non-conformant, with an expression that admits
+    everything. Nothing here is torn down between runs, so a reused cluster
+    would otherwise keep the previous run's list and refuse a shell into a pod
+    that no longer exists.
+
+    Args:
+        work_dir: Directory to render the manifest into before applying.
+        context: kubectl context to pin every call to.
+
+    Raises:
+        SubprocessError: If the pods cannot be listed or the policy applied.
+    """
+    pods = _nonconformant_pods(context)
+    if pods:
+        _log.warning(
+            "%d pod(s) predate the pod-security policy and violate it (%s); they were "
+            "created before this ran and admission cannot retract them, so the agent is "
+            "denied exec, attach and port-forward into them instead",
+            len(pods),
+            ", ".join(pods),
+        )
+    else:
+        _log.info("no pre-existing non-conformant pods; the shell guard is inert this run")
+
+    manifest = work_dir / "bench-agent-nonconformant-pods.yaml"
+    manifest.write_text(_render_nonconformant_pod_guard(pods))
+    kubectl.apply(str(manifest), context=context)
 
 
 def _labellable_namespaces(context: str | None) -> list[str]:
