@@ -203,6 +203,7 @@ def test_build_env_vertex_accepts_the_gcp_project_and_location_spellings(
     # matrix export, so a host configured for one agent works for the other.
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
     monkeypatch.setenv("GCP_PROJECT", "proj-a")
     monkeypatch.setenv("GCP_LOCATION", "europe-west4")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
@@ -210,26 +211,49 @@ def test_build_env_vertex_accepts_the_gcp_project_and_location_spellings(
     assert env["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
 
 
+def test_build_env_vertex_honors_the_repo_wide_vertex_location_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # GCP_VERTEX_LOCATION is what models/{gemini,claude}.py and the docs use;
+    # it outranks GCP_LOCATION, which deployers/factory.py owns as a cluster
+    # *zone* (us-central1-a) and which is never a valid Vertex location.
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.setenv("GCP_VERTEX_LOCATION", "global")
+    monkeypatch.setenv("GCP_LOCATION", "us-central1-a")
+    env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
+    assert env["GOOGLE_CLOUD_LOCATION"] == "global"
+
+
 def test_build_env_vertex_prefers_google_cloud_spellings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-google")
     monkeypatch.setenv("GCP_PROJECT", "proj-gcp")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
+    monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west1")
     monkeypatch.setenv("GCP_LOCATION", "europe-west4")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
     assert env["GOOGLE_CLOUD_PROJECT"] == "proj-google"
     assert env["GOOGLE_CLOUD_LOCATION"] == "asia-northeast1"
 
 
-def test_build_env_vertex_defaults_the_location_and_omits_an_unset_project(
+def test_build_env_vertex_defaults_the_location_to_global(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # No project anywhere: write nothing rather than an empty string, and let
-    # the SDK's own ADC-derived default apply. Location always gets a value.
-    for var in ("GOOGLE_CLOUD_PROJECT", "GCP_PROJECT", "GOOGLE_CLOUD_LOCATION", "GCP_LOCATION"):
+    # the SDK's own ADC-derived default apply. Location always gets a value —
+    # and that value is "global", not a region: the -preview model ids this
+    # benchmark runs are only published on the global endpoint and 404 from a
+    # regional one (docs/appendix/known_issues.md).
+    for var in (
+        "GOOGLE_CLOUD_PROJECT",
+        "GCP_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GCP_VERTEX_LOCATION",
+        "GCP_LOCATION",
+    ):
         monkeypatch.delenv(var, raising=False)
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
     assert "GOOGLE_CLOUD_PROJECT" not in env
-    assert env["GOOGLE_CLOUD_LOCATION"] == "us-central1"
+    assert env["GOOGLE_CLOUD_LOCATION"] == "global"
 
 
 def test_build_env_non_vertex_writes_no_vertex_routing_vars(
