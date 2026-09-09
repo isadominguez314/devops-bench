@@ -37,18 +37,23 @@ DEFAULT_VERTEX_LOCATION = "global"
 
 # Highest precedence first.
 #
+# ``GOOGLE_CLOUD_LOCATION`` is the native google-genai variable and stays on top
+# so an operator's own export always wins.
+#
 # ``GCP_VERTEX_LOCATION`` is the repo-wide spelling (models/gemini.py,
 # models/claude.py, the claude_code harness); it was missing from this chain, so
 # an operator who set the documented variable had it silently ignored here.
 #
-# ``GCP_LOCATION`` stays last and is deliberately *below* the Vertex-specific
-# name: deployers/factory.py reads it as a cluster **zone** (``us-central1-a``),
-# which is not a valid Vertex location at all. Anyone who set it for their
-# cluster should not thereby repoint model traffic.
+# ``GCP_LOCATION`` is deliberately NOT read. It belongs to the deployers, which
+# resolve it as a cluster **zone** — every place this repo sets it sets a zone
+# (scripts/bastion/vm-setup.sh, scripts/bastion/_matrix_lib.sh,
+# deployers/factory.py's ``us-central1-a`` default) and docs/components/infra.md
+# documents it as such. A zone is never a valid Vertex location, so honoring it
+# here could only ever route a run at an endpoint that does not exist. Operators
+# who want to pin a Vertex region set ``GCP_VERTEX_LOCATION``.
 VERTEX_LOCATION_ENVS = (
     "GOOGLE_CLOUD_LOCATION",
     "GCP_VERTEX_LOCATION",
-    "GCP_LOCATION",
 )
 
 

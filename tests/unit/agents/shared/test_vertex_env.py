@@ -27,8 +27,8 @@ from devops_bench.agents.shared.vertex_env import (
 
 @pytest.fixture(autouse=True)
 def _clear_location_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An operator's ambient GCP_LOCATION must not decide these assertions.
-    for name in VERTEX_LOCATION_ENVS:
+    # An operator's ambient location env must not decide these assertions.
+    for name in (*VERTEX_LOCATION_ENVS, "GCP_LOCATION"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -50,14 +50,14 @@ def test_precedence_is_declaration_order(monkeypatch: pytest.MonkeyPatch) -> Non
     assert vertex_location() == DEFAULT_VERTEX_LOCATION
 
 
-def test_vertex_spelling_outranks_the_overloaded_gcp_location(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # deployers/factory.py owns GCP_LOCATION as a cluster *zone*, which is never
-    # a valid Vertex location. Setting the Vertex-specific name must win.
+def test_the_deployers_cluster_zone_is_not_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    # GCP_LOCATION belongs to the deployers and holds a cluster *zone*
+    # (scripts/bastion/vm-setup.sh exports us-central1-a into the bastion
+    # profile). A zone is never a valid Vertex location, so it must not leak
+    # into model routing — the run falls through to the default instead.
     monkeypatch.setenv("GCP_LOCATION", "us-central1-a")
-    monkeypatch.setenv("GCP_VERTEX_LOCATION", "global")
     assert vertex_location() == "global"
+    assert "GCP_LOCATION" not in VERTEX_LOCATION_ENVS
 
 
 def test_whitespace_only_value_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -81,13 +81,13 @@ def test_fallback_runs_only_when_the_env_chain_is_empty(
         calls.append(1)
         return "asia-northeast1"
 
-    monkeypatch.setenv("GCP_LOCATION", "europe-west4")
+    monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west4")
     assert vertex_location(fallback=_lookup) == "europe-west4"
     # The antigravity caller's fallback shells out to gcloud; a configured host
     # must not pay for that subprocess.
     assert calls == []
 
-    monkeypatch.delenv("GCP_LOCATION")
+    monkeypatch.delenv("GCP_VERTEX_LOCATION")
     assert vertex_location(fallback=_lookup) == "asia-northeast1"
     assert calls == [1]
 

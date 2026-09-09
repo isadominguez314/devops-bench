@@ -429,11 +429,12 @@ def test_agy_cli_agent_execute_defaults_the_location_to_global(
 @mock.patch.object(agy_mod, "_get_gcloud_location", return_value="us-west9")
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
-def test_agy_cli_agent_execute_prefers_the_vertex_location_over_the_cluster_zone(
+def test_agy_cli_agent_execute_ignores_the_cluster_zone_for_routing(
     mock_run, mock_home, mock_gcloud_location, tmp_path
 ):
-    # GCP_LOCATION is the deployers' cluster *zone*; it must not outrank the
-    # Vertex-specific spelling and reroute model traffic at "us-central1-a".
+    # GCP_LOCATION is the deployers' cluster *zone* and is not read for routing;
+    # the Vertex-specific spelling decides. The overlay still *writes* the zone
+    # spelling for agy's own GCP tooling, now carrying the routed location.
     mock_home.return_value = tmp_path
     mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
     mock_run.side_effect = lambda *args, **kwargs: (
@@ -446,7 +447,9 @@ def test_agy_cli_agent_execute_prefers_the_vertex_location_over_the_cluster_zone
     with mock.patch.dict(os.environ, env, clear=True):
         agy_mod.AgyCliAgent(config)._execute("run task")
 
-    assert mock_run.call_args.kwargs["extra_env"]["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
+    overlay = mock_run.call_args.kwargs["extra_env"]
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
+    assert overlay["GCP_LOCATION"] == "europe-west4"
     # A configured host must not pay for the gcloud subprocess at all.
     mock_gcloud_location.assert_not_called()
 
