@@ -220,6 +220,7 @@ def get_resource(
     *,
     selector: str | None = None,
     namespace: str | None = None,
+    all_namespaces: bool = False,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
     timeout: float | None = None,
@@ -231,6 +232,10 @@ def get_resource(
         name: Optional specific resource name.
         selector: Optional label selector (``-l``).
         namespace: Optional namespace (``-n``).
+        all_namespaces: List across every namespace (``-A``). Without it a
+            namespaced kind is read from the kubeconfig's current namespace,
+            which for a cluster-wide question is silently the wrong answer
+            rather than an error. Ignored when ``namespace`` is given.
         kubeconfig: Kubeconfig path or context-like object.
         context: Optional kubeconfig context to pin the call to. A read left
             unpinned silently answers for whichever cluster the ambient
@@ -254,7 +259,7 @@ def get_resource(
         *_selector_args(selector),
         "-o",
         "json",
-        *_namespace_args(namespace),
+        *(_namespace_args(namespace) if namespace or not all_namespaces else ["-A"]),
     ]
     completed = _run_kubectl(argv, kubeconfig, context=context, timeout=timeout)
     return json.loads(completed.stdout)
