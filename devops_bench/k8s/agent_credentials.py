@@ -121,6 +121,27 @@ _POLICY_EXEMPT_NAMESPACES = frozenset(
     }
 )
 
+# The label a managed cluster puts on the namespaces it owns, and the second
+# half of the exemption. A list of names cannot be kept current: a plain GKE
+# run found four managed namespaces this set had never heard of
+# (``gke-managed-cim``, ``gke-managed-networking-dra-driver``,
+# ``gke-managed-volumepopulator``, ``gmp-public``), all created by the same
+# addon manager as the two that ARE listed, all inside the deny scope. Nothing
+# broke, because three were empty and the fourth runs an unprivileged metrics
+# scraper — but a cluster using DRA or TPUs puts a privileged, hostPath
+# DaemonSet in one of them, and a fail-closed policy would deny it.
+#
+# Prefix matching is what that wants and is not available: a label selector
+# has no prefix operator, so the binding below cannot express
+# ``gke-managed-*``. Keying off the addon manager's own label is better than
+# the prefixes anyway — it is the cluster stating which namespaces are its to
+# run, so it covers managed namespaces that do not exist yet and names that
+# follow no convention we know about.
+#
+# Names stay as well: they are not redundant. On kind and on vcluster nothing
+# carries this label, and on GKE ``kube-system`` itself does not.
+_ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
+
 # Namespaces the PSA labeller skips: the policy-exempt set, plus the harness's
 # own — which is not the agent's to deploy into and holds only a
 # ServiceAccount.
@@ -166,6 +187,13 @@ _EXEMPT_CEL_LIST = ", ".join(f"'{name}'" for name in sorted(_POLICY_EXEMPT_NAMES
 # own username via ``matchConditions`` is safe here in a way it would NOT be
 # for pods: a namespace is always created by whoever asked, whereas a pod may
 # be created on the agent's behalf by a controller running as another identity.
+#
+# It covers UPDATE as well as CREATE, which the name half alone would not need
+# — a name is immutable, so a namespace cannot be renamed into an exemption.
+# A label can be added to one at any time, and the agent holds ``update`` and
+# ``patch`` on namespaces, so exempting by ``_ADDON_MANAGER_LABEL`` without
+# this would hand it a one-command escape: label a namespace it already owns
+# and every pod in it stops being checked.
 _POD_SECURITY_POLICY_MANIFEST = f"""\
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -224,6 +252,8 @@ spec:
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values: [{", ".join(sorted(_POLICY_EXEMPT_NAMESPACES))}]
+        - key: {_ADDON_MANAGER_LABEL}
+          operator: DoesNotExist
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -235,7 +265,7 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
-        operations: ["CREATE"]
+        operations: ["CREATE", "UPDATE"]
         resources: ["namespaces"]
   matchConditions:
     - name: only-the-sandboxed-agent
@@ -244,6 +274,12 @@ spec:
     - expression: "!(object.metadata.name in [{_EXEMPT_CEL_LIST}])"
       message: >-
         that namespace name is reserved for the cluster's own components and is
+        exempt from the benchmark's pod-security policy
+    - expression: >-
+        !has(object.metadata.labels) ||
+        !('{_ADDON_MANAGER_LABEL}' in object.metadata.labels)
+      message: >-
+        that label marks a namespace as the cluster's own to manage and is
         exempt from the benchmark's pod-security policy
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -447,8 +483,9 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
 def _labellable_namespaces(context: str | None) -> list[str]:
     """List the namespaces this run should label, skipping the ones it must not.
 
-    Skips the system namespaces outright, and any namespace that already
-    declares an ``enforce`` level — that value belongs to whoever set it.
+    Skips the system namespaces outright, the ones a managed cluster has
+    labelled as its own to run, and any namespace that already declares an
+    ``enforce`` level — that value belongs to whoever set it.
     """
     try:
         listing = kubectl.get_resource("namespaces", context=context, timeout=60)
@@ -460,6 +497,9 @@ def _labellable_namespaces(context: str | None) -> list[str]:
         meta = item.get("metadata", {})
         name = meta.get("name", "")
         if not name or name in _LABEL_EXEMPT_NAMESPACES:
+            continue
+        if _ADDON_MANAGER_LABEL in meta.get("labels", {}):
+            _log.debug("namespace %s is the cluster's own to manage; leaving it", name)
             continue
         if meta.get("labels", {}).get(_PSA_ENFORCE_LABEL):
             _log.debug("namespace %s already declares a pod-security level; leaving it", name)

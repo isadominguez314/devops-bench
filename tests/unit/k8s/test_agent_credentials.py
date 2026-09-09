@@ -469,13 +469,44 @@ def test_namespace_guard_denies_claiming_an_exempt_name(
     expression = policy["spec"]["validations"][0]["expression"]
 
     assert rule["resources"] == ["namespaces"]
-    assert rule["operations"] == ["CREATE"]
+    assert "CREATE" in rule["operations"]
     assert "'kube-system'" in expression
     assert "'gmp-system'" in expression
     assert binding["spec"]["validationActions"] == ["Deny"]
     # No namespaceSelector: the pod policy's ``NotIn`` would otherwise exempt
     # the very namespace creation being guarded.
     assert "namespaceSelector" not in binding["spec"].get("matchResources", {})
+
+
+def test_pod_security_policy_exempts_namespaces_the_cluster_manages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A name list goes stale. A plain GKE run turned up four managed
+    namespaces this one had never heard of, all inside the deny scope, one of
+    them the home of the DRA driver's privileged DaemonSet on clusters that
+    use it. The addon manager's own label covers the ones we cannot name."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
+    exprs = binding["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"]
+    managed = next(e for e in exprs if e["key"] == "addonmanager.kubernetes.io/mode")
+
+    assert managed["operator"] == "DoesNotExist"
+
+
+def test_namespace_guard_denies_claiming_the_managed_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The label half of the exemption is mutable in a way the name half is
+    not: the agent holds ``patch`` on namespaces, so without a guard on UPDATE
+    it could label one it already owns and stop every pod in it being
+    checked."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
+    rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
+    expressions = " ".join(v["expression"] for v in policy["spec"]["validations"])
+
+    assert rule["operations"] == ["CREATE", "UPDATE"]
+    assert "addonmanager.kubernetes.io/mode" in expressions
 
 
 def test_namespace_guard_applies_only_to_the_agents_own_identity(
@@ -520,6 +551,30 @@ def test_enforce_pod_security_leaves_a_declared_level_alone(
     creds.enforce_pod_security(tmp_path)
 
     assert [c for c in calls if "label" in c] == []
+
+
+def test_enforce_pod_security_leaves_the_clusters_own_namespaces_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Measured on GKE: the labeller stamped ``enforce=baseline`` on exactly
+    the managed namespaces missing from the name list. The label is what the
+    cluster itself uses to say which namespaces are its to run."""
+    calls = _patch_kubectl(
+        monkeypatch,
+        namespaces={
+            "items": [
+                _ns("default"),
+                _ns("gke-managed-cim", **{"addonmanager.kubernetes.io/mode": "Reconcile"}),
+                _ns("gmp-public", **{"addonmanager.kubernetes.io/mode": "Reconcile"}),
+            ]
+        },
+    )
+
+    creds.enforce_pod_security(tmp_path)
+
+    labelled = [c for c in calls if "label" in c]
+    assert len(labelled) == 1
+    assert labelled[0][:4] == ["kubectl", "label", "namespace", "default"]
 
 
 def test_enforce_pod_security_pins_every_call_to_the_runs_context(
