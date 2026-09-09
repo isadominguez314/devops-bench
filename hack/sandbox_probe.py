@@ -43,10 +43,13 @@ the seed of the e2e boundary test planned for PR 4.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import subprocess
 import sys
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -107,15 +110,6 @@ _METADATA_URL = "http://169.254.169.254/computeMetadata/v1/instance/service-acco
 # denies it the label, which the ``review:claim-managed-label`` probe asserts.
 _MANAGED_NAMESPACE = "bench-probe-managed"
 
-_MANAGED_NAMESPACE_YAML = f"""\
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: {_MANAGED_NAMESPACE}
-  labels:
-    {creds._ADDON_MANAGER_LABEL}: Reconcile
-"""
-
 
 @dataclass
 class Probe:
@@ -129,6 +123,10 @@ class Probe:
         expect_stderr: Substring the refusal must mention, so a probe that
             fails for an unrelated reason (typo, missing binary) is not
             mistaken for the boundary doing its job.
+        setup: Host-side state this probe needs, re-asserted immediately
+            before it runs and reported as a failure when it cannot be. A
+            probe whose precondition is missing has not passed and has not
+            been skipped -- it never reached the boundary at all.
     """
 
     name: str
@@ -136,6 +134,7 @@ class Probe:
     argv: list[str]
     expect_denied: bool = True
     expect_stderr: str = ""
+    setup: Callable[[], bool] | None = None
 
 
 def _running_pod_in_kube_system(context: str) -> str | None:
@@ -174,36 +173,64 @@ def _running_pod_in_kube_system(context: str) -> str | None:
     return completed.stdout.strip() or None
 
 
-def _ensure_managed_namespace(context: str) -> str | None:
-    """Create the labelled namespace the by-label binding needs.
+def _ensure_managed_namespace(context: str) -> bool:
+    """Make sure the labelled namespace the by-label binding needs is Active.
 
-    Host-side, and before the credential is provisioned: on a real cluster a
-    managed namespace already exists when the run starts, and creating it first
-    also puts it in front of the PSA labeller, which must skip it.
+    Two details here are not stylistic, they are what the first live run cost.
+    GKE's addon manager treats a namespace carrying its label as one of its own
+    and prunes it: on that run it deleted this namespace 2.5 seconds before the
+    probe's request reached the apiserver, and the probe reported ``namespaces
+    "bench-probe-managed" not found`` rather than a refusal.
+
+    So the namespace is built with ``create`` + ``label`` rather than ``apply``
+    -- the pruner skips objects with no ``last-applied-configuration``
+    annotation, and ``apply`` is what writes one -- and this function is called
+    again immediately before the probe, which closes whatever window is left.
 
     Args:
         context: kubectl context to create it in.
 
     Returns:
-        The namespace name, or ``None`` when it could not be created — in which
-        case the probe below must not run, since a missing namespace produces a
-        refusal of its own that has nothing to do with the boundary.
+        True once the namespace is Active. False means the probe must not run:
+        a missing namespace produces a refusal of its own that has nothing to
+        do with the boundary.
     """
-    completed = subprocess.run(
-        ["kubectl", "--context", context, "apply", "-f", "-"],
-        input=_MANAGED_NAMESPACE_YAML,
-        capture_output=True,
-        text=True,
-        check=False,
+
+    def kubectl(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["kubectl", "--context", context, *args], capture_output=True, text=True, check=False
+        )
+
+    for _ in range(4):
+        phase = kubectl("get", "namespace", _MANAGED_NAMESPACE, "-o", "jsonpath={.status.phase}")
+        if phase.returncode == 0 and phase.stdout.strip() == "Active":
+            break
+        if phase.stdout.strip() == "Terminating":
+            # A prune already in flight. Recreating now fails; wait it out.
+            time.sleep(5)
+            continue
+        created = kubectl("create", "namespace", _MANAGED_NAMESPACE)
+        if created.returncode != 0 and "already exists" not in created.stderr:
+            print(f"    {created.stderr.strip()}")
+            time.sleep(2)
+    else:
+        return False
+
+    labelled = kubectl(
+        "label",
+        "namespace",
+        _MANAGED_NAMESPACE,
+        f"{creds._ADDON_MANAGER_LABEL}=Reconcile",
+        "--overwrite",
     )
-    if completed.returncode != 0:
-        print(f"    {completed.stderr.strip()}")
-        return None
-    return _MANAGED_NAMESPACE
+    if labelled.returncode != 0:
+        print(f"    {labelled.stderr.strip()}")
+        return False
+    return True
 
 
 def _probes(
-    workspace_pod_path: str, exec_target: str | None, managed_namespace: str | None
+    workspace_pod_path: str, exec_target: str | None, managed_setup: Callable[[], bool] | None
 ) -> list[Probe]:
     """Build the probe list.
 
@@ -211,8 +238,8 @@ def _probes(
         workspace_pod_path: Container path of the hostPath manifest.
         exec_target: A running kube-system pod to attempt exec into, or
             ``None`` to skip that probe.
-        managed_namespace: A namespace carrying the addon manager label, or
-            ``None`` to skip the by-label probe.
+        managed_setup: Re-asserts the labelled namespace, or ``None`` to drop
+            the by-label probe because it could not be built at all.
 
     Returns:
         Controls first, then the escapes, then the informational checks.
@@ -414,13 +441,14 @@ def _probes(
                         "deployment",
                         "bench-probe-managed-deploy",
                         "-n",
-                        managed_namespace,
+                        _MANAGED_NAMESPACE,
                         "--image=busybox",
                     ],
                     expect_stderr="by-label",
+                    setup=managed_setup,
                 )
             ]
-            if managed_namespace
+            if managed_setup
             else []
         ),
         # -- informational: read the output, there is no pass/fail here --
@@ -443,6 +471,9 @@ def _run_probe(executor: SandboxExecutor, probe: Probe) -> tuple[bool, str]:
     Returns:
         ``(passed, detail)``; ``detail`` is the output worth printing.
     """
+    if probe.setup and not probe.setup():
+        return False, "[the probe's precondition could not be met; the boundary was never reached]"
+
     completed = executor.run(probe.argv, check=False, timeout=120)
     out = ((completed.stdout or "") + (completed.stderr or "")).strip()
     denied = completed.returncode != 0
@@ -650,10 +681,15 @@ def main() -> int:
         creds_dir = Path(tmp) / "creds"
         creds_dir.mkdir()
 
+        # Before provisioning, so it is also in front of the PSA labeller,
+        # which must skip a namespace the cluster has claimed as its own.
         print(f"==> creating the labelled namespace {_MANAGED_NAMESPACE}")
-        managed_namespace = _ensure_managed_namespace(context)
-        if not managed_namespace:
+        managed_setup: Callable[[], bool] | None = functools.partial(
+            _ensure_managed_namespace, context
+        )
+        if not managed_setup():
             print("    FAIL setup:managed-namespace (the by-label binding stays untested)")
+            managed_setup = None
 
         print(f"==> provisioning the agent credential against {context}")
         kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
@@ -673,9 +709,9 @@ def main() -> int:
             print("    NOTE: no running kube-system pod; skipping the exec probe")
 
         failures = list(problems)
-        if not managed_namespace:
+        if managed_setup is None:
             failures.append("setup:managed-namespace")
-        for probe in _probes("/workspace/probe-hostpath.yaml", exec_target, managed_namespace):
+        for probe in _probes("/workspace/probe-hostpath.yaml", exec_target, managed_setup):
             passed, detail = _run_probe(executor, probe)
             verdict = "PASS" if passed else "FAIL"
             print(f"\n==> [{verdict}] {probe.name}")
