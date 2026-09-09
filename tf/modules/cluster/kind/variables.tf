@@ -51,3 +51,9 @@ variable "node_count" {
   description = "Number of nodes (1 control-plane + worker nodes)"
   default     = 3
 }
+
+variable "disable_default_cni" {
+  description = "Replace kind's built-in kindnet with Calico. kindnet does not enforce NetworkPolicy, so a task that grades policy enforcement needs this."
+  type        = bool
+  default     = false
+}
