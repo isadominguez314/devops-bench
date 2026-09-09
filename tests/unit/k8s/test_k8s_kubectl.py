@@ -115,6 +115,32 @@ def test_get_resource_with_name(mocker: MockerFixture) -> None:
     assert argv == ["kubectl", "get", "deployment", "my-dep", "-o", "json"]
 
 
+def test_get_resource_lists_across_every_namespace(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout='{"items": []}'),
+    )
+
+    kubectl.get_resource("pods", all_namespaces=True)
+
+    assert mock_run.call_args.args[0] == ["kubectl", "get", "pods", "-o", "json", "-A"]
+
+
+def test_get_resource_prefers_an_explicit_namespace_over_all(mocker: MockerFixture) -> None:
+    """``-n`` and ``-A`` together are an error, and the caller who named a
+    namespace meant it."""
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout='{"items": []}'),
+    )
+
+    kubectl.get_resource("pods", namespace="default", all_namespaces=True)
+
+    argv = mock_run.call_args.args[0]
+    assert argv[-2:] == ["-n", "default"]
+    assert "-A" not in argv
+
+
 def test_get_resource_forwards_timeout(mocker: MockerFixture) -> None:
     payload = {"items": []}
     mock_run = mocker.patch(
