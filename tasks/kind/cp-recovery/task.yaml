@@ -17,6 +17,13 @@ timeout_sec: 1500
 # $KUBECONFIG, not ~/.kube/config. See docs/bastion.md "Parallel agent support".
 infrastructure:
   deployer: "tofu"
+  # Explicit because deduction keys off the stack DIRECTORY NAME, and only
+  # exactly "kind"/"vcluster" deduce. "cp-recovery-kind" does not, so without
+  # this the run dies at provisioning with "stack requires an explicit
+  # provider" — before the agent ever starts. Every b-00xx task declares
+  # provider: kind for the same reason; this one was the only kind task that
+  # did not.
+  provider: "kind"
   stack: "prebuilt/cp-recovery-kind"
   teardown: true
   # Without this, {{NAMESPACE}} falls back to "default" (env NAMESPACE ->

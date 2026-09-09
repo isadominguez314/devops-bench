@@ -225,6 +225,7 @@ def test_to_dict_roundtrip_fields():
         "documentation",
         "agent_pod_security",
         "validated",
+        "requires_unsandboxed",
     }
 
 
@@ -243,6 +244,22 @@ def test_validated_empty_block_coalesces_false():
 
 def test_validated_roundtrips_in_to_dict():
     assert Task.from_dict({"name": "n", "validated": True}).to_dict()["validated"] is True
+
+
+def test_requires_unsandboxed_defaults_false():
+    assert Task.from_dict({"name": "n"}, name_default="d").requires_unsandboxed is False
+
+
+def test_requires_unsandboxed_parsed_from_spec():
+    # from_dict builds an explicit field mapping and Task ignores unknown keys,
+    # so a key absent from that mapping is dropped silently; this pins the wiring.
+    assert Task.from_dict({"name": "n", "requires_unsandboxed": True}).requires_unsandboxed is True
+
+
+def test_requires_unsandboxed_empty_block_coalesces_false():
+    # An empty YAML block (``requires_unsandboxed:`` with no value) parses to None.
+    task = Task.from_dict({"name": "n", "requires_unsandboxed": None})
+    assert task.requires_unsandboxed is False
 
 
 def test_safety_checklists_empty_block_coalesces_to_empty_list():
