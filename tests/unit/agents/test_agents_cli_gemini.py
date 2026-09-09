@@ -203,22 +203,22 @@ def test_build_env_vertex_accepts_the_gcp_project_and_location_spellings(
     # matrix export, so a host configured for one agent works for the other.
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
-    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
     monkeypatch.setenv("GCP_PROJECT", "proj-a")
-    monkeypatch.setenv("GCP_LOCATION", "europe-west4")
+    monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west4")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
     assert env["GOOGLE_CLOUD_PROJECT"] == "proj-a"
     assert env["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
 
 
-def test_build_env_vertex_honors_the_repo_wide_vertex_location_spelling(
+def test_build_env_vertex_ignores_the_deployers_cluster_zone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # GCP_VERTEX_LOCATION is what models/{gemini,claude}.py and the docs use;
-    # it outranks GCP_LOCATION, which deployers/factory.py owns as a cluster
-    # *zone* (us-central1-a) and which is never a valid Vertex location.
+    # GCP_LOCATION belongs to the deployers and holds a cluster *zone*;
+    # scripts/bastion/vm-setup.sh exports us-central1-a into the bastion
+    # profile. Routing model traffic there would hit an endpoint that does not
+    # exist, so it must not be read at all — fall through to the default.
     monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
-    monkeypatch.setenv("GCP_VERTEX_LOCATION", "global")
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
     monkeypatch.setenv("GCP_LOCATION", "us-central1-a")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
     assert env["GOOGLE_CLOUD_LOCATION"] == "global"
@@ -229,7 +229,6 @@ def test_build_env_vertex_prefers_google_cloud_spellings(monkeypatch: pytest.Mon
     monkeypatch.setenv("GCP_PROJECT", "proj-gcp")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
     monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west1")
-    monkeypatch.setenv("GCP_LOCATION", "europe-west4")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
     assert env["GOOGLE_CLOUD_PROJECT"] == "proj-google"
     assert env["GOOGLE_CLOUD_LOCATION"] == "asia-northeast1"

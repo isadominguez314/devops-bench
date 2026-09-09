@@ -234,6 +234,10 @@ class AgyCliAgent(base.AgentHarness):
             # chain is empty.
             location = vertex_location(fallback=_get_gcloud_location)
             env_overlay["GOOGLE_CLOUD_LOCATION"] = location
+            # Written but deliberately not *read* back (see vertex_env): agy's
+            # own GCP tooling has always been handed this spelling, and dropping
+            # it is a behavior change for the binary, not a routing fix. It only
+            # ever reaches the agy subprocess, never the deployers.
             env_overlay["GCP_LOCATION"] = location
 
             # Explicit gemini_dir keeps agy on the workspace settings, not real HOME.
