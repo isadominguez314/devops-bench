@@ -273,14 +273,14 @@ export AGENT_MODEL="gemini-3.1-pro-preview"
 # there), so which judge scored a run depended on how it was launched -- and
 # nothing recorded the answer.
 export JUDGE_PROVIDER="google"
-export JUDGE_MODEL="gemini-3.1-pro"
+export JUDGE_MODEL="gemini-3.1-pro-preview"
 export JUDGE_API_KEY=""
 
 # --- Chaos driver ---
 # Only optimize-scale uses this, but unset it falls back to AGENT_MODEL, which
 # is how the load spike failed to inject in every optimize-scale run.
 export CHAOS_PROVIDER="google"
-export CHAOS_MODEL="gemini-3.1-pro"
+export CHAOS_MODEL="gemini-3.1-pro-preview"
 EOF
 else
   echo "==> ${ENV_FILE} already exists; leaving it untouched"

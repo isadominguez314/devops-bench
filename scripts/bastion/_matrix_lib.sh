@@ -63,13 +63,13 @@ AGENT_PROVIDER="${AGENT_PROVIDER:-google}"
 # killed the load spike in 8 of 8 optimize-scale runs, and nothing in the
 # artifacts recorded which judge had scored which arm.
 JUDGE_PROVIDER="${JUDGE_PROVIDER:-google}"
-JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.1-pro}"
+JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.1-pro-preview}"
 # Only optimize-scale declares a chaos_spec, and its GenerateLoadFault is
 # LLM-driven: the model plans and issues the fortio command. So this matters for
 # exactly one task, and gets it wrong expensively — a bad endpoint now fails the
 # run loudly (chaos_invalidated) instead of scoring a spike that never fired.
 CHAOS_PROVIDER="${CHAOS_PROVIDER:-google}"
-CHAOS_MODEL="${CHAOS_MODEL:-gemini-3.1-pro}"
+CHAOS_MODEL="${CHAOS_MODEL:-gemini-3.1-pro-preview}"
 MAX_PARALLEL="${MAX_PARALLEL:-3}"
 # Per-subprocess agent timeout. The 600s harness default is too low for
 # infra-bearing tasks (e.g. deploy-hello-app timed out); give matrix runs more
