@@ -523,6 +523,94 @@ def test_namespace_guard_applies_only_to_the_agents_own_identity(
     assert f"system:serviceaccount:{creds.AGENT_NAMESPACE}:{creds.AGENT_SA_NAME}" in condition
 
 
+def _exempt_guard_resources(docs: list[dict], operation: str) -> set[str]:
+    """Every ``<group>/<resource>`` the exempt-namespace guard matches for one operation."""
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-exempt-namespace-guard")
+    return {
+        f"{rule['apiGroups'][0]}/{resource}"
+        for rule in policy["spec"]["matchConstraints"]["resourceRules"]
+        if operation in rule["operations"]
+        for resource in rule["resources"]
+    }
+
+
+def test_exempt_namespaces_deny_the_agents_own_workloads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The hole a probe found: the pod policy skips these namespaces, but
+    ``edit`` is bound cluster-wide, so ``kubectl run --privileged -n
+    kube-system`` was admitted on a cluster carrying the full policy set. The
+    exemption is only safe if the agent cannot write there at all."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-exempt-namespace-guard")
+
+    assert policy["spec"]["failurePolicy"] == "Fail"
+    # Nothing to evaluate: being matched at all is the violation.
+    assert [v["expression"] for v in policy["spec"]["validations"]] == ["false"]
+    assert "/pods" in _exempt_guard_resources(docs, "CREATE")
+    for suffix in ("by-name", "by-label"):
+        binding = _doc(
+            docs,
+            "ValidatingAdmissionPolicyBinding",
+            f"bench-agent-exempt-namespace-guard-{suffix}",
+        )
+        assert binding["spec"]["validationActions"] == ["Deny"]
+
+
+def test_exempt_namespace_guard_covers_every_kind_that_makes_a_pod(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Denying ``pods`` alone would be one ``create deployment`` from useless:
+    the ReplicaSet controller makes that pod under an identity of its own, so
+    a username-scoped rule never sees it. The workload object is where the
+    agent's own name is still on the request."""
+    matched = _exempt_guard_resources(_policy_docs(tmp_path, monkeypatch), "CREATE")
+
+    assert {
+        "apps/deployments",
+        "apps/daemonsets",
+        "apps/statefulsets",
+        "apps/replicasets",
+        "batch/jobs",
+        "batch/cronjobs",
+        "/replicationcontrollers",
+    } <= matched
+
+
+def test_exempt_namespace_guard_covers_exec_into_the_clusters_own_pods(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``edit`` grants exec, and these are the namespaces whose pods are
+    legitimately privileged. A shell in kube-proxy is the same escape by a
+    longer route, and exec arrives as CONNECT, not CREATE."""
+    matched = _exempt_guard_resources(_policy_docs(tmp_path, monkeypatch), "CONNECT")
+
+    assert {"/pods/exec", "/pods/attach", "/pods/portforward"} <= matched
+
+
+def test_exempt_namespace_guard_selects_exactly_what_the_pod_policy_skips(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The two must stay exact complements, or a namespace falls through both.
+    A ``namespaceSelector`` ANDs its expressions, so the inverse of "not by
+    name AND not by label" needs one binding per half."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    skipped = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
+    skipped_exprs = skipped["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"]
+    by_name, by_label = (
+        _doc(docs, "ValidatingAdmissionPolicyBinding", f"bench-agent-exempt-namespace-guard-{s}")[
+            "spec"
+        ]["matchResources"]["namespaceSelector"]["matchExpressions"][0]
+        for s in ("by-name", "by-label")
+    )
+
+    name_half = next(e for e in skipped_exprs if e["operator"] == "NotIn")
+    label_half = next(e for e in skipped_exprs if e["operator"] == "DoesNotExist")
+    assert (by_name["key"], by_name["operator"]) == (name_half["key"], "In")
+    assert by_name["values"] == name_half["values"]
+    assert (by_label["key"], by_label["operator"]) == (label_half["key"], "Exists")
+
+
 def test_enforce_pod_security_labels_ordinary_namespaces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
