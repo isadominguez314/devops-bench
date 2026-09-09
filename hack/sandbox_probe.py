@@ -123,11 +123,49 @@ class Probe:
     expect_stderr: str = ""
 
 
-def _probes(workspace_pod_path: str) -> list[Probe]:
+def _running_pod_in_kube_system(context: str) -> str | None:
+    """Name a running kube-system pod for the exec probe to aim at.
+
+    Resolved host-side because the probe needs a target that exists: with a
+    made-up name ``kubectl exec`` fails on the preliminary GET, before the
+    apiserver ever reaches admission, and the probe would report a refusal the
+    boundary had nothing to do with.
+
+    Args:
+        context: kubectl context to query.
+
+    Returns:
+        A pod name, or ``None`` when the namespace has no running pod — a
+        vcluster's virtual ``kube-system`` may have none, and there is nothing
+        to prove there.
+    """
+    completed = subprocess.run(
+        [
+            "kubectl",
+            "--context",
+            context,
+            "get",
+            "pods",
+            "-n",
+            "kube-system",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.stdout.strip() or None
+
+
+def _probes(workspace_pod_path: str, exec_target: str | None) -> list[Probe]:
     """Build the probe list.
 
     Args:
         workspace_pod_path: Container path of the hostPath manifest.
+        exec_target: A running kube-system pod to attempt exec into, or
+            ``None`` to skip that probe.
 
     Returns:
         Controls first, then the escapes, then the informational checks.
@@ -237,17 +275,19 @@ def _probes(workspace_pod_path: str) -> list[Probe]:
             expect_stderr="reserved",
         ),
         # -- the exemption's other edge: namespaces that already exist --
+        #
+        # This trio found a real hole and is the reason the exempt-namespace
+        # guard exists. On the first live run the pod probe came back CREATED:
+        # the pod policy skips kube-system by namespaceSelector, the labeller
+        # skips it too, and edit is bound cluster-wide, so the escape the whole
+        # stack exists to deny was one -n kube-system away. Keep all three --
+        # they now assert the guard rather than document the hole, and each
+        # covers a different way in.
         Probe(
             name="review:exempt-namespace-pod",
             why="the module asserts every exempt name is one the agent cannot "
-            "write to, and edit bound cluster-wide makes that false: the "
-            "policy skips kube-system by namespaceSelector and the labeller "
-            "skips it too, so the escape may be one -n kube-system away. A "
-            "Deployment would reach the same place, and needs no probe of "
-            "its own while the policy is namespace-scoped: the ReplicaSet "
-            "controller's pod is judged by the same selector as this one. "
-            "Add one if a username-scoped defence is ever proposed, because "
-            "that is exactly what such a defence would miss",
+            "write to; edit bound cluster-wide made that false until the "
+            "exempt-namespace guard, and this is the request that proved it",
             argv=[
                 "kubectl",
                 "run",
@@ -258,7 +298,41 @@ def _probes(workspace_pod_path: str) -> list[Probe]:
                 "--restart=Never",
                 f"--overrides={_PRIVILEGED_OVERRIDE}",
             ],
-            expect_stderr="privileged",
+            expect_stderr="may not run a workload",
+        ),
+        Probe(
+            name="review:exempt-namespace-deployment",
+            why="the guard is username-scoped, and a Deployment's pod is made "
+            "by the ReplicaSet controller under an identity of its own -- so "
+            "the workload object is the only place the agent's name still "
+            "appears. Deliberately unprivileged: only the exempt-namespace "
+            "guard can deny this, so it cannot pass on the pod policy's back",
+            argv=[
+                "kubectl",
+                "create",
+                "deployment",
+                "bench-probe-exempt-deploy",
+                "-n",
+                "kube-system",
+                "--image=busybox",
+            ],
+            expect_stderr="may not run a workload",
+        ),
+        *(
+            [
+                Probe(
+                    name="review:exempt-namespace-exec",
+                    why="denying creates is only half of it: edit grants "
+                    "pods/exec, and these are the namespaces whose pods are "
+                    "legitimately privileged, so a shell in one of them is "
+                    "the same escape by a longer route. exec arrives as "
+                    "CONNECT on a subresource, which a CREATE rule never sees",
+                    argv=["kubectl", "exec", "-n", "kube-system", exec_target, "--", "true"],
+                    expect_stderr="exec into one",
+                )
+            ]
+            if exec_target
+            else []
         ),
         Probe(
             name="review:claim-managed-label",
@@ -307,8 +381,15 @@ def _run_probe(executor: SandboxExecutor, probe: Probe) -> tuple[bool, str]:
     return True, out
 
 
+_POLICY_NAMES = (
+    "bench-agent-pod-security",
+    "bench-agent-namespace-guard",
+    "bench-agent-exempt-namespace-guard",
+)
+
+
 def _check_policies(context: str) -> list[str]:
-    """Host-side: confirm both policies exist and their CEL compiled.
+    """Host-side: confirm every policy exists and its CEL compiled.
 
     A ValidatingAdmissionPolicy whose expression does not type-check is
     accepted by the apiserver and then, under ``failurePolicy: Fail``, denies
@@ -319,10 +400,10 @@ def _check_policies(context: str) -> list[str]:
         context: kubectl context to query.
 
     Returns:
-        Human-readable problem lines; empty when both policies are healthy.
+        Human-readable problem lines; empty when every policy is healthy.
     """
     problems: list[str] = []
-    for name in ("bench-agent-pod-security", "bench-agent-namespace-guard"):
+    for name in _POLICY_NAMES:
         completed = subprocess.run(
             [
                 "kubectl",
@@ -507,8 +588,12 @@ def main() -> int:
             SandboxSpec(image=args.image, network=plan, workspace=workspace, kubeconfig=kubeconfig)
         )
 
+        exec_target = _running_pod_in_kube_system(context)
+        if not exec_target:
+            print("    NOTE: no running kube-system pod; skipping the exec probe")
+
         failures = list(problems)
-        for probe in _probes("/workspace/probe-hostpath.yaml"):
+        for probe in _probes("/workspace/probe-hostpath.yaml", exec_target):
             passed, detail = _run_probe(executor, probe)
             verdict = "PASS" if passed else "FAIL"
             print(f"\n==> [{verdict}] {probe.name}")
@@ -525,25 +610,30 @@ def main() -> int:
             if problem:
                 failures.append("vcluster:token-replay")
 
-        # Always, even under --keep. If the exempt-namespace probe FAILED then
-        # the escape worked, and what it left behind is a privileged container
-        # in kube-system. That is not something to leave for inspection.
-        subprocess.run(
-            [
-                "kubectl",
-                "--context",
-                context,
-                "delete",
-                "pod",
-                "bench-probe-exempt",
-                "-n",
-                "kube-system",
-                "--ignore-not-found",
-                "--wait=false",
-            ],
-            capture_output=True,
-            check=False,
-        )
+        # Always, even under --keep. If the exempt-namespace probes FAILED then
+        # the escape worked, and what they left behind is a privileged
+        # container in kube-system. That is not something to leave for
+        # inspection.
+        for kind, name in (
+            ("pod", "bench-probe-exempt"),
+            ("deployment", "bench-probe-exempt-deploy"),
+        ):
+            subprocess.run(
+                [
+                    "kubectl",
+                    "--context",
+                    context,
+                    "delete",
+                    kind,
+                    name,
+                    "-n",
+                    "kube-system",
+                    "--ignore-not-found",
+                    "--wait=false",
+                ],
+                capture_output=True,
+                check=False,
+            )
 
         if not args.keep:
             for namespace in ("bench-probe-ok",):
