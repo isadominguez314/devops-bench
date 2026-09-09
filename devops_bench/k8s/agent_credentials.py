@@ -98,6 +98,14 @@ TOKEN_TTL_SLACK_SEC = 900
 POD_SECURITY_BASELINE = "baseline"
 POD_SECURITY_PRIVILEGED = "privileged"
 
+# The backstop's API, spelled so ``kubectl get`` resolves that exact version and
+# not whatever else the cluster happens to serve. ValidatingAdmissionPolicy was
+# GA'd in Kubernetes 1.30; 1.29 serves only ``v1beta1``, and behind a feature
+# gate at that. Checked before the apply so an old cluster is named as an old
+# cluster, rather than surfacing as ``no matches for kind``.
+_POLICY_API_RESOURCE = "validatingadmissionpolicies.v1.admissionregistration.k8s.io"
+_MIN_CLUSTER_VERSION = "1.30"
+
 # Namespaces the ADMISSION POLICY leaves alone. They hold the cluster's own
 # control-plane, storage and managed add-on components, which legitimately run
 # privileged and with host mounts; denying them would break the cluster rather
@@ -562,10 +570,17 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
         context: kubectl context to pin every call to.
 
     Raises:
+        SandboxError: If the cluster does not serve the policy API at all.
+            Deliberately not routed through the admin escape hatch: that hatch
+            is for an operator whose credential cannot write cluster-scoped
+            objects, and no credential makes a 1.29 apiserver serve a v1
+            policy.
         SubprocessError: If the policy cannot be applied. Namespace labelling
             failures are warned and skipped — the policy is the load-bearing
             half, and one unlabellable namespace must not fail the run.
     """
+    _require_policy_api(context)
+
     manifest = work_dir / "bench-agent-pod-security.yaml"
     manifest.write_text(_POD_SECURITY_POLICY_MANIFEST)
     kubectl.apply(str(manifest), context=context)
@@ -586,6 +601,31 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
         except SubprocessError as exc:
             _log.warning("could not label namespace %s for pod security: %s", name, exc)
     _log.info("pod security enforced: baseline labels plus the cluster-wide admission policy")
+
+
+def _require_policy_api(context: str | None) -> None:
+    """Refuse a cluster too old to serve the pod-security backstop.
+
+    Without this the apply fails with kubectl's ``no matches for kind``, which
+    reads like a typo in our manifest rather than what it is: an apiserver
+    predating the API's GA. Every sandboxed run on such a cluster then refuses,
+    correctly but unhelpfully.
+
+    Args:
+        context: kubectl context to pin the check to.
+
+    Raises:
+        SandboxError: If the cluster does not serve the policy API at ``v1``.
+    """
+    try:
+        kubectl.get_resource(_POLICY_API_RESOURCE, context=context, timeout=60)
+    except SubprocessError as exc:
+        raise SandboxError(
+            f"this cluster does not serve {_POLICY_API_RESOURCE} ({exc}); the sandbox's "
+            "pod-security backstop is a ValidatingAdmissionPolicy, which reached GA in "
+            f"Kubernetes {_MIN_CLUSTER_VERSION} — upgrade the cluster (for kind, the "
+            "node_image variable) rather than running the agent without the backstop"
+        ) from exc
 
 
 def _labellable_namespaces(context: str | None) -> list[str]:
