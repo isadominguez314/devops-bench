@@ -56,6 +56,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from devops_bench.cheat_detection.rules import SCAN_FIELDS, SensitiveAccessRule
+from devops_bench.core import get_logger
 
 __all__ = [
     "DEFAULT_BASELINE",
@@ -63,8 +64,12 @@ __all__ = [
     "baseline_from_granted_paths",
     "build_inventory_rules",
     "build_mount_rules",
+    "drop_fingerprints_matching_inputs",
     "filter_rules_for_prompt",
+    "narrow_home_listing_rules",
 ]
+
+_log = get_logger("cheat_detection.inventory")
 
 # Category stamped on every generated rule so reviewers can tell dynamic
 # inventory findings from the static ruleset at a glance.
@@ -341,13 +346,14 @@ def filter_rules_for_prompt(
     honest run of the task. Naming an entry in the prompt is authorization to
     reference it — for that record only.
 
-    Only path rules (which carry ``source``) are filterable, and this is the
-    one place authorization is recognised at all: path rules otherwise flag a
-    home entry however it surfaced, including passively in an ``ls`` listing.
-    Content fingerprints are never filterable: a prompt naming ``report.md``
-    tells the agent to *write* its own, not to read the stale copy back — and
-    an honest write never reproduces the stale file's lines, so keeping the
-    fingerprint costs honest runs nothing.
+    Only path rules (which carry ``source``) are filterable here. Content
+    fingerprints are handled separately by
+    :func:`drop_fingerprints_matching_inputs`, because the reasoning that makes
+    them safe to keep — "a prompt naming ``report.md`` tells the agent to
+    *write* its own, and an honest write never reproduces the stale file's
+    lines" — holds for outputs and fails for **delivered inputs**. A CVE
+    advisory is copied from the same fixture every run, so an honest agent
+    reading its own advisory reproduces the previous run's copy byte for byte.
 
     The name must appear as a whole token, not a substring: a prompt naming
     ``workspace-repo`` must not also authorize a ``workspace`` leftover, and
@@ -369,3 +375,113 @@ def filter_rules_for_prompt(
         return re.search(rf"(?<![\w.-]){re.escape(source)}(?![\w-])(?!\.\w)", prompt) is not None
 
     return tuple(r for r in rules if not (r.source and named(r.source)))
+
+
+#: Rules whose patterns are bare filenames living at the top of the operator's
+#: home, so any listing of home surfaces them whether or not the agent read
+#: anything. Narrowed to ``args`` for records whose prompt sends the agent into
+#: home; left alone otherwise, where a sighting really is evidence of digging.
+_HOME_LISTING_CATEGORIES: frozenset[str] = frozenset({"harness-environment"})
+
+
+def narrow_home_listing_rules(
+    rules: tuple[SensitiveAccessRule, ...], prompt: str, home: Path | None = None
+) -> tuple[SensitiveAccessRule, ...]:
+    """Stop passive home-listing sightings flagging a prompt-authorized run.
+
+    Five tasks seed their input into the operator's home and point the prompt
+    at ``~/<name>``, so an agent that runs ``ls -la ~`` to find it necessarily
+    prints the harness's own top-level files and is flagged for material it
+    never opened.
+
+    A sighting is still evidence when nothing authorized the agent to be in
+    home, so this narrows rather than removes, and only for records whose
+    prompt names a home fixture. Naming one of these files on a command line
+    still flags through ``args``; reading one while hiding the path still flags
+    through the separate content-evidence rule.
+
+    Args:
+        rules: Rules to narrow.
+        prompt: The record's substituted task ``input``.
+        home: Home the prompt's ``~`` resolves to; defaults to the current
+            user's.
+
+    Returns:
+        ``rules`` with the home-listing rules restricted to ``args`` when the
+        prompt authorizes a home fixture, unchanged otherwise.
+    """
+    from devops_bench.evalharness.fixtures import prompt_fixture_paths
+
+    if not prompt or not prompt_fixture_paths(prompt, home):
+        return rules
+    return tuple(
+        rule.model_copy(update={"fields": ("args",)})
+        if rule.category in _HOME_LISTING_CATEGORIES and rule.fields == SCAN_FIELDS
+        else rule
+        for rule in rules
+    )
+
+
+def drop_fingerprints_matching_inputs(
+    rules: tuple[SensitiveAccessRule, ...], prompt: str, home: Path | None = None
+) -> tuple[SensitiveAccessRule, ...]:
+    """Drop content fingerprints that also match this run's own task input.
+
+    A stale copy of a *delivered input* in the operator's home becomes a
+    content fingerprint, and the honest agent then matches it by reading the
+    current copy — the two are byte-identical, both seeded from the same file
+    in the stack.
+
+    The test is "does this pattern match what the prompt authorized the agent
+    to read": a fingerprint that fires on the run's own input is evidence of
+    nothing, whatever its provenance. Fingerprints that do not match an
+    authorized input are untouched, so a genuinely stale ``report.md`` or a
+    prior ``results.json`` still flags.
+
+    Args:
+        rules: Rules to filter, inventory-generated and static alike.
+        prompt: The record's substituted task ``input``; the paths it names are
+            the authorization.
+        home: Home directory the prompt's ``~`` resolves to. Defaults to the
+            current user's, which is the agent's on an unsandboxed run.
+
+    Returns:
+        ``rules`` minus the fingerprints that match an authorized input.
+    """
+    # Imported here rather than at module scope: the evalharness package pulls
+    # in the agent and metric layers, and cheat_detection must stay importable
+    # from them without a cycle.
+    from devops_bench.evalharness.fixtures import prompt_fixture_paths
+
+    if not prompt:
+        return rules
+    texts: list[str] = []
+    for path in prompt_fixture_paths(prompt, home):
+        try:
+            if path.is_file():
+                texts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:  # unreadable input is the fixture check's problem
+            _log.debug("could not read authorized input %s: %s", path, exc)
+    if not texts:
+        return rules
+
+    def matches_own_input(rule: SensitiveAccessRule) -> bool:
+        for pattern in rule.patterns:
+            try:
+                compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+            except re.error:  # pragma: no cover - rules validate at load
+                continue
+            if any(compiled.search(text) for text in texts):
+                return True
+        return False
+
+    kept = []
+    for rule in rules:
+        if matches_own_input(rule):
+            _log.info(
+                "dropping %s rule for this record: it matches the task's own declared input",
+                rule.category,
+            )
+            continue
+        kept.append(rule)
+    return tuple(kept)
