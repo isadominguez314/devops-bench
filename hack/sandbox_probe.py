@@ -110,6 +110,16 @@ _METADATA_URL = "http://169.254.169.254/computeMetadata/v1/instance/service-acco
 # denies it the label, which the ``review:claim-managed-label`` probe asserts.
 _MANAGED_NAMESPACE = "bench-probe-managed"
 
+# An ordinary, non-exempt namespace holding two pods built host-side *before*
+# provisioning, standing in for what ``tf/prebuilt/opa-remediation`` leaves
+# behind: one privileged pod the policy would have refused had it existed yet,
+# and one conformant pod beside it. The pair is the point -- they differ only
+# in conformance, so a deny on the first and a success on the second can only
+# be the shell guard discriminating between them.
+_LEGACY_NAMESPACE = "bench-probe-legacy"
+_LEGACY_PRIVILEGED_POD = "bench-probe-legacy-priv"
+_LEGACY_ORDINARY_POD = "bench-probe-legacy-ok"
+
 
 @dataclass
 class Probe:
@@ -229,8 +239,92 @@ def _ensure_managed_namespace(context: str) -> bool:
     return True
 
 
+def _kubectl(context: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a host-side kubectl pinned to ``context``, never raising."""
+    return subprocess.run(
+        ["kubectl", "--context", context, *args], capture_output=True, text=True, check=False
+    )
+
+
+def _create_legacy_pods(context: str) -> bool:
+    """Build the pods that must predate provisioning, and wait for them.
+
+    Called before ``provision_agent_credentials`` on purpose: the whole point
+    of the guard under test is that admission never saw these creates. Running
+    this afterwards would have the pod-security policy refuse the privileged
+    one, and the probe would be testing the wrong control.
+
+    They must reach Running, not merely exist. ``kubectl exec`` on a Pending
+    pod fails in the kubelet with a message the boundary had nothing to do
+    with, which would read as a deny.
+
+    Args:
+        context: kubectl context to create them in.
+
+    Returns:
+        True once both pods are Running.
+    """
+    _kubectl(context, "create", "namespace", _LEGACY_NAMESPACE)
+    for name, overrides in (
+        (_LEGACY_PRIVILEGED_POD, _PRIVILEGED_OVERRIDE),
+        (_LEGACY_ORDINARY_POD, _ORDINARY_POD),
+    ):
+        created = _kubectl(
+            context,
+            "run",
+            name,
+            "-n",
+            _LEGACY_NAMESPACE,
+            "--image=busybox",
+            "--restart=Never",
+            f"--overrides={overrides}",
+        )
+        if created.returncode != 0 and "already exists" not in created.stderr:
+            print(f"    {created.stderr.strip()}")
+            return False
+
+    for name in (_LEGACY_PRIVILEGED_POD, _LEGACY_ORDINARY_POD):
+        waited = _kubectl(
+            context,
+            "wait",
+            "--for=condition=Ready",
+            f"pod/{name}",
+            "-n",
+            _LEGACY_NAMESPACE,
+            "--timeout=120s",
+        )
+        if waited.returncode != 0:
+            print(f"    {waited.stderr.strip()}")
+            return False
+    return True
+
+
+def _legacy_pod_still_running(context: str, name: str) -> bool:
+    """Re-assert that a legacy pod is still Running, without rebuilding it.
+
+    Deliberately not a create: by the time this runs the pod-security policy is
+    installed, so recreating the privileged one would be denied and the probe
+    would report a refusal from the wrong control. If the pod is gone, the
+    precondition is gone with it and the probe has to say so.
+
+    Args:
+        context: kubectl context to query.
+        name: Pod name in :data:`_LEGACY_NAMESPACE`.
+
+    Returns:
+        True when the pod is Running.
+    """
+    phase = _kubectl(
+        context, "get", "pod", name, "-n", _LEGACY_NAMESPACE, "-o", "jsonpath={.status.phase}"
+    )
+    return phase.returncode == 0 and phase.stdout.strip() == "Running"
+
+
 def _probes(
-    workspace_pod_path: str, exec_target: str | None, managed_setup: Callable[[], bool] | None
+    workspace_pod_path: str,
+    exec_target: str | None,
+    managed_setup: Callable[[], bool] | None,
+    legacy_setup: Callable[[str], bool] | None,
 ) -> list[Probe]:
     """Build the probe list.
 
@@ -240,6 +334,9 @@ def _probes(
             ``None`` to skip that probe.
         managed_setup: Re-asserts the labelled namespace, or ``None`` to drop
             the by-label probe because it could not be built at all.
+        legacy_setup: Re-asserts that a named pre-provisioning pod is still
+            Running, or ``None`` to drop the shell-guard probes because the
+            pods could not be built at all.
 
     Returns:
         Controls first, then the escapes, then the informational checks.
@@ -451,6 +548,54 @@ def _probes(
             if managed_setup
             else []
         ),
+        *(
+            [
+                Probe(
+                    name="control:exec-conformant-legacy-pod",
+                    why="the deny below must be the shell guard picking one pod "
+                    "out, not exec being broken wholesale. This pod predates "
+                    "provisioning exactly like the privileged one, sits in the "
+                    "same non-exempt namespace and differs only in conformance, "
+                    "so the pair isolates the guard and nothing else",
+                    argv=[
+                        "kubectl",
+                        "exec",
+                        "-n",
+                        _LEGACY_NAMESPACE,
+                        _LEGACY_ORDINARY_POD,
+                        "--",
+                        "true",
+                    ],
+                    expect_denied=False,
+                    setup=functools.partial(legacy_setup, _LEGACY_ORDINARY_POD),
+                ),
+                Probe(
+                    name="review:exec-nonconformant-pod",
+                    why="the deployer runs before credentials are provisioned, "
+                    "so fixtures like opa-remediation leave privileged pods "
+                    "admission never saw and cannot retract. edit grants "
+                    "pods/exec cluster-wide, and this namespace is not exempt, "
+                    "so a shell into one of those is node root by a route the "
+                    "pod-security policy is blind to. Admission cannot read the "
+                    "pod's spec on a CONNECT -- the object is a PodExecOptions "
+                    "-- so the guard names the pods instead, and this asserts "
+                    "the name list was built from a real cluster scan",
+                    argv=[
+                        "kubectl",
+                        "exec",
+                        "-n",
+                        _LEGACY_NAMESPACE,
+                        _LEGACY_PRIVILEGED_POD,
+                        "--",
+                        "true",
+                    ],
+                    expect_stderr="may not open a shell",
+                    setup=functools.partial(legacy_setup, _LEGACY_PRIVILEGED_POD),
+                ),
+            ]
+            if legacy_setup
+            else []
+        ),
         # -- informational: read the output, there is no pass/fail here --
         Probe(
             name="info:visible-nodes",
@@ -491,6 +636,7 @@ _POLICY_NAMES = (
     "bench-agent-pod-security",
     "bench-agent-namespace-guard",
     "bench-agent-exempt-namespace-guard",
+    "bench-agent-nonconformant-pod-guard",
 )
 
 
@@ -691,6 +837,16 @@ def main() -> int:
             print("    FAIL setup:managed-namespace (the by-label binding stays untested)")
             managed_setup = None
 
+        # Also before provisioning, and that ordering is the whole test: these
+        # pods exist because admission was not there yet to refuse them.
+        print(f"==> creating the pre-provisioning pods in {_LEGACY_NAMESPACE}")
+        legacy_setup: Callable[[str], bool] | None = functools.partial(
+            _legacy_pod_still_running, context
+        )
+        if not _create_legacy_pods(context):
+            print("    FAIL setup:legacy-pods (the shell guard stays untested)")
+            legacy_setup = None
+
         print(f"==> provisioning the agent credential against {context}")
         kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
         print(f"    kubeconfig: {kubeconfig}")
@@ -711,7 +867,11 @@ def main() -> int:
         failures = list(problems)
         if managed_setup is None:
             failures.append("setup:managed-namespace")
-        for probe in _probes("/workspace/probe-hostpath.yaml", exec_target, managed_setup):
+        if legacy_setup is None:
+            failures.append("setup:legacy-pods")
+        for probe in _probes(
+            "/workspace/probe-hostpath.yaml", exec_target, managed_setup, legacy_setup
+        ):
             passed, detail = _run_probe(executor, probe)
             verdict = "PASS" if passed else "FAIL"
             print(f"\n==> [{verdict}] {probe.name}")
@@ -752,6 +912,18 @@ def main() -> int:
                 capture_output=True,
                 check=False,
             )
+
+        # Also unconditional: this namespace holds a privileged pod that the
+        # probe itself put there, and leaving it for inspection would leave the
+        # escape route open on a cluster the next run reuses.
+        _kubectl(
+            context,
+            "delete",
+            "namespace",
+            _LEGACY_NAMESPACE,
+            "--ignore-not-found",
+            "--wait=false",
+        )
 
         if not args.keep:
             for namespace in ("bench-probe-ok", _MANAGED_NAMESPACE):
