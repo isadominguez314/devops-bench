@@ -92,16 +92,28 @@ at 15s, the objectives above are still evaluated against a cluster that was neve
 entry's status in `results.json` before reading a passing score as evidence the workload absorbed
 anything.
 
-## Why GKE
+## Why kind
 
-The metrics objective needs a working metrics pipeline. GKE ships metrics-server; a stock kind
-cluster does not, so `ScalingActive` would read `False` there for reasons that have nothing to do
-with the agent.
+Two things used to argue for GKE, and neither survives measurement.
 
-`tf/prebuilt/optimize-scale` still supports `infra_provider=kind` — it swaps the Service to
-`ClusterIP` and relies on the harness port-forward — and running with `INFRA_PROVIDER=kind` is
-much cheaper if you only want to exercise the fixture. Expect **Autoscaler Is Reading Live
-Metrics** to fail unless you install metrics-server yourself.
+Metrics: the HPA objective grades `ScalingActive=True`, which needs a live
+metrics pipeline. A stock kind cluster ships none — but the stack now installs
+metrics-server itself under `infra_provider=kind`, so the objective is decided
+by the agent again.
+
+The load path: on GKE the Service is a LoadBalancer the chaos generator was
+meant to reach directly. In practice it cannot — fortio times out on the
+external IP (`dial tcp <ip>:8080: i/o timeout`) because the project's firewall
+admits only 22/3389/443, so the spike never injects. On kind the Service is a
+`ClusterIP` behind the harness port-forward, which connects and serves the
+spike.
+
+The historic 8-of-8 injection failures were a third thing entirely: every chaos
+command shared a 40s ceiling, and this task declares a 300s spike, so fortio was
+killed mid-run and the fault reported "load did not reach the workload".
+
+`INFRA_PROVIDER=gcp` still selects GKE and is the better load path once a runner
+can reach a LoadBalancer.
 
 ## Run
 
