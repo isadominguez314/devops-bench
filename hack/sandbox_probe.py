@@ -258,12 +258,22 @@ def _create_legacy_pods(context: str) -> bool:
     pod fails in the kubelet with a message the boundary had nothing to do
     with, which would read as a deny.
 
+    The pod-security policy is dropped first, and that is not a shortcut. On a
+    fresh cluster the deployer runs before anything here exists, which is the
+    situation being reproduced; on a cluster a previous run left policies on,
+    the operator's own create is refused -- the policy is deliberately not
+    username-scoped, because a pod is often created on the agent's behalf by a
+    controller. Provisioning re-applies it seconds later, and the probe below
+    reads the policy's own status to confirm that.
+
     Args:
         context: kubectl context to create them in.
 
     Returns:
         True once both pods are Running.
     """
+    for kind in ("validatingadmissionpolicybinding", "validatingadmissionpolicy"):
+        _kubectl(context, "delete", kind, "bench-agent-pod-security", "--ignore-not-found")
     _kubectl(context, "create", "namespace", _LEGACY_NAMESPACE)
     for name, overrides in (
         (_LEGACY_PRIVILEGED_POD, _PRIVILEGED_OVERRIDE),
