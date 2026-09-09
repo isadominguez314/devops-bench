@@ -59,6 +59,7 @@ def _patch_kubectl(
     token: str = _TOKEN,
     mint_fails: bool = False,
     namespaces: dict | None = None,
+    pods: dict | None = None,
     policy_api: bool = True,
     calls: list[list[str]] | None = None,
 ) -> list[list[str]]:
@@ -69,6 +70,7 @@ def _patch_kubectl(
     """
     seen = calls if calls is not None else []
     namespaces = namespaces if namespaces is not None else {"items": []}
+    pods = pods if pods is not None else {"items": []}
     answers = {
         "jsonpath={.clusters[0].cluster.certificate-authority-data}": ca,
         "jsonpath={.clusters[0].cluster.server}": server,
@@ -98,6 +100,8 @@ def _patch_kubectl(
             resource = argv[argv.index("get") + 1]
             if resource == "namespaces":
                 return SimpleNamespace(returncode=0, stdout=json.dumps(namespaces), stderr="")
+            if resource == "pods":
+                return SimpleNamespace(returncode=0, stdout=json.dumps(pods), stderr="")
             if resource == creds._POLICY_API_RESOURCE:
                 if not policy_api:
                     raise SubprocessError(
@@ -720,6 +724,175 @@ def test_the_version_refusal_is_not_the_admin_escape_hatch(
 
     with pytest.raises(SandboxError, match=creds._MIN_CLUSTER_VERSION):
         creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+
+# -- pods that predate the policy --------------------------------------------
+
+
+def _pod(namespace: str, name: str, **spec: object) -> dict:
+    return {"metadata": {"namespace": namespace, "name": name}, "spec": spec}
+
+
+_PRIVILEGED = {"containers": [{"name": "c", "securityContext": {"privileged": True}}]}
+
+
+def _shell_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pods: dict,
+    namespaces: dict | None = None,
+) -> list[dict]:
+    _patch_kubectl(monkeypatch, pods=pods, namespaces=namespaces)
+    creds.enforce_pod_security(tmp_path)
+    text = (tmp_path / "bench-agent-nonconformant-pods.yaml").read_text()
+    return [d for d in yaml.safe_load_all(text) if d]
+
+
+def _guard_expression(docs: list[dict]) -> str:
+    policy = _doc(docs, "ValidatingAdmissionPolicy", creds._NONCONFORMANT_GUARD_NAME)
+    return " ".join(v["expression"] for v in policy["spec"]["validations"])
+
+
+def test_the_shell_guard_names_pods_the_policy_arrived_too_late_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deployer runs before credentials are provisioned, and fixtures like
+    ``opa-remediation`` deploy privileged pods on purpose — remediating them is
+    the task. Admission never saw those creates and cannot retract them, so the
+    agent holding cluster-wide ``pods/exec`` is node root by a route the
+    pod-security policy is blind to."""
+    docs = _shell_guard(
+        tmp_path,
+        monkeypatch,
+        pods={
+            "items": [
+                _pod("team-alpha", "cache", **_PRIVILEGED),
+                _pod("default", "web", containers=[{"name": "c"}]),
+            ]
+        },
+    )
+
+    expression = _guard_expression(docs)
+    assert "'team-alpha/cache'" in expression
+    assert "default/web" not in expression
+
+
+def test_the_shell_guard_covers_every_way_into_a_running_container(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``exec`` is the obvious one; ``attach`` reaches the same process and
+    ``port-forward`` reaches anything it is listening on."""
+    docs = _shell_guard(
+        tmp_path, monkeypatch, pods={"items": [_pod("team-alpha", "cache", **_PRIVILEGED)]}
+    )
+    policy = _doc(docs, "ValidatingAdmissionPolicy", creds._NONCONFORMANT_GUARD_NAME)
+    rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
+
+    assert rule["operations"] == ["CONNECT"]
+    assert set(rule["resources"]) == {"pods/exec", "pods/attach", "pods/portforward"}
+    assert _doc(docs, "ValidatingAdmissionPolicyBinding", creds._NONCONFORMANT_GUARD_NAME)["spec"][
+        "validationActions"
+    ] == ["Deny"]
+
+
+def test_the_shell_guard_applies_only_to_the_agents_own_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unlike the pod-security policy, this one is username-scoped: the pods it
+    names are the fixture's own, and the operator and the task's controllers
+    must keep being able to reach them."""
+    docs = _shell_guard(
+        tmp_path, monkeypatch, pods={"items": [_pod("team-alpha", "cache", **_PRIVILEGED)]}
+    )
+    policy = _doc(docs, "ValidatingAdmissionPolicy", creds._NONCONFORMANT_GUARD_NAME)
+    conditions = policy["spec"]["matchConditions"]
+
+    assert len(conditions) == 1
+    assert creds._AGENT_USERNAME in conditions[0]["expression"]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {"hostNetwork": True, "containers": [{"name": "c"}]},
+        {"hostPID": True, "containers": [{"name": "c"}]},
+        {"hostIPC": True, "containers": [{"name": "c"}]},
+        {"volumes": [{"name": "root", "hostPath": {"path": "/"}}], "containers": [{"name": "c"}]},
+        {"initContainers": [{"name": "i", "securityContext": {"privileged": True}}]},
+        {"ephemeralContainers": [{"name": "e", "securityContext": {"privileged": True}}]},
+    ],
+)
+def test_the_shell_guard_reads_the_same_pod_spec_the_policy_would_have(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spec: dict
+) -> None:
+    """The scan is kept in lockstep with the policy's CEL, not with PSA
+    ``baseline`` — a pod it skips must be one the policy would have admitted,
+    or the guard's coverage claim is a lie."""
+    docs = _shell_guard(
+        tmp_path, monkeypatch, pods={"items": [_pod("team-alpha", "cache", **spec)]}
+    )
+
+    assert "'team-alpha/cache'" in _guard_expression(docs)
+
+
+def test_the_shell_guard_ignores_pods_the_agent_already_cannot_reach(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every namespace the exempt-namespace guard covers — by name or by the
+    addon manager's label — is already closed to the agent on all four verbs.
+    Naming ``kube-system``'s privileged pods here would bury the ones that
+    actually needed this."""
+    docs = _shell_guard(
+        tmp_path,
+        monkeypatch,
+        pods={
+            "items": [
+                _pod("kube-system", "kube-proxy", **_PRIVILEGED),
+                _pod("gke-managed-cim", "collector", **_PRIVILEGED),
+            ]
+        },
+        namespaces={
+            "items": [
+                _ns("kube-system"),
+                _ns("gke-managed-cim", **{creds._ADDON_MANAGER_LABEL: "Reconcile"}),
+            ]
+        },
+    )
+
+    assert _guard_expression(docs) == "true"
+
+
+def test_the_shell_guard_is_applied_even_with_nothing_to_deny(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nothing here is torn down between runs, so a reused cluster would
+    otherwise keep the previous run's list and refuse a shell into a pod that is
+    long gone. An empty CEL list literal has no element type to infer either,
+    and a policy that fails to compile under ``failurePolicy: Fail`` denies
+    every exec the agent attempts — the opposite of inert."""
+    calls = _patch_kubectl(monkeypatch)
+
+    creds.enforce_pod_security(tmp_path)
+
+    assert any(_applies(c, "bench-agent-nonconformant-pods.yaml") for c in calls)
+    text = (tmp_path / "bench-agent-nonconformant-pods.yaml").read_text()
+    docs = [d for d in yaml.safe_load_all(text) if d]
+    assert _guard_expression(docs) == "true"
+
+
+def test_the_nonconformant_scan_looks_at_every_namespace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without ``-A`` the listing comes from the kubeconfig's current namespace,
+    which for a cluster-wide question is silently the wrong answer."""
+    calls = _patch_kubectl(monkeypatch)
+
+    creds.enforce_pod_security(tmp_path)
+
+    pod_gets = [c for c in calls if "get" in c and c[c.index("get") + 1] == "pods"]
+    assert len(pod_gets) == 1
+    assert "-A" in pod_gets[0]
 
 
 def test_provision_enforces_pod_security_by_default(
