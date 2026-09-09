@@ -73,6 +73,7 @@ __all__ = [
     "SandboxExecutor",
     "spec_from_env",
     "build_network_plan",
+    "container_path",
     "discover_fixture_mounts",
     "filter_boundary_env",
     "container_name_for_workspace",
@@ -362,6 +363,44 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
     return mounts
 
 
+def container_path(workspace: str | os.PathLike[str], path: str | os.PathLike[str]) -> str:
+    """Map a host path under ``workspace`` to the path the container sees.
+
+    Module-level, not just a method, because a harness has to translate paths
+    *before* it hands them over: a value like ``OPENCLAW_STATE_DIR`` crosses the
+    boundary inside the env overlay, and the host spelling means nothing on the
+    other side. The executor's ``cwd`` mapping and these value translations must
+    agree, so they share one implementation.
+
+    Anything outside the workspace raises: the alternative would be to grow the
+    mount set to make the path exist, and the mount set is the boundary — it
+    only ever widens through an explicit spec field, never as a side effect of a
+    call site's ``cwd`` or an env value.
+
+    Args:
+        workspace: The run's host workspace, mounted at ``/workspace``.
+        path: A host path expected to live under it.
+
+    Returns:
+        The container-side absolute path.
+
+    Raises:
+        SandboxError: When ``path`` is not under ``workspace``.
+    """
+    resolved = Path(path).resolve()
+    root = Path(workspace).resolve()
+    if resolved == root:
+        return CONTAINER_WORKSPACE
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise SandboxError(
+            f"host path {resolved} is outside the sandbox workspace {root} "
+            "and has no container mapping; refusing to widen the mount set"
+        ) from exc
+    return f"{CONTAINER_WORKSPACE}/{relative.as_posix()}"
+
+
 def _env_denied(name: str) -> bool:
     return name in _DENIED_ENV_NAMES or name.startswith(_DENIED_ENV_PREFIXES)
 
@@ -436,25 +475,8 @@ class SandboxExecutor:
         self.container_name = container_name_for_workspace(self._workspace)
 
     def map_host_path(self, path: str | os.PathLike[str]) -> str:
-        """Map a host path under the workspace to its container-side path.
-
-        Anything outside the workspace raises: the alternative would be to
-        grow the mount set to make the path exist, and the mount set is the
-        boundary — it only ever widens through an explicit spec field, never
-        as a side effect of a call site's ``cwd``.
-        """
-        resolved = Path(path).resolve()
-        workspace = self._workspace.resolve()
-        if resolved == workspace:
-            return CONTAINER_WORKSPACE
-        try:
-            relative = resolved.relative_to(workspace)
-        except ValueError as exc:
-            raise SandboxError(
-                f"host path {resolved} is outside the sandbox workspace {workspace} "
-                "and has no container mapping; refusing to widen the mount set"
-            ) from exc
-        return f"{CONTAINER_WORKSPACE}/{relative.as_posix()}"
+        """Map a host path under this executor's workspace to its container path."""
+        return container_path(self._workspace, path)
 
     def wrap_argv(
         self,

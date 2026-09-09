@@ -721,3 +721,41 @@ def test_gemini_declares_sandbox_support() -> None:
     assert GeminiCliAgent.supports_sandbox is True
     # The base default stays False so a new harness must opt in explicitly.
     assert AgentHarness.supports_sandbox is False
+
+
+# --- container_path: harnesses translate values, not just cwd ----------------
+
+
+def test_container_path_maps_a_workspace_child(tmp_path) -> None:
+    # An env value like OPENCLAW_STATE_DIR crosses the boundary inside the
+    # overlay, so the harness has to translate it before handing it over; the
+    # host spelling means nothing on the other side.
+    assert sandbox.container_path(tmp_path, tmp_path / "state") == "/workspace/state"
+
+
+def test_container_path_maps_the_workspace_root(tmp_path) -> None:
+    assert sandbox.container_path(tmp_path, tmp_path) == "/workspace"
+
+
+def test_container_path_refuses_a_path_outside_the_workspace(tmp_path) -> None:
+    # Widening the mount set is the only way to make such a path exist, and the
+    # mount set is the boundary.
+    outside = tmp_path.parent / "elsewhere"
+    with pytest.raises(SandboxError, match="outside the sandbox workspace"):
+        sandbox.container_path(tmp_path, outside)
+
+
+def test_every_cli_harness_declares_sandbox_support() -> None:
+    """All four CLI harnesses route their agent turn through the seam.
+
+    A harness that does not is refused outright by ``AgentHarness.run`` when the
+    sandbox flag is on, so this is what stops a "sandboxed" matrix from silently
+    skipping an arm.
+    """
+    from devops_bench.agents.cli.antigravity.agent import AgyCliAgent
+    from devops_bench.agents.cli.claude_code.agent import ClaudeCodeAgent
+    from devops_bench.agents.cli.gemini_cli.agent import GeminiCliAgent
+    from devops_bench.agents.cli.openclaw.agent import OpenClawAgent
+
+    for cls in (AgyCliAgent, ClaudeCodeAgent, GeminiCliAgent, OpenClawAgent):
+        assert cls.supports_sandbox is True, f"{cls.__name__} is not wired onto the seam"
