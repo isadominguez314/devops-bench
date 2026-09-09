@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shlex
 import textwrap
 import threading
@@ -57,8 +58,18 @@ _log = get_logger("chaos.generate_load")
 # active. The harness watches the shared event to coordinate measurements.
 _LOAD_MARKER = "fortio load"
 
-# Wall-clock ceiling for a single chaos command.
+# Wall-clock ceiling for a single chaos command that is not a load spike.
 _COMMAND_TIMEOUT = 40
+
+# A load spike has to outlive its own ``-t`` duration, so its ceiling is derived
+# from the command rather than fixed. The flat 40s ceiling silently killed every
+# spike a task declared for longer than that: optimize-scale asks for 300s
+# deliberately (so the spike is still running when verification starts), fortio
+# was SIGKILLed at 40s, the fault recorded exit -1, and the run was scored
+# ``chaos_invalidated`` with the reason "load did not reach the workload" — which
+# reads as unreachable rather than cut short.
+_LOAD_TIMEOUT_SLACK_SEC = 60
+_LOAD_TIMEOUT_CEILING_SEC = 900
 
 # The workload's in-cluster (remote) port for chaos load generation, and the
 # default local side of the port-forward. Parallel runs override only the local
@@ -83,6 +94,41 @@ _ENV_LOCAL_PORT = "CHAOS_LOCAL_PORT"
 # limits) just before the spike, triggering a rolling update; without this wait
 # the port-forward can race a not-yet-Ready pod and exit early (code 1).
 _TARGET_READY_TIMEOUT_SEC = 120
+
+
+def _go_duration_seconds(value: str) -> float | None:
+    """Parse a Go-style duration (``300s``, ``5m``, ``1h30m``) into seconds.
+
+    fortio takes its ``-t`` in Go's format. Returns ``None`` for anything not
+    understood, so the caller falls back to the fixed ceiling rather than
+    inventing a budget from a value it misread.
+    """
+    parts = re.findall(r"([0-9]*\.?[0-9]+)\s*(ms|h|m|s)", value.strip())
+    if not parts:
+        return None
+    unit = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+    total = 0.0
+    for amount, suffix in parts:
+        total += float(amount) * unit[suffix]
+    return total or None
+
+
+def _command_timeout(argv: list[str], *, is_load: bool) -> float:
+    """Wall-clock ceiling for this command.
+
+    A load spike gets its declared duration plus slack (bounded), so the
+    generator is never killed mid-spike. Everything else keeps the flat
+    ceiling.
+    """
+    if not is_load:
+        return _COMMAND_TIMEOUT
+    for index, token in enumerate(argv):
+        if token == "-t" and index + 1 < len(argv):
+            declared = _go_duration_seconds(argv[index + 1])
+            if declared is None:
+                break
+            return min(declared + _LOAD_TIMEOUT_SLACK_SEC, _LOAD_TIMEOUT_CEILING_SEC)
+    return _COMMAND_TIMEOUT
 
 
 def build_system_instruction(target_url: str = _DEFAULT_TARGET_URL) -> str:
@@ -199,7 +245,7 @@ def run_chaos_command(
             _log.info("load spike detected; signaling harness via chaos event")
             chaos_active_event.set()
 
-        completed = run(argv, check=False, timeout=_COMMAND_TIMEOUT)
+        completed = run(argv, check=False, timeout=_command_timeout(argv, is_load=is_load))
         if is_load and load_result is not None:
             # Record the spike's real exit status so the fault can fail closed:
             # a non-zero fortio exit means it could not reach the workload.
