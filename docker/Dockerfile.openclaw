@@ -1,0 +1,138 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Sandbox image for the OpenClaw agent harness (BENCH_SANDBOX_IMAGE).
+#
+# Sibling of Dockerfile.gemini-cli and deliberately a separate image, not a
+# shared multi-stage base with per-agent targets: the CLIs pin their own
+# runtimes, and a version bump for one agent would otherwise invalidate the
+# others' A/B baselines.
+#
+# Contents are the tools a task may legitimately need inside the boundary. The
+# agent's cluster credential, workspace, and fixtures are mounted at run time
+# by devops_bench/agents/sandbox.py, never baked in here.
+
+FROM node:22-slim
+
+# Versions are pinned so a rebuild reproduces the image an A/B arm was scored
+# with; bump them deliberately and re-baseline.
+#
+# kubectl and helm match fleet/pins.yaml's tools block, so the agent inside the
+# boundary sees the same versions the executor uses outside it.
+ARG KUBECTL_VERSION=v1.36.4
+ARG HELM_VERSION=v3.21.4
+
+# OPENCLAW_VERSION and ANTHROPIC_VERTEX_PROVIDER_VERSION are a matched
+# core+plugin pair and must be bumped together. 2026.9.1-beta.1 is the earliest
+# pairing confirmed live to work end to end, and the reasons are worth keeping:
+#
+#   openclaw@2026.7.1 (npm "latest" at the time): the plugin's bundled
+#     @anthropic-ai/vertex-sdk + gaxios/google-auth-library combination throws
+#     inside its JWT token-exchange flow, so every run fails with "Failed to
+#     acquire Google OAuth credentials" (openclaw/openclaw#107341).
+#   openclaw@2026.7.2-beta.7 (first release carrying that fix): a separate bug.
+#     The plugin's "activation": {"onStartup": false} manifest flag makes
+#     `oc plugins list` (and the synthetic-auth provider discovery sharing its
+#     code) skip anthropic-vertex entirely, so it never reaches the auth hook.
+#   openclaw@2026.9.1-beta.1: discovery is fixed, and this is the first version
+#     where the per-agent SQLite auth-profile store is fully wired for
+#     anthropic-vertex. It is also the version gpt-5.6-sol was confirmed live
+#     on, which is what this image is built to run.
+#
+# Note this is AHEAD of fleet/pins.yaml's tools.openclaw (2026.8.1-beta.3),
+# which pins the `oc` binary installed on the executor host. A sandboxed run
+# uses the version below and an unsandboxed run uses the host's, so those two
+# want reconciling before results from both are compared.
+ARG OPENCLAW_VERSION=2026.9.1-beta.1
+ARG ANTHROPIC_VERTEX_PROVIDER_VERSION=2026.9.1-beta.1
+
+# ripgrep and jq are what the agent's own search and JSON handling reach for.
+#
+# The bookworm-backports line is inherited from Dockerfile.gemini-cli. Verify
+# before relying on it: as built today the resulting git is 1:2.39.5-0+deb12u3,
+# plain bookworm rather than backports, so any task needing a git feature newer
+# than 2.39 (reftable, for instance) will not find it here.
+RUN echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        jq \
+        ripgrep \
+    && apt-get install -y -t bookworm-backports --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# kubectl and helm: resolve the arch from the build platform rather than
+# hardcoding amd64, so the image builds on an arm64 laptop as well as the
+# x86 bastion.
+RUN arch="$(dpkg --print-architecture)" \
+    && curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" \
+    && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl \
+    && rm kubectl \
+    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
+        | tar -xz -C /tmp \
+    && install -o root -g root -m 0755 "/tmp/linux-${arch}/helm" /usr/local/bin/helm \
+    && rm -rf "/tmp/linux-${arch}"
+
+RUN npm install -g "openclaw@${OPENCLAW_VERSION}" \
+    && npm cache clean --force
+
+# openclaw's package.json registers its bin as `openclaw`, not `oc`. The `oc`
+# name is a convention the harness's own tooling relies on (see
+# devops_bench/agents/cli/openclaw/agent.py's `_resolve_oc_bin`), not something
+# npm sets up. Without this symlink `oc` resolves to nothing inside the image
+# and every sandboxed run fails looking for the binary.
+RUN ln -s "$(command -v openclaw)" /usr/local/bin/oc
+
+# anthropic-vertex (Claude on Vertex, e.g. claude-fable-5) is a separately
+# published plugin rather than one of openclaw's bundled "stock" plugins.
+# gpt-5.6-sol does not need it, but installing it here keeps one image able to
+# serve both arms instead of forcing a second openclaw image per provider.
+#
+# Install it with `npm install -g` into the SAME global prefix as openclaw,
+# not with `oc plugins install`. npm then dedupes the "openclaw" peer
+# dependency against the already-installed global package instead of vendoring
+# its own node_modules/openclaw symlink, so there is no self-referencing
+# symlink to trip openclaw's "Symlink escapes plugin root" guard or to recurse
+# into when the state directory is copied.
+# Installing it is not enough: openclaw only discovers plugins under its own
+# stock extensions root, so a package sitting in the global node_modules is
+# never registered and `oc plugins list` does not show it. Copy it into that
+# root, then drop the npm copy so there is one on-disk copy rather than two
+# that can drift. The grep is a build-time assert: without it a plugin that
+# silently fails to register only surfaces as a failed run.
+RUN npm install -g "@openclaw/anthropic-vertex-provider@${ANTHROPIC_VERTEX_PROVIDER_VERSION}" \
+    && src="$(npm root -g)/@openclaw/anthropic-vertex-provider" \
+    && dest="$(npm root -g)/openclaw/dist/extensions/anthropic-vertex" \
+    && mkdir -p "${dest}" \
+    && cp -a "${src}/." "${dest}/" \
+    && npm uninstall -g "@openclaw/anthropic-vertex-provider" \
+    && npm cache clean --force \
+    && oc plugins list 2>&1 | grep -q "anthropic-vertex"
+
+# Fail the build rather than ship an image whose `oc` is missing or is not the
+# pinned version, which would otherwise only surface as a failed run.
+RUN oc --version
+
+# The sandbox wrapper mounts the per-run workspace at /workspace, repoints HOME
+# to /workspace/home so a bare "~" cannot reach the operator's profile, and on
+# Linux runs the container as the host user's uid:gid so files written to the
+# mount are owned correctly (devops_bench/agents/sandbox.py). That uid does not
+# exist in /etc/passwd here, so create the mount points world-writable and set
+# HOME to the same path the wrapper does, rather than relying on a passwd
+# lookup that will not resolve.
+RUN mkdir -p /workspace/home \
+    && chmod 0777 /workspace /workspace/home
+ENV HOME=/workspace/home
+
+WORKDIR /workspace
