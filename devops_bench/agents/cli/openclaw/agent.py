@@ -139,7 +139,15 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 # catalog; the harness registers these per-run (see :func:`_build_model_override`).
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
 _CATALOG_OVERRIDES: frozenset[str] = frozenset(
-    {"gemini-3.5-flash", "gemini-3.7-flash", "claude-sonnet-5", "claude-fable-5", "claude-opus-5"}
+    {
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "claude-fable-5-1",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-5",
+    }
 )
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
