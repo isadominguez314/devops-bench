@@ -41,6 +41,12 @@ _log = core.get_logger("agents.cli.antigravity")
 
 _GCLOUD_LOOKUP_TIMEOUT_SEC = 10
 
+# The image ships its own agy on PATH; the host binary path is meaningless
+# inside the container. Same idiom as openclaw's _CONTAINER_OC_BIN — without
+# it, _resolve_binary's host fallback (~/.local/bin/agy, or an absolute
+# AGENT_TARGET) crosses the boundary verbatim in argv[0] and fails to exec.
+_CONTAINER_AGY_BIN = "agy"
+
 # agy flushes usage to the conversation DB asynchronously after process exit;
 # poll briefly for the rows before giving up.
 _DB_FLUSH_POLL_ATTEMPTS = 10
@@ -263,6 +269,9 @@ class AgyCliAgent(base.AgentHarness):
             spec = self.config.sandbox
             if spec is not None and spec.workspace is not None:
                 gemini_dir_arg = sandbox_mod.container_path(spec.workspace, gemini_dir)
+                # The host binary path means nothing inside the image, which
+                # ships its own agy on PATH.
+                binary = _CONTAINER_AGY_BIN
             argv = [
                 binary,
                 "--dangerously-skip-permissions",
