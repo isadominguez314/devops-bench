@@ -382,10 +382,17 @@ every run). The token behind it is minted by impersonating a service account
 that holds `roles/aiplatform.user` and nothing else, refilled in place, and
 never minted at all if the run does not call the model.
 
-Only the token-related paths are served; everything else is a 404, so this is an
-emulator of three endpoints and not a proxy onto the host's real metadata
-server. Requests must carry `Metadata-Flavor: Google`, as the real server
-requires.
+The route table is fixed and closed: the residency ping, `project/project-id`,
+`universe/universe-domain`, and the service-account subtree (the account
+listing, plus `email`, `scopes`, `aliases`, `token` and the recursive listing,
+under both the `default` alias and the account's own email). Everything else is
+a 404 — including `instance/attributes/`, which on a real GKE node carries
+`kube-env`; the instance identity paths (`id`, `zone`, `hostname`, `disks`,
+`network-interfaces`); any account other than the impersonated one; and the
+`identity?audience=` OIDC-JWT issuer. So this is an emulator of an enumerated
+set of paths, not a proxy onto the host's real metadata server: a container that
+probes it learns nothing about the host it is running on. Requests must carry
+`Metadata-Flavor: Google`, as the real server requires.
 
 Two things have to be set up before a sandboxed Vertex run:
 
