@@ -1020,6 +1020,30 @@ def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
     assert calls == []
 
 
+def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unsandboxed runs use the host's own ADC; no emulator is started."""
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(
+        oc_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called on an unsandboxed run"),
+    )
+    captured: dict = {}
+
+    def fake_bash(cmd, **kwargs):
+        captured["env"] = kwargs.get("extra_env") or {}
+        return _make_subprocess_result(stdout="ok", returncode=0)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+    cfg = AgentConfig(target=str(tmp_path / "oc"), provider="google-vertex")
+    OpenClawAgent(cfg).run("p")
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(
+        captured["env"]
+    )
+
+
 @pytest.mark.parametrize(
     "model,provider,transport",
     [
