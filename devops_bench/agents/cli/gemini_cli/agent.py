@@ -48,7 +48,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     materialize_skills,
 )
 from devops_bench.core import SubprocessError, get_logger
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
@@ -155,6 +155,15 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     (``GOOGLE_GENAI_USE_VERTEXAI`` plus project/location), since the SDK
     otherwise talks to the Gemini API regardless of the configured provider.
 
+    Vertex is also keyless: it authenticates through Application Default
+    Credentials, which exist for a host process and deliberately do not exist
+    inside the sandbox. A sandboxed Vertex run therefore additionally gets the
+    backend's mint-and-inject credential recipe
+    (:func:`~devops_bench.core.model_providers.sandbox_credential_env`) — the
+    metadata-emulator vars pointing at a host-side server serving a narrowly
+    scoped, short-lived token. An unsandboxed run does not call it at all, so
+    the flag-off path stays byte-for-byte unchanged.
+
     Args:
         config: Resolved :class:`AgentConfig` for this run.
 
@@ -162,7 +171,8 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         A mapping suitable for ``core.subprocess.run``'s ``extra_env``.
 
     Raises:
-        ConfigError: If ``config.provider`` is not a known provider.
+        ConfigError: If ``config.provider`` is not a known provider, or a
+            sandboxed keyless run cannot be given a model credential.
     """
     # Resolve unconditionally so an unknown provider fails loud even on a keyless
     # (Vertex/ADC) run, not only when a key happens to be set.
@@ -189,6 +199,8 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
             or os.environ.get("GCP_LOCATION")
             or "us-central1"
         )
+        if config.sandbox is not None:
+            overlay.update(sandbox_credential_env(spec, project=project))
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
