@@ -77,7 +77,7 @@ from devops_bench.agents.shared.cli_capabilities import (
 )
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
@@ -456,7 +456,13 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
 
 
 def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
-    """Forward explicit provider routing and enable metadata auth in the image."""
+    """Forward explicit provider routing and enable metadata auth in the image.
+
+    Only the sandboxed branch of :meth:`OpenClawAgent._execute` calls this, so
+    there is no ``config.sandbox`` guard around the credential recipe below —
+    being called at all already means the run is sandboxed. (The gemini
+    harness needs that guard because its ``_build_env`` serves both paths.)
+    """
     overlay = {
         name: os.environ[name]
         for name in (
@@ -474,6 +480,17 @@ def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
     if _oc_provider_or_none(config) == "anthropic-vertex":
         overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
         overlay.setdefault("GOOGLE_CLOUD_API_KEY", "gcp-vertex-credentials")
+    spec = resolve_provider(config.provider)
+    if spec.backend == "vertex" and not config.api_key:
+        # The metadata auth prepared above still needs a server to answer it:
+        # the sandbox blocks the real metadata endpoint, so a keyless Vertex
+        # run points the SDKs at the host-side emulator credential instead. A
+        # run that *did* provide a key already carries its credential across
+        # the boundary (a google-vertex key rides GOOGLE_CLOUD_API_KEY via
+        # _build_env) and must keep working without BENCH_VERTEX_SANDBOX_SA.
+        # Same project spellings as the forwarding block above.
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT_ID")
+        overlay.update(sandbox_credential_env(spec, project=project))
     return overlay
 
 

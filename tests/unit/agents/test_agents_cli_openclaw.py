@@ -1040,11 +1040,119 @@ def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
 ) -> None:
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/host.json")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
     overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="anthropic-vertex"), tmp_path)
     assert overlay["GOOGLE_CLOUD_PROJECT"] == "test-project"
     assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in overlay
     assert (tmp_path / "node-fetch-shim" / "register.mjs").is_file()
+
+
+def test_sandbox_provider_env_vertex_injects_the_metadata_emulator_vars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Inside the sandbox there is no ADC and the real metadata endpoint is
+    # blocked, so the backend's mint-and-inject recipe supplies the credential.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    seen: dict = {}
+
+    def fake_recipe(spec, *, project=None):
+        seen["backend"] = spec.backend
+        seen["project"] = project
+        return {
+            "GCE_METADATA_HOST": "host.docker.internal:41235",
+            "GCE_METADATA_IP": "host.docker.internal:41235",
+            "METADATA_SERVER_DETECTION": "assume-present",
+        }
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", fake_recipe)
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+
+    assert seen == {"backend": "vertex", "project": "proj-a"}
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41235"
+    assert overlay["GCE_METADATA_IP"] == "host.docker.internal:41235"
+    assert overlay["METADATA_SERVER_DETECTION"] == "assume-present"
+    # The recipe rides alongside the routing vars, it does not replace them.
+    assert overlay["GOOGLE_CLOUD_PROJECT"] == "proj-a"
+
+
+def test_sandbox_provider_env_anthropic_vertex_gets_the_recipe_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # anthropic-vertex shares the vertex backend, and the project falls back to
+    # the GCP_PROJECT_ID spelling the forwarding block reads.
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj-b")
+    seen: dict = {}
+
+    def fake_recipe(spec, *, project=None):
+        seen["backend"] = spec.backend
+        seen["project"] = project
+        return {"GCE_METADATA_HOST": "host.docker.internal:41235"}
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", fake_recipe)
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="anthropic-vertex"), tmp_path)
+
+    assert seen == {"backend": "vertex", "project": "proj-b"}
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41235"
+    assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
+
+
+def test_sandbox_provider_env_non_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A key-based provider carries its own credential across the boundary.
+    monkeypatch.setattr(
+        oc_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called for a key-based provider"),
+    )
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google"), tmp_path)
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(overlay)
+
+
+def test_sandbox_provider_env_keyed_vertex_skips_the_recipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A sandboxed google-vertex run with an explicit key was a working
+    # configuration before the recipe existed (the key rides
+    # GOOGLE_CLOUD_API_KEY via _build_env); it must not start requiring
+    # BENCH_VERTEX_SANDBOX_SA.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(
+        oc_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called for a keyed run"),
+    )
+    overlay = oc_mod._sandbox_provider_env(
+        AgentConfig(provider="google-vertex", api_key="k"), tmp_path
+    )
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(overlay)
+
+
+def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Flag off must stay byte-for-byte the old behaviour: the host process has
+    # ADC of its own, so the recipe is not consulted and no emulator is started.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(
+        oc_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called on an unsandboxed run"),
+    )
+    captured: dict = {}
+
+    def fake_bash(cmd, **kwargs):
+        captured["env"] = kwargs.get("extra_env") or {}
+        return _make_subprocess_result(stdout="ok", returncode=0)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+    cfg = AgentConfig(target=str(tmp_path / "oc"), provider="google-vertex")
+    OpenClawAgent(cfg).run("p")
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(
+        captured["env"]
+    )
 
 
 @pytest.mark.parametrize(
