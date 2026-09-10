@@ -52,6 +52,7 @@ the agent on the host.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -60,7 +61,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from devops_bench.core import ClusterInfo, NetworkPlan, get_env, get_logger
-from devops_bench.core.errors import SandboxError
+from devops_bench.core.errors import SandboxError, SubprocessError
 from devops_bench.core.subprocess import CompletedProcess, run
 from devops_bench.k8s import kubectl
 
@@ -103,6 +104,31 @@ FIXTURES_ENV = "BENCH_AGENT_FIXTURES"
 CONTAINER_WORKSPACE = "/workspace"
 CONTAINER_HOME = f"{CONTAINER_WORKSPACE}/home"
 CONTAINER_KUBECONFIG = "/creds/kubeconfig"
+
+# Docker rejects ``--user`` ids above int32 max ("uids and gids must be in
+# range 0-2147483647") and refuses to start the container AT ALL: no ``start``
+# event, exit code 125. Identities minted by an external IdP (GCP Cloud
+# Identity, Workspace external users, most LDAP setups) routinely exceed this,
+# so it is not an exotic case to guard against.
+#
+# Dropping ``--user`` when this happens (running the agent container as its
+# image's default user, root) was considered and rejected: it trades a
+# boundary failure for a silent containment downgrade. The untrusted agent
+# under test would gain root inside the very boundary this module exists to
+# enforce, and it would leave root-owned files in the operator's home and
+# workspace that teardown cannot remove without sudo (observed live). So when
+# an id is out of range we remap instead of degrading; see ``_REMAP_UID`` /
+# ``_REMAP_GID`` and ``SandboxExecutor._needs_id_remap``.
+_MAX_CONTAINER_ID = 2**31 - 1
+
+# The unprivileged, in-range id the agent container runs as when the caller's
+# real uid or gid cannot be passed to ``--user``. 1000 is not arbitrary: it is
+# the ``node`` user baked into the ``node:22-slim`` base these sandbox images
+# build on, so the remap lands on a real named unprivileged user rather than
+# an anonymous id. The agent stays unprivileged either way, which is the
+# property this module protects; only the specific id changes.
+_REMAP_UID = 1000
+_REMAP_GID = 1000
 
 # Every sandboxed container this harness starts carries this name prefix,
 # followed by its run workspace's own directory name (see
@@ -478,6 +504,91 @@ class SandboxExecutor:
         """Map a host path under this executor's workspace to its container path."""
         return container_path(self._workspace, path)
 
+    def _needs_id_remap(self) -> bool:
+        """Whether the caller's uid/gid must be remapped for ``--user``.
+
+        Only asked on Linux (macOS never passes ``--user`` at all). ``True``
+        when either id exceeds Docker's int32 ``--user`` limit, which is
+        exactly the case docker itself would otherwise refuse to start a
+        container over.
+        """
+        return os.getuid() > _MAX_CONTAINER_ID or os.getgid() > _MAX_CONTAINER_ID
+
+    def _remap_mounts(self) -> list[tuple[str, str]]:
+        """Host path -> container path for every mount a chown pass must cover.
+
+        The workspace, the generated kubeconfig, and every fixture mount (see ``discover_fixture_mounts``):
+        fixtures live outside the workspace, in the operator's home, so a chown
+        of the workspace alone would strand them exactly as un-owned as before.
+        """
+        spec = self.spec
+        return [
+            (str(spec.workspace), CONTAINER_WORKSPACE),
+            (str(spec.kubeconfig), CONTAINER_KUBECONFIG),
+            *spec.fixture_mounts.items(),
+        ]
+
+    def _chown_argv(self, uid: int, gid: int) -> list[str]:
+        """``docker run`` argv for a throwaway root container that chowns every
+        remap mount to ``uid:gid``.
+
+        Runs from the same sandbox image as the agent container (no extra pull)
+        and carries no ``--user``, so it runs as root, the only user that can
+        chown arbitrary ids either direction (including up past int32, which
+        plain ``chown`` has no restriction on, unlike docker's ``--user``).
+        """
+        argv = ["docker", "run", "--rm"]
+        targets: list[str] = []
+        for host_path, mount_path in self._remap_mounts():
+            argv += ["-v", f"{host_path}:{mount_path}"]
+            targets.append(mount_path)
+        argv += [self.spec.image, "chown", "-R", f"{uid}:{gid}", *targets]
+        return argv
+
+    def _chown_before_remap(self) -> None:
+        """Chown the workspace and fixtures to ``_REMAP_UID:_REMAP_GID`` before
+        the agent container starts.
+
+        Fatal on failure: running on without it means the remapped, unprivileged
+        agent container cannot write a workspace it does not own, and the run
+        would produce a misleading result instead of an honest refusal.
+        """
+        argv = self._chown_argv(_REMAP_UID, _REMAP_GID)
+        try:
+            run(argv, check=True)
+        except SubprocessError as exc:
+            raise SandboxError(
+                f"could not chown the workspace/fixtures to {_REMAP_UID}:{_REMAP_GID} "
+                "before starting the id-remapped agent container; running on would "
+                "hand an unprivileged agent a workspace it cannot write, so refusing "
+                "rather than produce a misleading result"
+            ) from exc
+
+    def _chown_after_remap(self) -> None:
+        """Chown the workspace and fixtures back to the real host uid/gid after
+        the agent container exits.
+
+        Best-effort and never raises: a failure here must not mask a real agent
+        result, but it does leave the artifacts owned by the remap id rather
+        than the operator, who then cannot read or delete them without root. So
+        it is logged as an error carrying the exact repair command to run by
+        hand.
+        """
+        uid, gid = os.getuid(), os.getgid()
+        argv = self._chown_argv(uid, gid)
+        try:
+            run(argv, check=True)
+        except SubprocessError:
+            _log.error(
+                "could not chown the workspace/fixtures back to %s:%s after the "
+                "id-remapped agent container exited; the artifacts are left owned "
+                "by the remap id and the operator cannot read or delete them "
+                "without root. Repair manually: %s",
+                uid,
+                gid,
+                " ".join(argv),
+            )
+
     def wrap_argv(
         self,
         cmd: Sequence[str | os.PathLike[str]],
@@ -510,7 +621,10 @@ class SandboxExecutor:
         for host_entry in spec.network.extra_hosts:
             argv += ["--add-host", host_entry]
         if sys.platform.startswith("linux"):
-            argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
+            uid, gid = (
+                (_REMAP_UID, _REMAP_GID) if self._needs_id_remap() else (os.getuid(), os.getgid())
+            )
+            argv += ["--user", f"{uid}:{gid}"]
         argv += ["-v", f"{spec.workspace}:{CONTAINER_WORKSPACE}"]
         argv += ["-v", f"{spec.kubeconfig}:{CONTAINER_KUBECONFIG}:ro"]
         for host_path, container_path in spec.fixture_mounts.items():
@@ -572,21 +686,31 @@ class SandboxExecutor:
                 "the sandboxed agent runs without stdin (no -i, by design); input= is unsupported"
             )
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=extra_env)
+        remap = sys.platform.startswith("linux") and self._needs_id_remap()
+        if remap:
+            self._chown_before_remap()
         try:
             return run(wrapped, check=check, capture=capture, text=text, timeout=timeout)
         finally:
-            kill_container(self.container_name)
+            try:
+                kill_container(self.container_name)
+            finally:
+                if remap:
+                    self._chown_after_remap()
 
 
 def container_name_for_workspace(workspace: Path) -> str:
     """Deterministic ``docker run --name`` for one run's sandboxed agent.
 
     Ties the container 1:1 to the run's own workspace directory name (already
-    unique per run), so a reaper can find and kill a stray container purely
-    from its name, without threading a separate run id through the agent
-    harness.
+    unique per run: it comes from ``mint_dir(...)`` / ``TemporaryDirectory``),
+    so a reaper can find and kill a stray container purely from its name,
+    without threading a separate run id through the agent harness.
     """
-    return f"{_CONTAINER_NAME_PREFIX}{workspace.name}"
+    owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
+    if owner and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
+        raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
+    return f"{_CONTAINER_NAME_PREFIX}{owner + '-' if owner else ''}{workspace.name}"
 
 
 def kill_container(name: str) -> None:
@@ -601,27 +725,21 @@ def kill_container(name: str) -> None:
 
 
 def sweep_stray_containers() -> None:
-    """Best-effort reap of containers this harness left running from a prior run.
+    """Reap only the explicitly selected attempt's leftovers.
 
-    Intended to run once at harness start (before any run's own container
-    exists) so a container orphaned by a prior crash or a killed harness
-    process gets cleaned up before it burns any more quota. Matches
-    exclusively on this benchmark's own name prefix, so it can never reap a
-    container some other tool created — but the prefix is shared across
-    benchmark processes, so this assumes it is the only harness on the host:
-    a *sibling* harness's live agent container matches too. Callers running
-    parallel harnesses must not sweep (see the eval harness's
-    ``BENCH_PARALLEL`` gate).
+    A shared name prefix is not proof that another process has exited. Legacy
+    unscoped containers require explicit operator recovery; never sweep them here.
+    The owner ID must be unique per attempt and must not be reused concurrently.
     """
-    listed = run(
-        ["docker", "ps", "-q", "--filter", f"name=^{_CONTAINER_NAME_PREFIX}"],
-        check=False,
-    )
+    owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
+    if not owner:
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
+        raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
+    prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-"
+    listed = run(["docker", "ps", "--format", "{{.Names}}"], check=False)
     if listed.returncode != 0:
         return
-    for container_id in (listed.stdout or "").split():
-        result = run(["docker", "kill", container_id], check=False)
-        if result.returncode == 0:
-            _log.warning(
-                "reaped stray sandbox container %s left running from a prior run", container_id
-            )
+    for name in (listed.stdout or "").splitlines():
+        if name.startswith(prefix):
+            kill_container(name)

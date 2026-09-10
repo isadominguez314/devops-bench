@@ -382,3 +382,17 @@ working for them.
 
 Want to wrap a different agent? See
 [Add an agent harness](../how-to/add-an-agent-harness.md).
+
+### Concurrent sandbox runs and external user IDs
+
+A caller may set `BENCH_AGENT_SANDBOX_OWNER` to a unique alphanumeric attempt ID
+(underscores allowed). Agent container names then include that ID; startup
+recovery only reaps containers belonging to the same owner. Never reuse an owner
+for concurrent attempts. Without an owner, startup recovery is a no-op; legacy
+orphans require explicit operator recovery.
+
+For host IDs above Docker's signed 32-bit limit, the sandbox runs as 1000:1000.
+Ownership remapping covers the workspace, fixture mounts and the generated
+single-cluster kubeconfig, then restores the host ownership after execution.
+The agent's kubeconfig mount remains read-only. Provider authentication uses
+explicit overlays; host credential files are not copied into the sandbox.
