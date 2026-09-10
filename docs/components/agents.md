@@ -396,3 +396,11 @@ Ownership remapping covers the workspace, fixture mounts and the generated
 single-cluster kubeconfig, then restores the host ownership after execution.
 The agent's kubeconfig mount remains read-only. Provider authentication uses
 explicit overlays; host credential files are not copied into the sandbox.
+
+
+OpenClaw's per-run catalog also registers `gemini-3.8-flash` with the `google`
+or `google-vertex` provider, and `claude-fable-5-1` with `anthropic-vertex`.
+Select them with `AGENT_MODEL` and `AGENT_PROVIDER`; the harness pins the matching
+transport in the isolated run configuration. Model IDs follow the
+[Gemini documentation](https://ai.google.dev/gemini-api/docs/latest-model) and
+[Claude on Vertex documentation](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/fable-5-1).

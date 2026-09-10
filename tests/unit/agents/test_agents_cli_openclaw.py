@@ -1045,3 +1045,21 @@ def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
     assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in overlay
     assert (tmp_path / "node-fetch-shim" / "register.mjs").is_file()
+
+
+@pytest.mark.parametrize(
+    "model,provider,transport",
+    [
+        ("gemini-3.8-flash", "google", "google-generative-ai"),
+        ("gemini-3.8-flash", "google-vertex", "google-vertex"),
+        ("claude-fable-5-1", "anthropic-vertex", "anthropic-messages"),
+    ],
+)
+def test_latest_models_have_per_run_catalog_and_transport(
+    model: str, provider: str, transport: str
+) -> None:
+    override = _build_model_override(AgentConfig(model=model, provider=provider))
+    entry = override["models"]["providers"][provider]
+    assert entry["models"] == [{"id": model, "name": model}]
+    assert entry["api"] == transport
+    assert override["agents"]["defaults"]["models"] == {f"{provider}/{model}": {}}
