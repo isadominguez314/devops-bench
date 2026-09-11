@@ -477,6 +477,34 @@ def test_wrap_argv_never_forwards_denied_env(tmp_path: Path) -> None:
     assert "BENCH_AGENT_SANDBOX" not in joined
 
 
+def test_wrap_argv_injects_the_spec_cloud_credential_env(tmp_path: Path) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok",
+            "GOOGLE_OAUTH_ACCESS_TOKEN": "tok",
+        },
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy", "-p", "hi"])
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN=tok" in argv
+    assert "GOOGLE_OAUTH_ACCESS_TOKEN=tok" in argv
+    # Container-owned env still trails it, so it can never repoint HOME.
+    assert argv.index("HOME=/workspace/home") > argv.index("CLOUDSDK_AUTH_ACCESS_TOKEN=tok")
+
+
+def test_wrap_argv_drops_container_owned_names_from_the_cloud_credential_env(
+    tmp_path: Path,
+) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={"HOME": "/elsewhere", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"},
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy"])
+    assert "HOME=/elsewhere" not in argv
+    assert "HOME=/workspace/home" in argv
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN=tok" in argv
+
+
 def test_wrap_argv_mounts_fixtures_read_write(tmp_path: Path) -> None:
     executor = sandbox.SandboxExecutor(
         _complete_spec(
@@ -721,3 +749,41 @@ def test_gemini_declares_sandbox_support() -> None:
     assert GeminiCliAgent.supports_sandbox is True
     # The base default stays False so a new harness must opt in explicitly.
     assert AgentHarness.supports_sandbox is False
+
+
+# --- container_path: harnesses translate values, not just cwd ----------------
+
+
+def test_container_path_maps_a_workspace_child(tmp_path) -> None:
+    # An env value like OPENCLAW_STATE_DIR crosses the boundary inside the
+    # overlay, so the harness has to translate it before handing it over; the
+    # host spelling means nothing on the other side.
+    assert sandbox.container_path(tmp_path, tmp_path / "state") == "/workspace/state"
+
+
+def test_container_path_maps_the_workspace_root(tmp_path) -> None:
+    assert sandbox.container_path(tmp_path, tmp_path) == "/workspace"
+
+
+def test_container_path_refuses_a_path_outside_the_workspace(tmp_path) -> None:
+    # Widening the mount set is the only way to make such a path exist, and the
+    # mount set is the boundary.
+    outside = tmp_path.parent / "elsewhere"
+    with pytest.raises(SandboxError, match="outside the sandbox workspace"):
+        sandbox.container_path(tmp_path, outside)
+
+
+def test_every_cli_harness_declares_sandbox_support() -> None:
+    """All four CLI harnesses route their agent turn through the seam.
+
+    A harness that does not is refused outright by ``AgentHarness.run`` when the
+    sandbox flag is on, so this is what stops a "sandboxed" matrix from silently
+    skipping an arm.
+    """
+    from devops_bench.agents.cli.antigravity.agent import AgyCliAgent
+    from devops_bench.agents.cli.claude_code.agent import ClaudeCodeAgent
+    from devops_bench.agents.cli.gemini_cli.agent import GeminiCliAgent
+    from devops_bench.agents.cli.openclaw.agent import OpenClawAgent
+
+    for cls in (AgyCliAgent, ClaudeCodeAgent, GeminiCliAgent, OpenClawAgent):
+        assert cls.supports_sandbox is True, f"{cls.__name__} is not wired onto the seam"

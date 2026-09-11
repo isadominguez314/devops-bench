@@ -73,6 +73,7 @@ __all__ = [
     "SandboxExecutor",
     "spec_from_env",
     "build_network_plan",
+    "container_path",
     "discover_fixture_mounts",
     "filter_boundary_env",
     "container_name_for_workspace",
@@ -168,6 +169,12 @@ class SandboxSpec:
             are excepted — never crossable, allowlisted or not. Everything
             else in the caller's overlay crosses unless denied; nothing
             outside the overlay ever crosses.
+        cloud_credential_env: Harness-minted env carrying the short-lived,
+            task-scoped cloud credential for the agent's own cloud API calls
+            (see ``Provider.sandbox_cloud_credential_env``). Spec-owned like
+            the kubeconfig mount, not part of the caller's overlay: it exists
+            precisely because the operator's ambient cloud identity is denied.
+            Empty for tasks that need no cloud calls beyond kubectl.
     """
 
     image: str = ""
@@ -176,6 +183,7 @@ class SandboxSpec:
     kubeconfig: Path | None = None
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
+    cloud_credential_env: Mapping[str, str] = field(default_factory=dict)
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
@@ -362,6 +370,44 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
     return mounts
 
 
+def container_path(workspace: str | os.PathLike[str], path: str | os.PathLike[str]) -> str:
+    """Map a host path under ``workspace`` to the path the container sees.
+
+    Module-level, not just a method, because a harness has to translate paths
+    *before* it hands them over: a value like ``OPENCLAW_STATE_DIR`` crosses the
+    boundary inside the env overlay, and the host spelling means nothing on the
+    other side. The executor's ``cwd`` mapping and these value translations must
+    agree, so they share one implementation.
+
+    Anything outside the workspace raises: the alternative would be to grow the
+    mount set to make the path exist, and the mount set is the boundary — it
+    only ever widens through an explicit spec field, never as a side effect of a
+    call site's ``cwd`` or an env value.
+
+    Args:
+        workspace: The run's host workspace, mounted at ``/workspace``.
+        path: A host path expected to live under it.
+
+    Returns:
+        The container-side absolute path.
+
+    Raises:
+        SandboxError: When ``path`` is not under ``workspace``.
+    """
+    resolved = Path(path).resolve()
+    root = Path(workspace).resolve()
+    if resolved == root:
+        return CONTAINER_WORKSPACE
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise SandboxError(
+            f"host path {resolved} is outside the sandbox workspace {root} "
+            "and has no container mapping; refusing to widen the mount set"
+        ) from exc
+    return f"{CONTAINER_WORKSPACE}/{relative.as_posix()}"
+
+
 def _env_denied(name: str) -> bool:
     return name in _DENIED_ENV_NAMES or name.startswith(_DENIED_ENV_PREFIXES)
 
@@ -436,25 +482,8 @@ class SandboxExecutor:
         self.container_name = container_name_for_workspace(self._workspace)
 
     def map_host_path(self, path: str | os.PathLike[str]) -> str:
-        """Map a host path under the workspace to its container-side path.
-
-        Anything outside the workspace raises: the alternative would be to
-        grow the mount set to make the path exist, and the mount set is the
-        boundary — it only ever widens through an explicit spec field, never
-        as a side effect of a call site's ``cwd``.
-        """
-        resolved = Path(path).resolve()
-        workspace = self._workspace.resolve()
-        if resolved == workspace:
-            return CONTAINER_WORKSPACE
-        try:
-            relative = resolved.relative_to(workspace)
-        except ValueError as exc:
-            raise SandboxError(
-                f"host path {resolved} is outside the sandbox workspace {workspace} "
-                "and has no container mapping; refusing to widen the mount set"
-            ) from exc
-        return f"{CONTAINER_WORKSPACE}/{relative.as_posix()}"
+        """Map a host path under this executor's workspace to its container path."""
+        return container_path(self._workspace, path)
 
     def wrap_argv(
         self,
@@ -475,6 +504,7 @@ class SandboxExecutor:
         four-mount set (workspace RW, kubeconfig RO, fixtures RW — the write
         bit is deliberate, several tasks ask the agent to commit its fix back
         to the seeded repo); the filtered env overlay by value, then the
+        spec's minted cloud credential (if the task declared one), then the
         container-owned ``HOME``/``KUBECONFIG`` last so they win any
         duplicate ``-e``; and **no ``-i``** — keeping stdin open gives the
         agent an open, non-TTY stdin to block on, and a headless prompt run
@@ -494,6 +524,15 @@ class SandboxExecutor:
         for host_path, container_path in spec.fixture_mounts.items():
             argv += ["-v", f"{host_path}:{container_path}"]
         for name, value in filter_boundary_env(extra_env, spec.env_allowlist).items():
+            argv += ["-e", f"{name}={value}"]
+        # The spec's own minted cloud credential, if any. Not routed through
+        # the overlay filter — the spec is harness-built boundary config, the
+        # same trust level as the kubeconfig mount above — but container-owned
+        # names are still skipped so no spec value can repoint them either.
+        for name, value in spec.cloud_credential_env.items():
+            if name in _CONTAINER_OWNED_ENV:
+                _log.warning("cloud credential env %s is container-owned; dropped", name)
+                continue
             argv += ["-e", f"{name}={value}"]
         # Container-owned env comes AFTER the overlay: docker's last ``-e``
         # wins, so even a filter regression could not let an overlay value

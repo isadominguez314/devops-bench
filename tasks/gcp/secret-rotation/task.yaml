@@ -1,5 +1,13 @@
 task_id: 25
 name: "secret-rotation"
+# Runs outside the agent sandbox, deliberately. The task IS credential work:
+# the agent rotates a Secret Manager version and re-syncs it through
+# ExternalSecrets, which needs Application Default Credentials — and ADC is
+# precisely what the sandbox boundary strips (see devops_bench/agents/sandbox.py).
+# Sandboxing this task would not harden it, it would make it impossible. The
+# harness honours this flag by skipping the sandbox for this task only, and logs
+# a warning so a sandboxed matrix run shows which task did not get a boundary.
+requires_unsandboxed: true
 # Provisions its own GKE cluster, a Secret Manager secret with exactly one
 # version, a Workload-Identity-bound service account, the ExternalSecrets
 # operator, and a workload that mounts the synced Secret. Version "1" of the
