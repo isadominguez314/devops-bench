@@ -80,3 +80,8 @@ output "cluster_name" {
 output "cluster_location" {
   value = module.cluster.cluster_location
 }
+
+output "agent_cloud_identity" {
+  description = "Run-unique service account the sandboxed agent's Secret Manager calls run as."
+  value       = module.cluster.agent_cloud_identity
+}

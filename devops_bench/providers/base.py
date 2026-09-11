@@ -130,6 +130,33 @@ class Provider(ABC):
         del cluster_info
         return NetworkPlan()
 
+    def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
+        """Mint the sandboxed agent's cloud-API credential, as env to inject.
+
+        Some tasks require cloud API calls beyond ``kubectl`` — adding a
+        Secret Manager secret version, resizing a node pool. The sandbox
+        strips the operator's ambient cloud identity by design, so those
+        calls need their own credential: a short-lived token for the narrow,
+        run-unique identity the task's stack provisioned and recorded on
+        ``cluster_info.agent_cloud_identity``.
+
+        The default is the correct answer for every task that names no such
+        identity: nothing crosses. A provider overrides this to mint for its
+        own cloud, and must fail loud when the identity is named but a
+        credential cannot be produced — an agent silently missing the
+        credential its task depends on gets graded on the wrong failure.
+
+        Args:
+            cluster_info: The provisioned cluster, carrying the agent's cloud
+                identity when the task's stack declared one.
+
+        Returns:
+            Environment variables to inject into the sandboxed agent
+            container; empty when the task declared no cloud identity.
+        """
+        del cluster_info
+        return {}
+
     def cleanup(
         self,
         cluster_info: ClusterInfo,

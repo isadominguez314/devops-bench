@@ -1159,7 +1159,15 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     harness = _sandboxed_harness(monkeypatch, tmp_path)
     plan = NetworkPlan(docker_network="kind", rewrite_server="https://c1-control-plane:6443")
     kubeconfig = tmp_path / "creds" / "kubeconfig"
-    provider = object()
+
+    cloud_requests: list[str] = []
+
+    class _StubProvider:
+        def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
+            cloud_requests.append(cluster_info.name)
+            return {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
+
+    provider = _StubProvider()
 
     def fake_provision(
         got_plan: Any, dest_dir: Path, *, token_ttl_sec: int, pod_security: str
@@ -1208,6 +1216,10 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     # The run's own provider and cluster build the plan (and through it the
     # kubeconfig), never the ambient current-context.
     assert plan_requests == [(provider, "c1")]
+    # The provider's minted cloud credential lands on the spec, keyed to this
+    # run's cluster — empty for providers/tasks that mint nothing.
+    assert cloud_requests == ["c1"]
+    assert spec.cloud_credential_env == {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
 
 
 def test_build_agent_config_overlays_the_active_sandbox_spec(
