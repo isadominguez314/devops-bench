@@ -604,6 +604,52 @@ def test_wrap_argv_never_forwards_denied_env(tmp_path: Path) -> None:
     assert "BENCH_AGENT_SANDBOX" not in joined
 
 
+def test_wrap_argv_names_the_spec_cloud_credential_env_without_its_value(tmp_path: Path) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok",
+            "GOOGLE_OAUTH_ACCESS_TOKEN": "tok",
+        },
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy", "-p", "hi"])
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN" in argv
+    assert "GOOGLE_OAUTH_ACCESS_TOKEN" in argv
+    assert "tok" not in " ".join(argv)
+    # Container-owned env still trails it, so it can never repoint HOME.
+    assert argv.index("HOME=/workspace/home") > argv.index("CLOUDSDK_AUTH_ACCESS_TOKEN")
+
+
+def test_wrap_argv_drops_container_owned_names_from_the_cloud_credential_env(
+    tmp_path: Path,
+) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={"HOME": "/elsewhere", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"},
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy"])
+    assert argv.count("-e") == 3  # the token name, then HOME and KUBECONFIG
+    assert "HOME=/workspace/home" in argv
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN" in argv
+
+
+def test_executor_run_hands_the_cloud_credential_value_to_the_docker_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _complete_spec(tmp_path, cloud_credential_env={"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"})
+    seen: dict = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[:2] == ["docker", "run"]:
+            seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.SandboxExecutor(spec).run(["agy"], extra_env={"FOO": "bar"}, check=False)
+
+    assert seen["extra_env"] == {"FOO": "bar", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
+
+
 def test_wrap_argv_mounts_fixtures_read_write(tmp_path: Path) -> None:
     executor = sandbox.SandboxExecutor(
         _complete_spec(

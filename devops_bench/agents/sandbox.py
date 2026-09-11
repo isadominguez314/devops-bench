@@ -173,6 +173,9 @@ class SandboxSpec:
     ``env_allowlist`` names vars permitted to cross despite a deny rule
     (container-owned ``HOME``/``KUBECONFIG``/``PATH`` excepted — never
     crossable).
+    ``cloud_credential_env`` is the harness-minted, task-scoped cloud
+    credential (see ``Provider.sandbox_cloud_credential_env``); spec-owned,
+    so it bypasses the overlay filter. Empty for kubectl-only tasks.
     """
 
     image: str = ""
@@ -181,6 +184,7 @@ class SandboxSpec:
     kubeconfig: Path | None = None
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
+    cloud_credential_env: Mapping[str, str] = field(default_factory=dict)
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
@@ -539,6 +543,16 @@ class SandboxExecutor:
                 " ".join(argv),
             )
 
+    def _cloud_credential_env(self) -> dict[str, str]:
+        """The spec's minted cloud credential, minus container-owned names."""
+        kept: dict[str, str] = {}
+        for name, value in self.spec.cloud_credential_env.items():
+            if name in _CONTAINER_OWNED_ENV:
+                _log.warning("cloud credential env %s is container-owned; dropped", name)
+            else:
+                kept[name] = value
+        return kept
+
     def wrap_argv(
         self,
         cmd: Sequence[str | os.PathLike[str]],
@@ -555,8 +569,9 @@ class SandboxExecutor:
         the network plan; ``host.docker.internal:host-gateway`` (loopback
         endpoints resolve on Linux); ``--user`` on Linux (workspace files
         stay operator-owned); workspace RW, kubeconfig RO, fixtures RW
-        (tasks commit fixes back); overlay env as name-only ``-e`` (values
-        ride the client env, never the world-readable argv); container-owned
+        (tasks commit fixes back); overlay env, then the spec's minted cloud
+        credential, as name-only ``-e`` (values ride the client env, never the
+        world-readable argv); container-owned
         ``HOME``/``KUBECONFIG`` inline and last (non-secret constants,
         last ``-e`` wins); no ``-i`` (a headless run never reads stdin).
         """
@@ -578,6 +593,8 @@ class SandboxExecutor:
         for host_path, container_path in spec.fixture_mounts.items():
             argv += ["-v", f"{host_path}:{container_path}"]
         for name in filter_boundary_env(extra_env, spec.env_allowlist):
+            argv += ["-e", name]
+        for name in self._cloud_credential_env():
             argv += ["-e", name]
         argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
@@ -635,7 +652,7 @@ class SandboxExecutor:
             try:
                 completed = run(
                     wrapped,
-                    extra_env=crossing,
+                    extra_env={**crossing, **self._cloud_credential_env()},
                     check=check,
                     capture=capture,
                     text=text,
