@@ -23,12 +23,15 @@ import sqlite3
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from devops_bench.agents import capabilities
 from devops_bench.agents import config as agents_config
 from devops_bench.agents.cli.antigravity import agent as agy_mod
 from devops_bench.agents.cli.antigravity import parsing
+from devops_bench.agents.sandbox import SandboxSpec
 from devops_bench.core import subprocess as devops_subprocess
-from devops_bench.core.errors import SubprocessError
+from devops_bench.core.errors import ConfigError, SubprocessError
 
 
 def _jsonl(*records: dict) -> str:
@@ -346,6 +349,89 @@ def test_build_env_resolves_provider_qualified_model_name():
     env = agy_mod._build_env(config)
 
     assert env["GEMINI_MODEL"] == "gemini-3.5-flash"
+
+
+def test_build_env_unknown_provider_raises_even_when_keyless():
+    with pytest.raises(ConfigError):
+        agy_mod._build_env(
+            agents_config.AgentConfig(model="gemini-3.5-flash", provider="google-vertyx")
+        )
+
+
+def test_build_env_vertex_sets_the_google_genai_routing_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # agy inherits these ambiently from the host shell; inside the sandbox
+    # nothing arrives unless this overlay carries it, and the binary's own
+    # gcloud fallback does not exist in the image.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
+
+    env = agy_mod._build_env(
+        agents_config.AgentConfig(model="gemini-3.5-flash", provider="google-vertex")
+    )
+
+    assert env["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+    assert env["GOOGLE_CLOUD_PROJECT"] == "proj-a"
+    assert env["GOOGLE_CLOUD_LOCATION"] == "global"
+
+
+def test_build_env_unsandboxed_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Flag off must stay byte-for-byte the old behaviour: the host process has
+    # ADC of its own, so the recipe is not consulted and no emulator is started.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(
+        agy_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called on an unsandboxed run"),
+    )
+    env = agy_mod._build_env(
+        agents_config.AgentConfig(model="gemini-3.5-flash", provider="google-vertex")
+    )
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & env.keys()
+
+
+def test_build_env_sandboxed_vertex_injects_the_metadata_emulator_vars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Inside the sandbox there is no ADC and the real metadata endpoint is
+    # blocked, so the backend's mint-and-inject recipe supplies the credential.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    seen: dict = {}
+
+    def fake_recipe(spec, *, project=None, **kwargs):
+        seen["backend"] = spec.backend
+        seen["project"] = project
+        return {"GCE_METADATA_HOST": "host.docker.internal:41235"}
+
+    monkeypatch.setattr(agy_mod, "sandbox_credential_env", fake_recipe)
+    cfg = agents_config.AgentConfig(
+        model="gemini-3.5-flash", provider="google-vertex", sandbox=SandboxSpec(image="img")
+    )
+    env = agy_mod._build_env(cfg)
+
+    assert seen == {"backend": "vertex", "project": "proj-a"}
+    assert env["GCE_METADATA_HOST"] == "host.docker.internal:41235"
+    # The recipe rides alongside the routing vars, it does not replace them.
+    assert env["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+    assert env["GOOGLE_CLOUD_PROJECT"] == "proj-a"
+
+
+def test_build_env_sandboxed_non_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A key-based provider carries its own credential across the boundary.
+    monkeypatch.setattr(
+        agy_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called for a key-based provider"),
+    )
+    cfg = agents_config.AgentConfig(
+        model="gemini-3.5-flash", api_key="abc", sandbox=SandboxSpec(image="img")
+    )
+    assert agy_mod._build_env(cfg)["GEMINI_API_KEY"] == "abc"
 
 
 @mock.patch.object(pathlib.Path, "home")

@@ -32,6 +32,7 @@ from devops_bench.agents.cli.antigravity import parsing
 from devops_bench.agents.shared import cli_capabilities
 from devops_bench.agents.shared.vertex_env import vertex_location
 from devops_bench.core import subprocess as devops_subprocess
+from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 
 if TYPE_CHECKING:
     from devops_bench.agents import capabilities
@@ -126,7 +127,30 @@ def _build_env(config: agents_config.AgentConfig) -> dict[str, str]:
     """Build the env overlay for the Antigravity CLI subprocess.
 
     HOME must NOT be overridden to leverage cached OAuth/ADC credentials.
+
+    A Vertex backend additionally writes the google-genai routing vars
+    (``GOOGLE_GENAI_USE_VERTEXAI`` plus project/location) — ``agy`` inherits
+    them ambiently on the host, but inside the sandbox nothing arrives unless
+    it crosses in this overlay, and the binary's own gcloud fallback does not
+    exist in the image. ``_execute`` re-resolves project/location with the
+    host-side gcloud fallbacks afterwards; the spellings here keep this
+    function self-contained and identical to the Gemini CLI harness.
+
+    A *sandboxed* Vertex run also gets the backend's mint-and-inject
+    credential recipe
+    (:func:`~devops_bench.core.model_providers.sandbox_credential_env`) — the
+    metadata-emulator vars pointing at a host-side server serving a narrowly
+    scoped, short-lived token — because the container has no ADC and the real
+    metadata endpoint is blocked at the boundary. An unsandboxed run does not
+    call it at all, so the flag-off path stays byte-for-byte unchanged.
+
+    Raises:
+        ConfigError: If ``config.provider`` is not a known provider, or a
+            sandboxed keyless run cannot be given a model credential.
     """
+    # Resolve unconditionally so an unknown provider fails loud even on a
+    # keyless (Vertex/ADC) run, not only when a key happens to be set.
+    spec = resolve_provider(config.provider)
     overlay: dict[str, str] = {
         # Trust workspace so it doesn't block on untrusted folder warnings
         "GEMINI_CLI_TRUST_WORKSPACE": "true",
@@ -136,6 +160,19 @@ def _build_env(config: agents_config.AgentConfig) -> dict[str, str]:
         "OTEL_LOGS_EXPORTER": "none",
         "OTEL_SDK_DISABLED": "true",
     }
+
+    if spec.backend == "vertex":
+        # The google-genai SDK agy embeds reads these three; without the
+        # switch it defaults to the Gemini API and ignores the Vertex routing.
+        # Project/location env spellings match the Gemini CLI harness so an
+        # operator configures both agents the same way.
+        overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        if project:
+            overlay["GOOGLE_CLOUD_PROJECT"] = project
+        overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
+        if config.sandbox is not None:
+            overlay.update(sandbox_credential_env(spec, project=project))
 
     if config.api_key:
         overlay["GEMINI_API_KEY"] = config.api_key
@@ -195,8 +232,11 @@ class AgyCliAgent(base.AgentHarness):
     mounted at all — which is the point. The one credential the agent still
     needs, its OAuth token, crosses deliberately: it is *copied* into the
     per-run config dir under the workspace (see ``_execute``), so it rides in
-    on the workspace mount rather than through the operator's home. ADC and the
-    gcloud config never cross; the sandbox's deny filter drops them.
+    on the workspace mount rather than through the operator's home. The
+    operator's own ADC and gcloud config never cross; the sandbox's deny
+    filter drops them. A keyless Vertex run instead authenticates through the
+    host-side metadata emulator (see ``_build_env``), whose token belongs to a
+    narrowly scoped service account rather than the operator.
     """
 
     # Every agent-owned subprocess here goes through run_agent_cmd, so a
