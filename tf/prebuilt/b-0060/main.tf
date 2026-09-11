@@ -88,6 +88,9 @@ resource "null_resource" "setup" {
       MANIFESTS_DIR  = "${path.module}/manifests"
       WORLD_JSON     = "${path.module}/world.json"
       WAIT_TIMEOUT   = var.wait_timeout
+      # setup.sh reads $HOME under set -u; a local-exec only inherits what
+      # the caller had.
+      HOME = pathexpand("~")
     }
   }
 }
