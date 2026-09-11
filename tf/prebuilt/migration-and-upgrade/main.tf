@@ -77,6 +77,9 @@ resource "null_resource" "seed_repo" {
     environment = {
       REPO_PATH     = pathexpand(local.repo_path)
       MANIFESTS_DIR = "${path.module}/manifests"
+      # seed-repo.sh reads $HOME under set -u; a local-exec only inherits what
+      # the caller had.
+      HOME = pathexpand("~")
     }
   }
 }

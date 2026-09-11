@@ -76,13 +76,13 @@ resource "random_id" "suffix" {
 # Two regional (zonal) GKE clusters: east = primary, west = standby.
 # ---------------------------------------------------------------------------
 module "east" {
-  source                = "../../modules/cluster"
-  infra_provider        = "gcp"
-  project_id            = var.project_id
-  cluster_name          = local.east_cluster
-  location              = var.zone_primary
-  node_count            = var.node_count_primary
-  machine_type          = var.machine_type
+  source         = "../../modules/cluster"
+  infra_provider = "gcp"
+  project_id     = var.project_id
+  cluster_name   = local.east_cluster
+  location       = var.zone_primary
+  node_count     = var.node_count_primary
+  machine_type   = var.machine_type
   # BYO-credentials model (see docs/bastion.md): the agent runs as the operator's
   # broad bastion VM SA, which already holds container.admin out-of-band. This
   # stack grants NOTHING — a per-run stack must not manage a project IAM binding
@@ -275,6 +275,9 @@ resource "null_resource" "setup" {
       SQL_REPLICA     = google_sql_database_instance.replica.name
       MANIFESTS_DIR   = "${path.module}/manifests"
       WEST_KUBECONFIG = local.west_kubeconfig
+      # setup.sh reads $HOME under set -u; a local-exec only inherits what
+      # the caller had.
+      HOME = pathexpand("~")
     }
   }
 

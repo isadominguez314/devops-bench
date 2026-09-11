@@ -97,6 +97,9 @@ resource "null_resource" "setup" {
     environment = {
       KUBECONFIG    = pathexpand(var.kubeconfig_path)
       MANIFESTS_DIR = "${path.module}/manifests"
+      # setup.sh reads $HOME under set -u; a local-exec only inherits what
+      # the caller had.
+      HOME = pathexpand("~")
     }
   }
 }

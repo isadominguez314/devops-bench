@@ -106,6 +106,9 @@ resource "null_resource" "inject_fault" {
       CLUSTER_NAME = var.cluster_name
       NAMESPACE    = var.namespace
       KUBECONFIG   = pathexpand(var.kubeconfig_path)
+      # inject-fault.sh reads $HOME under set -u; a local-exec only inherits what
+      # the caller had.
+      HOME = pathexpand("~")
     }
   }
 }
