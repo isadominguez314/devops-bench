@@ -1032,7 +1032,32 @@ def test_vertex_auth_profile_seeded_for_headless_run() -> None:
     command = oc_mod._build_local_command(
         AgentConfig(provider="anthropic-vertex"), "hi", "operator", "oc"
     )
-    assert "models auth paste-api-key" in command
+    assert "models auth paste-api-key --provider anthropic-vertex --agent operator" in command
+    assert oc_mod._VERTEX_CREDENTIALS_MARKER in command
+
+
+def test_vertex_auth_profile_seeded_for_keyless_google_vertex() -> None:
+    # oc's per-agent auth store gates every provider, not just the plugin one:
+    # a keyless google-vertex run aborts with the same ProviderAuthError until
+    # the marker profile exists.
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex"), "hi", "operator", "oc"
+    )
+    assert "models auth paste-api-key --provider google-vertex --agent operator" in command
+
+
+def test_vertex_auth_profile_skipped_for_a_keyed_run() -> None:
+    # A real key is already in the config oc reads; seeding the marker on top
+    # would shadow it.
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex", api_key="k"), "hi", "operator", "oc"
+    )
+    assert "paste-api-key" not in command
+
+
+def test_vertex_auth_profile_skipped_for_a_non_vertex_provider() -> None:
+    command = oc_mod._build_local_command(AgentConfig(provider="google"), "hi", "operator", "oc")
+    assert "paste-api-key" not in command
 
 
 def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
@@ -1130,11 +1155,70 @@ def test_sandbox_provider_env_keyed_vertex_skips_the_recipe(
     assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(overlay)
 
 
+def test_sandbox_provider_env_vertex_defaults_the_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # oc aborts with "Vertex AI requires a location" when neither spelling is
+    # set on the host, which forwarding alone cannot fix.
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "global"
+
+
+def test_sandbox_provider_env_vertex_keeps_an_explicit_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Assigning unconditionally is not a clobber: vertex_location() reads
+    # GOOGLE_CLOUD_LOCATION first, so a forwarded value resolves to itself.
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-east5")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "us-east5"
+
+
+def test_sandbox_provider_env_vertex_reads_the_alternate_location_spelling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west4")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
+
+
+def test_sandbox_provider_env_keyed_vertex_still_gets_a_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The location is a routing fact, not a credential: a keyed run needs it
+    # just as much, and skips only the emulator recipe.
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    overlay = oc_mod._sandbox_provider_env(
+        AgentConfig(provider="google-vertex", api_key="k"), tmp_path
+    )
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "global"
+
+
+def test_sandbox_provider_env_non_vertex_invents_no_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A google-genai run resolves its endpoint from the API key, not a region.
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google"), tmp_path)
+    assert "GOOGLE_CLOUD_LOCATION" not in overlay
+
+
 def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # Flag off must stay byte-for-byte the old behaviour: the host process has
-    # ADC of its own, so the recipe is not consulted and no emulator is started.
+    # Flag off keeps its own credentials: the host process has ADC of its own,
+    # so the recipe is not consulted and no emulator is started. (The auth
+    # profile *is* seeded on this path -- oc's store gates it there too -- see
+    # test_vertex_auth_profile_seeded_for_keyless_google_vertex.)
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
     monkeypatch.setattr(
         oc_mod,

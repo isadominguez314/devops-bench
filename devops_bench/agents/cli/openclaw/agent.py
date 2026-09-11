@@ -75,6 +75,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.vertex_env import vertex_location
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
@@ -150,6 +151,12 @@ _CATALOG_OVERRIDES: frozenset[str] = frozenset(
     }
 )
 
+# Placeholder pasted where oc wants an API key on a keyless Vertex run. It is
+# never sent as a credential: the transport resolves the real one through ADC
+# (the metadata emulator, sandboxed). Its only job is to satisfy oc's auth
+# gate -- see :func:`_vertex_auth_profile_provider`.
+_VERTEX_CREDENTIALS_MARKER = "gcp-vertex-credentials"
+
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
 # built-in provider rather than merging, so without ``api`` oc falls back to the
 # OpenAI transport and 401s. ``google`` needs no ``baseUrl``; for ``google-vertex``
@@ -165,7 +172,7 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
     "anthropic-vertex": {
         "api": "anthropic-messages",
         "baseUrl": "https://aiplatform.googleapis.com",
-        "apiKey": "gcp-vertex-credentials",
+        "apiKey": _VERTEX_CREDENTIALS_MARKER,
     },
 }
 # Per-run layout of the node-fetch->native-fetch ESM loader shim (see
@@ -479,18 +486,28 @@ def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
     overlay["NODE_OPTIONS"] = "--import=/workspace/node-fetch-shim/register.mjs"
     if _oc_provider_or_none(config) == "anthropic-vertex":
         overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
-        overlay.setdefault("GOOGLE_CLOUD_API_KEY", "gcp-vertex-credentials")
+        overlay.setdefault("GOOGLE_CLOUD_API_KEY", _VERTEX_CREDENTIALS_MARKER)
     spec = resolve_provider(config.provider)
-    if spec.backend == "vertex" and not config.api_key:
-        # The metadata auth prepared above still needs a server to answer it:
-        # the sandbox blocks the real metadata endpoint, so a keyless Vertex
-        # run points the SDKs at the host-side emulator credential instead. A
-        # run that *did* provide a key already carries its credential across
-        # the boundary (a google-vertex key rides GOOGLE_CLOUD_API_KEY via
-        # _build_env) and must keep working without BENCH_VERTEX_SANDBOX_SA.
-        # Same project spellings as the forwarding block above.
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT_ID")
-        overlay.update(sandbox_credential_env(spec, project=project))
+    if spec.backend == "vertex":
+        # oc aborts with "Vertex AI requires a location" when this is unset, and
+        # forwarding alone does not cover the common case where the operator set
+        # neither spelling. Resolve it through the shared chain the other Vertex
+        # harnesses use, which ends at "global" -- the only endpoint several of
+        # the published model ids answer on. Assigning unconditionally is not a
+        # clobber: the chain reads GOOGLE_CLOUD_LOCATION first, so a forwarded
+        # value resolves back to itself.
+        overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
+        if not config.api_key:
+            # The metadata auth prepared above still needs a server to answer
+            # it: the sandbox blocks the real metadata endpoint, so a keyless
+            # Vertex run points the SDKs at the host-side emulator credential
+            # instead. A run that *did* provide a key already carries its
+            # credential across the boundary (a google-vertex key rides
+            # GOOGLE_CLOUD_API_KEY via _build_env) and must keep working
+            # without BENCH_VERTEX_SANDBOX_SA. Same project spellings as the
+            # forwarding block above.
+            project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT_ID")
+            overlay.update(sandbox_credential_env(spec, project=project))
     return overlay
 
 
@@ -513,9 +530,9 @@ def _oc_model_flag(config: AgentConfig) -> str:
 def _oc_provider_or_none(config: AgentConfig) -> str | None:
     """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
 
-    Shared by :func:`_needs_anthropic_vertex_auth_profile` and the sandboxed
-    anthropic-vertex env passthrough in :meth:`OpenClawAgent._execute`, so the
-    "is this run on anthropic-vertex" check has exactly one implementation.
+    Used by the sandboxed anthropic-vertex env passthrough in
+    :func:`_sandbox_provider_env`, which keys off the plugin-specific id rather
+    than the ``vertex`` backend the whole family shares.
     """
     try:
         return resolve_provider(config.provider).oc_provider
@@ -523,8 +540,8 @@ def _oc_provider_or_none(config: AgentConfig) -> str | None:
         return None
 
 
-def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
-    """Return whether this run must register a headless anthropic-vertex auth profile.
+def _vertex_auth_profile_provider(config: AgentConfig) -> str | None:
+    """Return the oc provider id needing a headless auth profile, else ``None``.
 
     Confirmed live against openclaw 2026.9.1-beta.1 + anthropic-vertex-provider
     2026.9.1-beta.1 (the first pairing where the plugin is correctly discovered
@@ -538,13 +555,28 @@ def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
     config is no longer sufficient on its own -- an explicit profile entry must
     exist in that store too.
 
-    ``oc models auth paste-api-key --provider anthropic-vertex`` registers
-    that entry non-interactively (it reads the key from stdin, no TTY
-    required), so it is safe to run unattended before every keyless
-    anthropic-vertex turn (see :func:`_build_local_command`). It is a no-op
-    correctness-wise for a run that already carries an explicit API key.
+    That gate is **not plugin-specific**: a keyless ``google-vertex`` run aborts
+    the same way (``No API key found for provider "google-vertex"``, confirmed
+    live on 2026-09-10 against the same version), because the store is consulted
+    for every provider before any ADC resolution happens. So the profile is
+    seeded for any Vertex-backend provider on a keyless run, not just the
+    Anthropic one. Seeding it does not make the run keyed: the pasted value is
+    :data:`_VERTEX_CREDENTIALS_MARKER`, and the turn only succeeds because the
+    transport then authenticates through ADC -- a real (wrong) key would 401.
+
+    ``oc models auth paste-api-key --provider <id>`` registers that entry
+    non-interactively (it reads the key from stdin, no TTY required), so it is
+    safe to run unattended before every keyless Vertex turn (see
+    :func:`_build_local_command`). A run carrying an explicit API key needs no
+    profile and gets none.
     """
-    return _oc_provider_or_none(config) == "anthropic-vertex" and not config.api_key
+    try:
+        spec = resolve_provider(config.provider)
+    except ConfigError:
+        return None
+    if spec.backend != "vertex" or config.api_key:
+        return None
+    return spec.oc_provider
 
 
 def _prepend_rules(rules_text: str, prompt: str) -> str:
@@ -588,11 +620,12 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
     """
     quoted_oc = shlex.quote(oc_bin)
     auth_setup = ""
-    if _needs_anthropic_vertex_auth_profile(config):
-        marker = _PROVIDER_TRANSPORT["anthropic-vertex"]["apiKey"]
+    auth_provider = _vertex_auth_profile_provider(config)
+    if auth_provider:
         auth_setup = (
-            f"printf '%s\\n' {shlex.quote(marker)} | {quoted_oc} models auth paste-api-key "
-            f"--provider anthropic-vertex --agent {shlex.quote(agent_name)}; "
+            f"printf '%s\\n' {shlex.quote(_VERTEX_CREDENTIALS_MARKER)} | "
+            f"{quoted_oc} models auth paste-api-key "
+            f"--provider {shlex.quote(auth_provider)} --agent {shlex.quote(agent_name)}; "
         )
     extra_flags_str = (
         " ".join(shlex.quote(f) for f in config.extra_flags) + " " if config.extra_flags else ""
