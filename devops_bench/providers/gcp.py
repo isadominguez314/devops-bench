@@ -18,7 +18,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from devops_bench.core import ClusterInfo, ConfigError, NetworkPlan, get_bool, get_env, get_logger
+from devops_bench.core import (
+    ClusterInfo,
+    ConfigError,
+    NetworkPlan,
+    SandboxError,
+    get_bool,
+    get_env,
+    get_logger,
+)
 from devops_bench.core.subprocess import run
 from devops_bench.providers.base import PROVIDERS, Provider, ResolveContext
 
@@ -114,7 +122,16 @@ class GcpProvider(Provider):
             )
 
         return ClusterInfo.from_dict(
-            {"name": cluster_name, "location": location, "project": project}
+            {
+                "name": cluster_name,
+                "location": location,
+                "project": project,
+                # A stack whose task needs its own cloud API calls (beyond
+                # kubectl) provisions a run-unique service account for them
+                # and names it in this output; most stacks don't, and the
+                # field stays None.
+                "agent_cloud_identity": (outputs or {}).get("agent_cloud_identity"),
+            }
         )
 
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
@@ -147,6 +164,65 @@ class GcpProvider(Provider):
                 cluster_info.project, cluster_info.location, cluster_info.name
             )
         )
+
+    def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
+        """Mint a short-lived impersonated token for the agent's cloud calls.
+
+        The token is minted host-side by impersonating the run-unique service
+        account the task's stack provisioned (which holds only that task's
+        narrow roles), and crosses the boundary by value. No key file exists
+        and none is mounted; the operator's ambient ADC never crosses. The
+        provisioning identity needs ``roles/iam.serviceAccountTokenCreator``
+        on that service account — the stack that creates the account grants
+        it, so the whole loop tears down with the run.
+
+        ``CLOUDSDK_AUTH_ACCESS_TOKEN`` is how gcloud accepts a bare token;
+        ``GOOGLE_OAUTH_ACCESS_TOKEN`` covers the client libraries and tofu.
+        Impersonated access tokens live at most one hour and are not
+        refreshed inside the container, so an agent still making cloud calls
+        past that gets a clean 401, not a silent widening.
+
+        Args:
+            cluster_info: The provisioned cluster; ``agent_cloud_identity``
+                names the service account to impersonate, or None.
+
+        Returns:
+            The env to inject, or empty when the task declared no identity.
+
+        Raises:
+            SandboxError: When the identity is named but no token could be
+                minted. Failing loud beats an agent that runs without the
+                credential its task depends on.
+        """
+        identity = cluster_info.agent_cloud_identity
+        if not identity:
+            return {}
+        result = run(
+            [
+                "gcloud",
+                "auth",
+                "print-access-token",
+                f"--impersonate-service-account={identity}",
+            ],
+            check=False,
+        )
+        token = (result.stdout or "").strip()
+        if result.returncode != 0 or not token:
+            raise SandboxError(
+                f"could not mint an access token for the agent's cloud identity "
+                f"{identity!r} (gcloud exit {result.returncode}); the provisioning "
+                "identity needs roles/iam.serviceAccountTokenCreator on it — "
+                "refusing to run the agent without the credential its task needs"
+            )
+        _log.info("minted a short-lived cloud credential for the sandboxed agent as %s", identity)
+        env = {
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": token,
+            "GOOGLE_OAUTH_ACCESS_TOKEN": token,
+        }
+        if cluster_info.project:
+            env["CLOUDSDK_CORE_PROJECT"] = cluster_info.project
+            env["GOOGLE_CLOUD_PROJECT"] = cluster_info.project
+        return env
 
     def cleanup(
         self,

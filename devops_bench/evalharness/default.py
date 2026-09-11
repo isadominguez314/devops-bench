@@ -1612,12 +1612,20 @@ class DefaultEvalHarness(Harness):
             token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
             pod_security=pod_security,
         )
+        # A task whose stack declared an agent cloud identity gets a matching
+        # short-lived credential minted for it; every other task gets nothing.
+        # A mint failure raises out of here — a failed record, never a silent
+        # run without the credential the task depends on.
+        cloud_credential_env = (
+            provider.sandbox_cloud_credential_env(cluster_info) if provider is not None else {}
+        )
         return replace(
             self._agent_config.sandbox,
             network=plan,
             workspace=workspace_path,
             kubeconfig=kubeconfig,
             fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
+            cloud_credential_env=cloud_credential_env,
         )
 
     def _inventory_sandbox_home(

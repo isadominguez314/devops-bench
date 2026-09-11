@@ -29,6 +29,11 @@ output "secret_id" {
   value       = google_secret_manager_secret.db_credentials.secret_id
 }
 
+output "agent_cloud_identity" {
+  description = "Run-unique service account the sandboxed agent's Secret Manager calls run as."
+  value       = google_service_account.agent_rotator.email
+}
+
 output "endpoint" {
   value = module.cluster.endpoint
 }

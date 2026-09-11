@@ -482,6 +482,34 @@ def test_wrap_argv_never_forwards_denied_env(tmp_path: Path) -> None:
     assert "BENCH_AGENT_SANDBOX" not in joined
 
 
+def test_wrap_argv_injects_the_spec_cloud_credential_env(tmp_path: Path) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok",
+            "GOOGLE_OAUTH_ACCESS_TOKEN": "tok",
+        },
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy", "-p", "hi"])
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN=tok" in argv
+    assert "GOOGLE_OAUTH_ACCESS_TOKEN=tok" in argv
+    # Container-owned env still trails it, so it can never repoint HOME.
+    assert argv.index("HOME=/workspace/home") > argv.index("CLOUDSDK_AUTH_ACCESS_TOKEN=tok")
+
+
+def test_wrap_argv_drops_container_owned_names_from_the_cloud_credential_env(
+    tmp_path: Path,
+) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={"HOME": "/elsewhere", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"},
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy"])
+    assert "HOME=/elsewhere" not in argv
+    assert "HOME=/workspace/home" in argv
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN=tok" in argv
+
+
 def test_wrap_argv_mounts_fixtures_read_write(tmp_path: Path) -> None:
     executor = sandbox.SandboxExecutor(
         _complete_spec(

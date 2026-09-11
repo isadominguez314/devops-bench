@@ -71,6 +71,16 @@ _COMMAND_TIMEOUT = 40
 _LOAD_TIMEOUT_SLACK_SEC = 60
 _LOAD_TIMEOUT_CEILING_SEC = 900
 
+# Ceiling on the tool output handed back to the chaos model. fortio logs a line
+# per request, so a 300s spike at 300 qps returns on the order of 90k lines --
+# more than the model's whole context window, and the call fails with
+# "input token count exceeds the maximum". Nothing in the spike's own log is
+# load-bearing: the summary the model reasons about is the tail. This became
+# reachable only once spikes stopped being killed at 40s, which is why the
+# uncapped return went unnoticed.
+_MAX_TOOL_OUTPUT_CHARS = 20_000
+_HEAD_CHARS = 4_000
+
 # The workload's in-cluster (remote) port for chaos load generation, and the
 # default local side of the port-forward. Parallel runs override only the local
 # side via ``_ENV_LOCAL_PORT`` so two concurrent forwards do not contend.
@@ -187,6 +197,27 @@ RUN_COMMAND_TOOL = SimpleNamespace(
 # TODO(#33): replace the free-form command tool with structured
 # qps / duration / concurrency parameters and a code-owned fortio argv pinned
 # to the target URL, so the model never chooses the executable or the target.
+
+
+def _clamp_tool_output(text: str) -> str:
+    """Bound a tool's output so one chatty command cannot exhaust the context.
+
+    Keeps the head (the command's own echo of what it is doing) and, weighted
+    heavier, the tail (fortio's summary), with an explicit marker in between so
+    the model is told the middle was dropped rather than silently shown a
+    truncated log.
+    """
+    if len(text) <= _MAX_TOOL_OUTPUT_CHARS:
+        return text
+    tail_chars = _MAX_TOOL_OUTPUT_CHARS - _HEAD_CHARS
+    dropped = len(text) - _MAX_TOOL_OUTPUT_CHARS
+    return (
+        text[:_HEAD_CHARS]
+        + f"\n\n... [{dropped} characters elided by the harness: a load generator "
+        f"logs per request, and the summary below is what matters] ...\n\n" + text[-tail_chars:]
+    )
+
+
 def run_chaos_command(
     command: str,
     chaos_active_event: threading.Event | None = None,
@@ -252,7 +283,8 @@ def run_chaos_command(
             load_result["attempted"] = True
             load_result["returncode"] = completed.returncode
             load_result["ok"] = completed.returncode == 0
-        return f"Stdout:\n{completed.stdout}\nStderr:\n{completed.stderr}"
+        combined = f"Stdout:\n{completed.stdout}\nStderr:\n{completed.stderr}"
+        return _clamp_tool_output(combined)
     except Exception as exc:  # noqa: BLE001 - surface any failure back to the LLM
         if is_load and load_result is not None:
             load_result["attempted"] = True

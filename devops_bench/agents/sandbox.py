@@ -195,6 +195,12 @@ class SandboxSpec:
             are excepted — never crossable, allowlisted or not. Everything
             else in the caller's overlay crosses unless denied; nothing
             outside the overlay ever crosses.
+        cloud_credential_env: Harness-minted env carrying the short-lived,
+            task-scoped cloud credential for the agent's own cloud API calls
+            (see ``Provider.sandbox_cloud_credential_env``). Spec-owned like
+            the kubeconfig mount, not part of the caller's overlay: it exists
+            precisely because the operator's ambient cloud identity is denied.
+            Empty for tasks that need no cloud calls beyond kubectl.
     """
 
     image: str = ""
@@ -203,6 +209,7 @@ class SandboxSpec:
     kubeconfig: Path | None = None
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
+    cloud_credential_env: Mapping[str, str] = field(default_factory=dict)
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
@@ -608,6 +615,7 @@ class SandboxExecutor:
         four-mount set (workspace RW, kubeconfig RO, fixtures RW — the write
         bit is deliberate, several tasks ask the agent to commit its fix back
         to the seeded repo); the filtered env overlay by value, then the
+        spec's minted cloud credential (if the task declared one), then the
         container-owned ``HOME``/``KUBECONFIG`` last so they win any
         duplicate ``-e``; and **no ``-i``** — keeping stdin open gives the
         agent an open, non-TTY stdin to block on, and a headless prompt run
@@ -630,6 +638,15 @@ class SandboxExecutor:
         for host_path, container_path in spec.fixture_mounts.items():
             argv += ["-v", f"{host_path}:{container_path}"]
         for name, value in filter_boundary_env(extra_env, spec.env_allowlist).items():
+            argv += ["-e", f"{name}={value}"]
+        # The spec's own minted cloud credential, if any. Not routed through
+        # the overlay filter — the spec is harness-built boundary config, the
+        # same trust level as the kubeconfig mount above — but container-owned
+        # names are still skipped so no spec value can repoint them either.
+        for name, value in spec.cloud_credential_env.items():
+            if name in _CONTAINER_OWNED_ENV:
+                _log.warning("cloud credential env %s is container-owned; dropped", name)
+                continue
             argv += ["-e", f"{name}={value}"]
         # Container-owned env comes AFTER the overlay: docker's last ``-e``
         # wins, so even a filter regression could not let an overlay value
