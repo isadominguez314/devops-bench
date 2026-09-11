@@ -402,6 +402,27 @@ working for them.
 > auth method is set — naming the very variable you exported. Export
 > `AGENT_API_KEY` and the sandboxed run routes it onward for you.
 
+### Task cloud credentials
+
+Some tasks require cloud API calls beyond `kubectl` — secret-rotation adds a
+Secret Manager secret version. The sandbox strips the operator's ambient cloud
+identity, so those calls get their own: the task's stack provisions a
+run-unique service account holding exactly the roles the task needs, scoped to
+exactly the resources it provisioned, and names it in an `agent_cloud_identity`
+output. When that output is present on a sandboxed run, the harness
+impersonates the account host-side, mints a short-lived access token, and
+injects it as `CLOUDSDK_AUTH_ACCESS_TOKEN` / `GOOGLE_OAUTH_ACCESS_TOKEN` (plus
+the project id). No key file exists, the operator's ADC never crosses, and the
+whole loop — account, role bindings, the provisioner's
+`serviceAccountTokenCreator` grant on it — tears down with the run's stack.
+
+Two properties to keep in mind. The token lives at most one hour and is not
+refreshed inside the container: an agent still making cloud calls past that
+gets a clean 401, not a silent widening. And a mint failure fails the run
+loudly — the alternative is an agent graded on a failure that was really a
+missing credential. Tasks that declare no `agent_cloud_identity` output are
+completely unaffected; nothing extra crosses for them.
+
 ## Adding your own harness
 
 Want to wrap a different agent? See

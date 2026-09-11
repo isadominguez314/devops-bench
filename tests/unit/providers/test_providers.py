@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
@@ -162,6 +163,79 @@ def test_gcp_ensure_cluster_credentials_no_project_raises(
 def test_gcp_ensure_account_credentials_is_noop() -> None:
     # No exception, no external calls.
     GcpProvider().ensure_account_credentials()
+
+
+def test_gcp_ensure_cluster_credentials_reads_the_agent_cloud_identity_output(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch("devops_bench.providers.gcp.run")
+    info = GcpProvider().ensure_cluster_credentials(
+        "test-cluster",
+        "us-central1-a",
+        {"project_id": "test-project"},
+        outputs={"agent_cloud_identity": "rot-x@test-project.iam.gserviceaccount.com"},
+    )
+    assert info.agent_cloud_identity == "rot-x@test-project.iam.gserviceaccount.com"
+
+
+def test_gcp_cloud_credential_env_is_empty_without_an_identity(
+    mocker: MockerFixture,
+) -> None:
+    mock_run = mocker.patch("devops_bench.providers.gcp.run")
+    info = ClusterInfo(name="c", location="us-central1-a", project="p")
+    assert GcpProvider().sandbox_cloud_credential_env(info) == {}
+    mock_run.assert_not_called()
+
+
+def test_gcp_cloud_credential_env_mints_an_impersonated_token(
+    mocker: MockerFixture,
+) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.providers.gcp.run",
+        return_value=SimpleNamespace(returncode=0, stdout="tok-123\n"),
+    )
+    info = ClusterInfo(
+        name="c",
+        location="us-central1-a",
+        project="p",
+        agent_cloud_identity="rot-x@p.iam.gserviceaccount.com",
+    )
+    env = GcpProvider().sandbox_cloud_credential_env(info)
+    assert env["CLOUDSDK_AUTH_ACCESS_TOKEN"] == "tok-123"
+    assert env["GOOGLE_OAUTH_ACCESS_TOKEN"] == "tok-123"
+    assert env["CLOUDSDK_CORE_PROJECT"] == "p"
+    assert env["GOOGLE_CLOUD_PROJECT"] == "p"
+    assert mock_run.call_args.args[0] == [
+        "gcloud",
+        "auth",
+        "print-access-token",
+        "--impersonate-service-account=rot-x@p.iam.gserviceaccount.com",
+    ]
+
+
+def test_gcp_cloud_credential_env_fails_loud_when_the_mint_fails(
+    mocker: MockerFixture,
+) -> None:
+    mocker.patch(
+        "devops_bench.providers.gcp.run",
+        return_value=SimpleNamespace(returncode=1, stdout=""),
+    )
+    info = ClusterInfo(name="c", agent_cloud_identity="rot-x@p.iam.gserviceaccount.com")
+    with pytest.raises(SandboxError, match="serviceAccountTokenCreator"):
+        GcpProvider().sandbox_cloud_credential_env(info)
+
+
+def test_provider_default_cloud_credential_env_is_empty() -> None:
+    class Minimal(Provider):
+        def ensure_account_credentials(self) -> None: ...
+        def ensure_cluster_credentials(self, *args, **kwargs) -> ClusterInfo:
+            return ClusterInfo(name="c")
+
+        def cleanup(self, *args, **kwargs) -> None: ...
+        def resolve_variables(self, ctx, custom_variables):
+            return custom_variables
+
+    assert Minimal().sandbox_cloud_credential_env(ClusterInfo(name="c")) == {}
 
 
 # --- KindProvider --------------------------------------------------------------

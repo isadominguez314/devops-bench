@@ -45,3 +45,9 @@ variable "namespace" {
   description = "Kubernetes Namespace to deploy secret rotation test app"
   default     = "secret-rotation"
 }
+
+variable "token_creator_member" {
+  type        = string
+  description = "IAM member (user:... or serviceAccount:...) allowed to mint tokens for the agent's rotator service account; empty derives it from the provisioner's ADC identity when possible"
+  default     = ""
+}
