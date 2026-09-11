@@ -1202,12 +1202,19 @@ class DefaultEvalHarness(Harness):
             kubeconfig.write_text("apiVersion: v1\nkind: Config\n")
             kubeconfig.chmod(0o600)
         try:
+            # A mint failure raises: a failed record, never a run missing its credential.
+            cloud_credential_env = (
+                provider.sandbox_cloud_credential_env(cluster_info)
+                if with_cluster and provider is not None
+                else {}
+            )
             return replace(
                 self._agent_config.sandbox,
                 network=plan,
                 workspace=workspace_path,
                 kubeconfig=kubeconfig,
                 fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
+                cloud_credential_env=cloud_credential_env,
             )
         except Exception:
             # Provisioned, but no completed spec will carry the objects to the run-end teardown.

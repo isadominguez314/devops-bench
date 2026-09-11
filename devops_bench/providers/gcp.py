@@ -117,7 +117,13 @@ class GcpProvider(Provider):
             )
 
         return ClusterInfo.from_dict(
-            {"name": cluster_name, "location": location, "project": project}
+            {
+                "name": cluster_name,
+                "location": location,
+                "project": project,
+                # Only stacks whose task makes its own cloud API calls set this.
+                "agent_cloud_identity": (outputs or {}).get("agent_cloud_identity"),
+            }
         )
 
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
@@ -140,6 +146,47 @@ class GcpProvider(Provider):
                 cluster_info.project, cluster_info.location, cluster_info.name
             )
         )
+
+    def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
+        """Impersonate the task's service account host-side and mint a token.
+
+        No key file exists or is mounted and the operator's ADC never crosses.
+        The token lives at most an hour and is not refreshed in the container.
+        The provisioning identity needs ``roles/iam.serviceAccountTokenCreator``
+        on the account; the task's stack grants it.
+
+        Raises:
+            SandboxError: When the identity is named but no token was minted.
+        """
+        identity = cluster_info.agent_cloud_identity
+        if not identity:
+            return {}
+        result = run(
+            [
+                "gcloud",
+                "auth",
+                "print-access-token",
+                f"--impersonate-service-account={identity}",
+            ],
+            check=False,
+        )
+        token = (result.stdout or "").strip()
+        if result.returncode != 0 or not token:
+            raise SandboxError(
+                f"could not mint an access token for the agent's cloud identity "
+                f"{identity!r} (gcloud exit {result.returncode}); the provisioning "
+                "identity needs roles/iam.serviceAccountTokenCreator on it — "
+                "refusing to run the agent without the credential its task needs"
+            )
+        _log.info("minted a short-lived cloud credential for the sandboxed agent as %s", identity)
+        env = {
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": token,
+            "GOOGLE_OAUTH_ACCESS_TOKEN": token,
+        }
+        if cluster_info.project:
+            env["CLOUDSDK_CORE_PROJECT"] = cluster_info.project
+            env["GOOGLE_CLOUD_PROJECT"] = cluster_info.project
+        return env
 
     def cleanup(
         self,

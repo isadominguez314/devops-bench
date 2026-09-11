@@ -137,6 +137,8 @@ class SandboxSpec:
     the rest per task. ``fixture_mounts`` maps host path -> container path (RW);
     ``env_allowlist`` lets named vars cross despite a deny rule; ``owner`` scopes
     container names and the stray sweep to one attempt.
+    ``cloud_credential_env`` is the harness-minted, task-scoped cloud credential; it
+    bypasses the overlay filter and is empty for kubectl-only tasks.
     """
 
     image: str = ""
@@ -146,6 +148,7 @@ class SandboxSpec:
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
     owner: str = ""
+    cloud_credential_env: Mapping[str, str] = field(default_factory=dict)
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
@@ -455,6 +458,16 @@ class SandboxExecutor:
                 " ".join(argv),
             )
 
+    def _cloud_credential_env(self) -> dict[str, str]:
+        """The spec's minted cloud credential, minus container-owned names."""
+        kept: dict[str, str] = {}
+        for name, value in self.spec.cloud_credential_env.items():
+            if name in _CONTAINER_OWNED_ENV:
+                _log.warning("cloud credential env %s is container-owned; dropped", name)
+            else:
+                kept[name] = value
+        return kept
+
     def wrap_argv(
         self,
         cmd: Sequence[str | os.PathLike[str]],
@@ -468,7 +481,7 @@ class SandboxExecutor:
         ``--cap-drop=ALL`` and ``no-new-privileges``; the network plan and
         ``host.docker.internal:host-gateway``; ``--user`` on Linux so workspace
         files stay operator-owned; workspace RW, kubeconfig RO, fixtures RW;
-        overlay env as name-only ``-e`` (values ride the client env, never the
+        overlay env, then the minted cloud credential, as name-only ``-e`` (values ride the client env, never the
         argv); ``HOME``/``KUBECONFIG`` last so they win; no ``-i``.
         """
         spec = self.spec
@@ -489,6 +502,8 @@ class SandboxExecutor:
         for host_path, container_path in spec.fixture_mounts.items():
             argv += ["-v", f"{host_path}:{container_path}"]
         for name in filter_boundary_env(extra_env, spec.env_allowlist):
+            argv += ["-e", name]
+        for name in self._cloud_credential_env():
             argv += ["-e", name]
         argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
@@ -544,7 +559,7 @@ class SandboxExecutor:
             try:
                 completed = run(
                     wrapped,
-                    extra_env=crossing,
+                    extra_env={**crossing, **self._cloud_credential_env()},
                     check=check,
                     capture=capture,
                     text=text,
