@@ -83,7 +83,8 @@ each harness maps them onto its target.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `AGENT_MODEL` | unset | Model id; flows to the harness's target. |
+| `AGENT_MODEL` | unset | Model id; flows to the harness's target. See [agy model ids](#agy-model-ids) for the one harness that rewrites it. |
+| `AGENT_MODEL_EFFORT` | `high` | Reasoning tier for `antigravity`; ignored by every other harness. One of `low`, `medium`, `high` — an unknown value is rejected rather than passed through. |
 | `AGENT_PROVIDER` | unset | Provider key (e.g. `gemini`, `anthropic`, `google-vertex`). |
 | `AGENT_API_KEY` | unset | Routed onto the provider's key env var(s) via the shared contract; omitted for keyless backends (Vertex/Bedrock ADC). |
 | `AGENT_TARGET` | unset | Path to the CLI binary (`gemini` / `oc`). Ignored by `api`. |
@@ -99,6 +100,29 @@ each harness maps them onto its target.
 | `AGENT_ALLOWED_TOOLS` | unset | CSV of pre-approved tool names. |
 | `AGENT_SKILLS_PATHS` | unset | CSV of directories to discover `SKILL.md` files under. |
 | `AGENT_RULES_TEXT` | unset | Operator-brief text handed to the agent. |
+
+### agy model ids
+
+`AGENT_MODEL` is a single value shared by every arm and by the judge, and it is
+normally spelled for Vertex — `gemini-3.1-pro-preview`. The `antigravity`
+harness is the one exception: `agy` does not recognise the `-preview` suffix,
+and it refuses any selection that does not name a reasoning tier exactly once.
+Left alone it exits with `invalid model selection` before the run starts.
+
+So the harness rewrites the id rather than requiring the matrix to respell it —
+respelling `AGENT_MODEL` for that one arm would desynchronise its label from
+every other arm in the same run. `google/gemini-3.1-pro-preview` becomes
+`--model gemini-3.1-pro --effort high`, and the rewrite is logged.
+
+The tier is a scoring variable, not a formatting detail: `low` and `high` are
+materially different agents. `high` is the default because the other harnesses
+run their model with no reasoning throttle. Override it with
+`AGENT_MODEL_EFFORT`.
+
+A tier already spelled into `AGENT_MODEL` is honoured and nothing is added —
+both `gemini-3.1-pro-low` and the display-name form `Gemini 3.1 Pro (Low)`
+work. In that case `AGENT_MODEL_EFFORT` is ignored and no `--effort` is passed,
+because `agy` rejects a tiered id and the flag together.
 
 ### Example: gemini CLI with MCP + skills
 
@@ -377,6 +401,27 @@ working for them.
 > host-side `GEMINI_API_KEY` is simply absent and the CLI exits reporting that no
 > auth method is set — naming the very variable you exported. Export
 > `AGENT_API_KEY` and the sandboxed run routes it onward for you.
+
+### Task cloud credentials
+
+Some tasks require cloud API calls beyond `kubectl` — secret-rotation adds a
+Secret Manager secret version. The sandbox strips the operator's ambient cloud
+identity, so those calls get their own: the task's stack provisions a
+run-unique service account holding exactly the roles the task needs, scoped to
+exactly the resources it provisioned, and names it in an `agent_cloud_identity`
+output. When that output is present on a sandboxed run, the harness
+impersonates the account host-side, mints a short-lived access token, and
+injects it as `CLOUDSDK_AUTH_ACCESS_TOKEN` / `GOOGLE_OAUTH_ACCESS_TOKEN` (plus
+the project id). No key file exists, the operator's ADC never crosses, and the
+whole loop — account, role bindings, the provisioner's
+`serviceAccountTokenCreator` grant on it — tears down with the run's stack.
+
+Two properties to keep in mind. The token lives at most one hour and is not
+refreshed inside the container: an agent still making cloud calls past that
+gets a clean 401, not a silent widening. And a mint failure fails the run
+loudly — the alternative is an agent graded on a failure that was really a
+missing credential. Tasks that declare no `agent_cloud_identity` output are
+completely unaffected; nothing extra crosses for them.
 
 ## Adding your own harness
 

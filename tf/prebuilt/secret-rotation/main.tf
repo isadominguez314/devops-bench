@@ -36,13 +36,14 @@ provider "google" {
 
 # 1. GKE Cluster & GCP IAM/Secrets provisioning
 module "cluster" {
-  source       = "./cluster"
-  project_id   = var.project_id
-  cluster_name = var.cluster_name
-  location     = var.location
-  node_count   = var.node_count
-  machine_type = var.machine_type
-  namespace    = var.namespace
+  source               = "./cluster"
+  project_id           = var.project_id
+  cluster_name         = var.cluster_name
+  location             = var.location
+  node_count           = var.node_count
+  machine_type         = var.machine_type
+  namespace            = var.namespace
+  token_creator_member = var.token_creator_member
 }
 
 # 2. Dynamic GKE Credentials Loading
@@ -84,4 +85,9 @@ output "cluster_name" {
 
 output "cluster_location" {
   value = module.cluster.cluster_location
+}
+
+output "agent_cloud_identity" {
+  description = "Run-unique service account the sandboxed agent's Secret Manager calls run as."
+  value       = module.cluster.agent_cloud_identity
 }

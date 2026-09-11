@@ -47,6 +47,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.vertex_env import vertex_location
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import run
@@ -153,7 +154,11 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     flows from ``config.model``. A keyless backend (e.g. Vertex/ADC) writes no
     key. A Vertex backend additionally writes the google-genai routing vars
     (``GOOGLE_GENAI_USE_VERTEXAI`` plus project/location), since the SDK
-    otherwise talks to the Gemini API regardless of the configured provider.
+    otherwise talks to the Gemini API regardless of the configured provider. The
+    location comes from the shared
+    :func:`~devops_bench.agents.shared.vertex_env.vertex_location` chain, which
+    defaults to ``global`` — the only endpoint the ``-preview`` model ids are
+    published on.
 
     Args:
         config: Resolved :class:`AgentConfig` for this run.
@@ -184,11 +189,7 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
         if project:
             overlay["GOOGLE_CLOUD_PROJECT"] = project
-        overlay["GOOGLE_CLOUD_LOCATION"] = (
-            os.environ.get("GOOGLE_CLOUD_LOCATION")
-            or os.environ.get("GCP_LOCATION")
-            or "us-central1"
-        )
+        overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
