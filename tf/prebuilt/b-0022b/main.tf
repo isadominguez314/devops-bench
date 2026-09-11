@@ -58,6 +58,9 @@ resource "null_resource" "setup" {
       KUBECONFIG     = pathexpand(var.kubeconfig_path)
       MANIFESTS_DIR  = "${path.module}/manifests"
       WAIT_TIMEOUT   = var.wait_timeout
+      # setup.sh reads $HOME under set -u; a local-exec only inherits what
+      # the caller had.
+      HOME = pathexpand("~")
     }
   }
 }
