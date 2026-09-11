@@ -922,7 +922,29 @@ def test_vertex_auth_profile_seeded_for_headless_run() -> None:
     command = oc_mod._build_local_command(
         AgentConfig(provider="anthropic-vertex"), "hi", "operator", "oc"
     )
-    assert "models auth paste-api-key" in command
+    assert "models auth paste-api-key --provider anthropic-vertex --agent operator" in command
+    assert oc_mod._VERTEX_CREDENTIALS_MARKER in command
+
+
+def test_vertex_auth_profile_seeded_for_keyless_google_vertex() -> None:
+    """oc's auth store gates every keyless Vertex provider, not just the plugin one."""
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex"), "hi", "operator", "oc"
+    )
+    assert "models auth paste-api-key --provider google-vertex --agent operator" in command
+
+
+def test_vertex_auth_profile_skipped_for_a_keyed_run() -> None:
+    """A real key is already in the config; the marker would shadow it."""
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex", api_key="k"), "hi", "operator", "oc"
+    )
+    assert "paste-api-key" not in command
+
+
+def test_vertex_auth_profile_skipped_for_a_non_vertex_provider() -> None:
+    command = oc_mod._build_local_command(AgentConfig(provider="google"), "hi", "operator", "oc")
+    assert "paste-api-key" not in command
 
 
 _FAKE_EMULATOR_ENV = {
@@ -1018,6 +1040,35 @@ def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
     overlay = oc_mod._sandbox_provider_env(config, tmp_path)
     assert "GCE_METADATA_HOST" not in overlay
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "env,provider,api_key,expected",
+    [
+        ({}, "google-vertex", "", "global"),
+        ({"GOOGLE_CLOUD_LOCATION": "us-east5"}, "google-vertex", "", "us-east5"),
+        ({"GCP_VERTEX_LOCATION": "europe-west4"}, "google-vertex", "", "europe-west4"),
+        ({}, "google-vertex", "k", "global"),
+        ({}, "google", "k", None),
+    ],
+)
+def test_sandbox_overlay_pins_a_vertex_location(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    env: dict[str, str],
+    provider: str,
+    api_key: str,
+    expected: str | None,
+) -> None:
+    """oc aborts on Vertex without a location; keyed runs need one too, non-Vertex gets none."""
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    _install_fake_emulator(monkeypatch)
+    config = _sandboxed(tmp_path, provider=provider, api_key=api_key)
+    overlay = oc_mod._sandbox_provider_env(config, tmp_path)
+    assert overlay.get("GOOGLE_CLOUD_LOCATION") == expected
 
 
 def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
