@@ -121,6 +121,19 @@ class Provider(ABC):
             "wrote — override it, or run this provider unsandboxed"
         )
 
+    def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
+        """Mint a short-lived credential for the task's ``agent_cloud_identity``.
+
+        For tasks whose work includes cloud API calls beyond ``kubectl``. The
+        default mints nothing; an override must raise when the identity is
+        named but no credential can be produced.
+
+        Returns:
+            Env to inject into the sandboxed agent; empty when no identity.
+        """
+        del cluster_info
+        return {}
+
     def cleanup(
         self,
         cluster_info: ClusterInfo,
