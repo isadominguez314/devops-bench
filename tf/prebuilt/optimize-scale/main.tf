@@ -56,7 +56,10 @@ data "google_client_config" "default" {
 }
 
 provider "kubernetes" {
-  host                   = var.infra_provider == "gcp" ? "https://${module.cluster.endpoint}" : module.cluster.endpoint
+  # managed_endpoint, not endpoint: the latter names the vcluster submodule and
+  # configuring this provider from it is a dependency cycle (see the output's
+  # own comment in modules/cluster/outputs.tf).
+  host                   = var.infra_provider == "gcp" ? "https://${module.cluster.managed_endpoint}" : module.cluster.managed_endpoint
   token                  = var.infra_provider == "gcp" ? data.google_client_config.default[0].access_token : null
   client_certificate     = var.infra_provider == "kind" ? module.cluster.client_certificate : null
   client_key             = var.infra_provider == "kind" ? module.cluster.client_key : null
@@ -75,6 +78,36 @@ provider "kubernetes" {
 # Image: registry.k8s.io/hpa-example — the canonical CPU-burn app from the
 # Kubernetes HPA walkthrough; each HTTP request consumes CPU, so generated load
 # drives CPU up and a correctly-configured HPA scales out.
+# metrics-server, kind only. The HPA objective grades ScalingActive=True, which
+# needs a live metrics pipeline; GKE ships one and a stock kind cluster does
+# not, so without this the objective fails for provider reasons rather than for
+# anything the agent did. Same install the b-0011 / b-0024 stacks use.
+resource "null_resource" "metrics_server" {
+  count = var.infra_provider == "kind" ? 1 : 0
+
+  depends_on = [module.cluster]
+
+  triggers = {
+    cluster = module.cluster.cluster_name
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      kubectl apply -f "https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.9.0/components.yaml"
+      kubectl -n kube-system get deploy metrics-server -o json \
+        | jq '(.spec.template.spec.containers[0].args) += ["--kubelet-insecure-tls"]' \
+        | kubectl apply -f -
+      kubectl -n kube-system rollout status deploy/metrics-server --timeout=180s
+    EOT
+
+    environment = {
+      KUBECONFIG = pathexpand(var.kubeconfig_path)
+    }
+  }
+}
+
 resource "kubernetes_deployment_v1" "target" {
   metadata {
     name      = var.target_deployment_name

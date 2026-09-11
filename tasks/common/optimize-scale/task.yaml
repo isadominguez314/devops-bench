@@ -7,15 +7,31 @@ name: "optimize-scale"
 # target_deployment_name/namespace can be substituted straight into the
 # {{TARGET_DEPLOYMENT_NAME}}/{{NAMESPACE}} placeholders below.
 #
-# Pinned to gcp because the objectives depend on a working metrics pipeline:
-# GKE ships metrics-server, a stock KinD cluster does not, so the HPA would
-# report ScalingActive=False there for reasons that have nothing to do with the
-# agent. INFRA_PROVIDER=kind still provisions and still runs, but expect the
-# metrics objective to fail; see README.md.
+# Runs on kind. This task was pinned to gcp for two reasons; measurement has
+# now retired both:
+#
+#   1. The objectives depend on a working metrics pipeline. GKE ships
+#      metrics-server; a stock kind cluster does not, so ScalingActive would
+#      read False for reasons that have nothing to do with the agent. The
+#      stack now installs metrics-server itself under infra_provider=kind, so
+#      this reason no longer holds on its own.
+#   2. The load path was the stronger argument for GKE: a LoadBalancer the
+#      chaos generator reaches directly, versus a port-forward on kind. It ran
+#      the other way in practice. On GKE fortio never connects at all — the
+#      LB's external IP is unreachable from the runner (`dial tcp <ip>:8080:
+#      i/o timeout`; the project's firewall admits only 22/3389/443). On kind
+#      the port-forward connects and serves the spike. The 8-of-8 injection
+#      failures were not the port-forward: every chaos command shared a 40s
+#      ceiling that killed this task's declared 300s spike outright.
+#
+# INFRA_PROVIDER=gcp still selects GKE, and remains the better load path the
+# day the runner can reach a LoadBalancer. Whichever is used, every runner must
+# use the SAME one: the provider changes the Service type and the load path, so
+# a kind arm and a GKE arm are not comparable on this task.
 infrastructure:
   deployer: "tofu"
   stack: "prebuilt/optimize-scale"
-  provider: "gcp"
+  provider: "kind"
   teardown: true
   variables:
     namespace: "default"

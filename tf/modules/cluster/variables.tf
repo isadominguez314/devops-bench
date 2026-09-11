@@ -134,3 +134,9 @@ variable "node_port" {
   description = "Static port override for local KinD testing (vcluster-only)"
   default     = null
 }
+
+variable "disable_default_cni" {
+  description = "Replace kind's built-in kindnet with Calico. kindnet does not enforce NetworkPolicy, so a task that grades policy enforcement needs this."
+  type        = bool
+  default     = false
+}

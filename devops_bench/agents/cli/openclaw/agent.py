@@ -60,6 +60,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from devops_bench.agents import sandbox
 from devops_bench.agents.base import AGENTS, AgentHarness
 from devops_bench.agents.cli.openclaw.parsing import (
     _pick_session_key,
@@ -127,6 +128,9 @@ _log = get_logger("agents.cli.openclaw.agent")
 # Per-run layout under the temp working dir. ``state`` is openclaw's state root
 # (sessions + the managed skills tree); ``openclaw.json`` is the isolated config
 # carrying ``mcp.servers``.
+# The image ships its own oc on PATH; the host binary path is meaningless
+# inside the container.
+_CONTAINER_OC_BIN = "oc"
 _OPENCLAW_STATE_DIRNAME = "state"
 _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
@@ -473,6 +477,14 @@ class OpenClawAgent(AgentHarness):
             per-run isolated one written for MCP).
     """
 
+    # The agent turn goes through run_agent_cmd, so it is contained. The
+    # post-run ``oc sessions`` / ``export-trajectory`` calls stay on the host
+    # by design: session state lives in ``<workspace>/state``, which is the
+    # bind mount itself, so the host reads exactly the bytes the container
+    # wrote — with the host spelling of the path, and without keeping a
+    # container alive past the agent's turn just to read a directory.
+    supports_sandbox = True
+
     def __init__(self, config: AgentConfig | None = None, *, agent_name: str = "main") -> None:
         AgentHarness.__init__(self, config)
         self.agent_name = agent_name
@@ -522,7 +534,28 @@ class OpenClawAgent(AgentHarness):
                 config_path.write_text(json.dumps(config_payload, indent=2))
                 env_overlay["OPENCLAW_CONFIG_PATH"] = str(config_path)
 
-            command = _build_local_command(self.config, final_prompt, self.agent_name, oc_bin)
+            # Two overlays, because the agent turn and the post-run extraction
+            # run on opposite sides of the boundary. The agent needs the
+            # container spelling of every path that crosses in its env; the
+            # extraction runs on the host afterwards and needs the host
+            # spelling. They read the same bytes either way: the state dir
+            # lives under the workspace, which IS the bind mount, so whatever
+            # the agent writes inside the container is on the host when it
+            # exits. Unsandboxed the two overlays are identical.
+            agent_env = dict(env_overlay)
+            agent_oc_bin = oc_bin
+            spec = self.config.sandbox
+            if spec is not None and spec.workspace is not None:
+                agent_env["OPENCLAW_STATE_DIR"] = sandbox.container_path(spec.workspace, state_dir)
+                if "OPENCLAW_CONFIG_PATH" in agent_env:
+                    agent_env["OPENCLAW_CONFIG_PATH"] = sandbox.container_path(
+                        spec.workspace, agent_env["OPENCLAW_CONFIG_PATH"]
+                    )
+                # The host binary path means nothing inside the image, which
+                # ships its own oc on PATH.
+                agent_oc_bin = _CONTAINER_OC_BIN
+
+            command = _build_local_command(self.config, final_prompt, self.agent_name, agent_oc_bin)
 
             # TODO(follow-up): on timeout this SIGKILLs only the bash child,
             # orphaning the oc/gcloud/kubectl/MCP process tree (which keeps
@@ -532,12 +565,13 @@ class OpenClawAgent(AgentHarness):
             try:
                 # bash -c (as argv, never shell=True) so nvm.sh can be sourced;
                 # every value interpolated into `command` is shlex.quoted.
-                completed = run(
+                completed = self.run_agent_cmd(
                     ["/bin/bash", "-c", command],
                     cwd=str(workdir),
-                    extra_env=env_overlay,
+                    extra_env=agent_env,
                     check=False,
                     timeout=self.config.timeout_sec,
+                    host_run=run,
                 )
             except SubprocessError:
                 # With check=False the only SubprocessError here is a timeout.
