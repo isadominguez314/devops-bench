@@ -114,16 +114,30 @@ resource "google_secret_manager_secret_iam_member" "agent_secret_accessor" {
   member    = "serviceAccount:${google_service_account.agent_rotator.email}"
 }
 
+# Who may mint tokens for the rotator account. An explicit
+# var.token_creator_member wins; otherwise the provisioner's own identity is
+# derived from the ADC userinfo endpoint. That derivation is best-effort: a
+# VM service-account credential without the userinfo-email scope reads a null
+# email here, in which case the binding is skipped and the harness's mint
+# fails loud, naming the missing grant — never a silent unsandboxed run.
 data "google_client_openid_userinfo" "provisioner" {}
 
+locals {
+  provisioner_email = data.google_client_openid_userinfo.provisioner.email
+  token_creator_member = (
+    var.token_creator_member != "" ? var.token_creator_member
+    : local.provisioner_email == null || local.provisioner_email == "" ? ""
+    : endswith(local.provisioner_email, "gserviceaccount.com")
+    ? "serviceAccount:${local.provisioner_email}"
+    : "user:${local.provisioner_email}"
+  )
+}
+
 resource "google_service_account_iam_member" "agent_rotator_token_creator" {
+  count              = local.token_creator_member == "" ? 0 : 1
   service_account_id = google_service_account.agent_rotator.name
   role               = "roles/iam.serviceAccountTokenCreator"
-  member = (
-    endswith(data.google_client_openid_userinfo.provisioner.email, "gserviceaccount.com")
-    ? "serviceAccount:${data.google_client_openid_userinfo.provisioner.email}"
-    : "user:${data.google_client_openid_userinfo.provisioner.email}"
-  )
+  member             = local.token_creator_member
 }
 
 # 10. Runner identity: BYO credentials.

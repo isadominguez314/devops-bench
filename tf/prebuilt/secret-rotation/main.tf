@@ -36,13 +36,14 @@ provider "google" {
 
 # 1. GKE Cluster & GCP IAM/Secrets provisioning
 module "cluster" {
-  source       = "./cluster"
-  project_id   = var.project_id
-  cluster_name = var.cluster_name
-  location     = var.location
-  node_count   = var.node_count
-  machine_type = var.machine_type
-  namespace    = var.namespace
+  source               = "./cluster"
+  project_id           = var.project_id
+  cluster_name         = var.cluster_name
+  location             = var.location
+  node_count           = var.node_count
+  machine_type         = var.machine_type
+  namespace            = var.namespace
+  token_creator_member = var.token_creator_member
 }
 
 # 2. Dynamic GKE Credentials Loading
