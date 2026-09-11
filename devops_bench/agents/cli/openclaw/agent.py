@@ -138,7 +138,17 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
 # catalog; the harness registers these per-run (see :func:`_build_model_override`).
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
-_CATALOG_OVERRIDES: frozenset[str] = frozenset({"gemini-3.5-flash"})
+_CATALOG_OVERRIDES: frozenset[str] = frozenset(
+    {
+        "gemini-3.5-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        "claude-fable-5-1",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-5",
+    }
+)
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
 # built-in provider rather than merging, so without ``api`` oc falls back to the
@@ -152,7 +162,67 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
         "api": "google-vertex",
         "baseUrl": "https://{location}-aiplatform.googleapis.com",
     },
+    "anthropic-vertex": {
+        "api": "anthropic-messages",
+        "baseUrl": "https://aiplatform.googleapis.com",
+        "apiKey": "gcp-vertex-credentials",
+    },
 }
+# Per-run layout of the node-fetch->native-fetch ESM loader shim (see
+# :func:`_write_node_fetch_shim`), written under the run's own workdir so it
+# is visible inside the sandboxed container at ``/workspace/node-fetch-shim``.
+_NODE_FETCH_SHIM_DIRNAME = "node-fetch-shim"
+
+_NODE_FETCH_REGISTER_MJS = (
+    "import { register } from 'node:module';\nregister('./hooks.mjs', import.meta.url);\n"
+)
+
+_NODE_FETCH_HOOKS_MJS = (
+    "export async function resolve(specifier, context, next) {\n"
+    "  if (specifier === 'node-fetch') {\n"
+    "    return { url: new URL('./fetch.mjs', import.meta.url).href, shortCircuit: true };\n"
+    "  }\n"
+    "  return next(specifier, context);\n"
+    "}\n"
+)
+
+_NODE_FETCH_FETCH_MJS = (
+    "const f = (...a) => globalThis.fetch(...a);\n"
+    "export default f;\n"
+    "export const Headers = globalThis.Headers;\n"
+    "export const Request = globalThis.Request;\n"
+    "export const Response = globalThis.Response;\n"
+)
+
+
+def _write_node_fetch_shim(workdir: Path) -> None:
+    """Write the node-fetch->native-fetch ESM loader shim into ``workdir``.
+
+    Works around a gaxios (7.3.1, google-auth-library's HTTP layer) bug inside
+    the agent-sandbox image: with no ``window`` global, gaxios does
+    ``(await import('node-fetch')).default`` to reach the compute-SA metadata
+    server, and that dynamic import throws ("Cannot convert undefined or null
+    to object") because node-fetch is not installed in the image. A Node
+    module-customization hook (registered via ``NODE_OPTIONS``, see the
+    sandboxed branch of :meth:`OpenClawAgent._execute`) intercepts only the
+    bare ``node-fetch`` specifier and resolves it to a tiny shim built on
+    Node's native ``fetch``; every other import passes through unchanged.
+
+    Files are written world-readable (0o644, dir 0o755): the container's own
+    ``--user`` may not match whichever uid this (possibly privileged) process
+    runs as, so permission bits do the work instead of a chown.
+    """
+    shim_dir = workdir / _NODE_FETCH_SHIM_DIRNAME
+    shim_dir.mkdir(exist_ok=True)
+    shim_dir.chmod(0o755)
+    for name, content in (
+        ("register.mjs", _NODE_FETCH_REGISTER_MJS),
+        ("hooks.mjs", _NODE_FETCH_HOOKS_MJS),
+        ("fetch.mjs", _NODE_FETCH_FETCH_MJS),
+    ):
+        path = shim_dir / name
+        path.write_text(content)
+        path.chmod(0o644)
 
 
 def _oc_model_id(config: AgentConfig) -> str:
@@ -374,12 +444,36 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     # Resolve unconditionally so an unknown provider fails loud even on a keyless
     # (Vertex/ADC) run, not only when a key happens to be set.
     spec = resolve_provider(config.provider)
-    overlay: dict[str, str] = {}
+    overlay: dict[str, str] = {
+        var: os.environ[var] for var in spec.api_key_envs if os.environ.get(var)
+    }
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
     if config.extra_env:
         overlay.update(config.extra_env)
+    return overlay
+
+
+def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
+    """Forward explicit provider routing and enable metadata auth in the image."""
+    overlay = {
+        name: os.environ[name]
+        for name in (
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "GOOGLE_GENAI_USE_VERTEXAI",
+            "GCP_PROJECT_ID",
+            "GCP_VERTEX_LOCATION",
+            "GOOGLE_CLOUD_API_KEY",
+        )
+        if name in os.environ
+    }
+    _write_node_fetch_shim(workdir)
+    overlay["NODE_OPTIONS"] = "--import=/workspace/node-fetch-shim/register.mjs"
+    if _oc_provider_or_none(config) == "anthropic-vertex":
+        overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
+        overlay.setdefault("GOOGLE_CLOUD_API_KEY", "gcp-vertex-credentials")
     return overlay
 
 
@@ -397,6 +491,43 @@ def _oc_model_flag(config: AgentConfig) -> str:
     if not model_id:
         return ""
     return f"--model {shlex.quote(model_id)} "
+
+
+def _oc_provider_or_none(config: AgentConfig) -> str | None:
+    """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
+
+    Shared by :func:`_needs_anthropic_vertex_auth_profile` and the sandboxed
+    anthropic-vertex env passthrough in :meth:`OpenClawAgent._execute`, so the
+    "is this run on anthropic-vertex" check has exactly one implementation.
+    """
+    try:
+        return resolve_provider(config.provider).oc_provider
+    except ConfigError:
+        return None
+
+
+def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
+    """Return whether this run must register a headless anthropic-vertex auth profile.
+
+    Confirmed live against openclaw 2026.9.1-beta.1 + anthropic-vertex-provider
+    2026.9.1-beta.1 (the first pairing where the plugin is correctly discovered
+    as a stock plugin -- see the Dockerfile comment): even with valid ADC
+    credentials on disk and the ``gcp-vertex-credentials`` marker pinned on
+    ``models.providers.anthropic-vertex.apiKey`` (see :data:`_PROVIDER_TRANSPORT`),
+    a bare run still aborts with ``ProviderAuthError: No API key found for
+    provider "anthropic-vertex"``. This version introduced a per-agent SQLite
+    auth-profile store that gates model auth *before* the plugin's own
+    ADC-detecting ``resolveSyntheticAuth`` hook is consulted, so the marker in
+    config is no longer sufficient on its own -- an explicit profile entry must
+    exist in that store too.
+
+    ``oc models auth paste-api-key --provider anthropic-vertex`` registers
+    that entry non-interactively (it reads the key from stdin, no TTY
+    required), so it is safe to run unattended before every keyless
+    anthropic-vertex turn (see :func:`_build_local_command`). It is a no-op
+    correctness-wise for a run that already carries an explicit API key.
+    """
+    return _oc_provider_or_none(config) == "anthropic-vertex" and not config.api_key
 
 
 def _prepend_rules(rules_text: str, prompt: str) -> str:
@@ -439,6 +570,13 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
         ``core.subprocess.run``.
     """
     quoted_oc = shlex.quote(oc_bin)
+    auth_setup = ""
+    if _needs_anthropic_vertex_auth_profile(config):
+        marker = _PROVIDER_TRANSPORT["anthropic-vertex"]["apiKey"]
+        auth_setup = (
+            f"printf '%s\\n' {shlex.quote(marker)} | {quoted_oc} models auth paste-api-key "
+            f"--provider anthropic-vertex --agent {shlex.quote(agent_name)}; "
+        )
     extra_flags_str = (
         " ".join(shlex.quote(f) for f in config.extra_flags) + " " if config.extra_flags else ""
     )
@@ -447,7 +585,7 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
         # inherited NVM_DIR (custom install path) wins over the default.
         'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; '
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
-        f"{quoted_oc} --log-level debug agent --local "
+        f"{auth_setup}{quoted_oc} --log-level debug agent --local "
         f"--agent {shlex.quote(agent_name)} {_oc_model_flag(config)}"
         f"{extra_flags_str}-m {shlex.quote(prompt)}"
     )
@@ -546,6 +684,7 @@ class OpenClawAgent(AgentHarness):
             agent_oc_bin = oc_bin
             spec = self.config.sandbox
             if spec is not None and spec.workspace is not None:
+                agent_env = {**_sandbox_provider_env(self.config, workdir), **agent_env}
                 agent_env["OPENCLAW_STATE_DIR"] = sandbox.container_path(spec.workspace, state_dir)
                 if "OPENCLAW_CONFIG_PATH" in agent_env:
                     agent_env["OPENCLAW_CONFIG_PATH"] = sandbox.container_path(

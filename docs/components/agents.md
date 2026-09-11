@@ -427,3 +427,25 @@ completely unaffected; nothing extra crosses for them.
 
 Want to wrap a different agent? See
 [Add an agent harness](../how-to/add-an-agent-harness.md).
+
+### Concurrent sandbox runs and external user IDs
+
+A caller may set `BENCH_AGENT_SANDBOX_OWNER` to a unique alphanumeric attempt ID
+(underscores allowed). Agent container names then include that ID; startup
+recovery only reaps containers belonging to the same owner. Never reuse an owner
+for concurrent attempts. Without an owner, startup recovery is a no-op; legacy
+orphans require explicit operator recovery.
+
+For host IDs above Docker's signed 32-bit limit, the sandbox runs as 1000:1000.
+Ownership remapping covers the workspace, fixture mounts and the generated
+single-cluster kubeconfig, then restores the host ownership after execution.
+The agent's kubeconfig mount remains read-only. Provider authentication uses
+explicit overlays; host credential files are not copied into the sandbox.
+
+
+OpenClaw's per-run catalog also registers `gemini-3.8-flash` with the `google`
+or `google-vertex` provider, and `claude-fable-5-1` with `anthropic-vertex`.
+Select them with `AGENT_MODEL` and `AGENT_PROVIDER`; the harness pins the matching
+transport in the isolated run configuration. Model IDs follow the
+[Gemini documentation](https://ai.google.dev/gemini-api/docs/latest-model) and
+[Claude on Vertex documentation](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/fable-5-1).
