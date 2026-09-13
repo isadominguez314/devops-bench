@@ -15,6 +15,9 @@ served by SGLang with a 256K context.
   { "dns": ["8.8.8.8", "8.8.4.4"], "mtu": 1460 }
   ```
 
+- The Ubuntu accelerator images ship `net.ipv4.ip_forward = 0`; set it to 1
+  (and persist it under `/etc/sysctl.d/`) or containers have no egress at all,
+  whatever the MTU says.
 - Sandboxed runs reach the host as `host.docker.internal`; add
   `127.0.0.1 host.docker.internal` to `/etc/hosts` so unsandboxed runs resolve
   the same name.
