@@ -25,7 +25,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentResult
@@ -43,7 +43,6 @@ from devops_bench.cheat_detection import (
     annotate_records,
     baseline_from_granted_paths,
     build_inventory_rules,
-    build_mount_rules,
     drop_fingerprints_matching_inputs,
     filter_rules_for_prompt,
     load_ruleset,
@@ -1300,9 +1299,7 @@ class DefaultEvalHarness(Harness):
                     task.agent_pod_security,
                 )
                 self._active_sandbox_spec = completed_spec
-                self._inventory_sandbox_home(
-                    task.name, workspace_path / "home", completed_spec.fixture_mounts
-                )
+                self._inventory_sandbox_home(task.name, workspace_path / "home")
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
@@ -1632,7 +1629,6 @@ class DefaultEvalHarness(Harness):
         self,
         task_name: str,
         home: Path,
-        fixture_mounts: Mapping[str, str] | None = None,
     ) -> None:
         """Point the pre-run detection inventory at the sandbox home.
 
@@ -1645,13 +1641,11 @@ class DefaultEvalHarness(Harness):
         here (a future harness step seeding the home) gets covered
         automatically.
 
-        Fixture mounts are covered separately: they only materialize inside
-        the container, so the host-side scan above cannot see them. Each
-        mounted name gets a container-path rule
-        (:func:`~devops_bench.cheat_detection.build_mount_rules`); the per-record
-        prompt filter then authorizes the ones the task itself names, leaving
-        anything the discovery glob swept in that the prompt never asked for
-        — a prior run's leftover on a reused cluster name — flagged.
+        Fixture mounts are deliberately **not** covered. They are this run's
+        declared input — ``discover_fixture_mounts`` matches only top-level
+        home entries carrying the run-unique cluster token — so a mount cannot
+        be another run's material, and rules keyed on prompt wording flagged
+        honest reads of a delivered input the prompt happens not to name.
         Best-effort, like the run-level inventory.
         """
         if not (self.cheat_detect and self.cheat_inventory):
@@ -1662,12 +1656,6 @@ class DefaultEvalHarness(Harness):
                 baseline=DEFAULT_BASELINE
                 | baseline_from_granted_paths(home, self._granted_skill_paths),
             )
-            mounted_names = [
-                PurePosixPath(container_path).name
-                for container_path in (fixture_mounts or {}).values()
-            ]
-            if mounted_names:
-                rules += build_mount_rules(agent_sandbox.CONTAINER_HOME, mounted_names)
             self._sandbox_inventory_rules[task_name] = rules
         except Exception:  # noqa: BLE001 - detection must never block execution
             _log.exception(
