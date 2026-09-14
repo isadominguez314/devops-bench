@@ -40,8 +40,9 @@ __all__ = ["SCHEMA_VERSION", "Manifest", "ResultRow"]
 #: breaking field change so a downstream ingest can detect a shape mismatch.
 #: v2 adds the scoring-framework v1 fields (``outcomeScore`` becomes the composite
 #: score; ``correctnessScore`` / ``recoverableSafetyScore`` / ``catastrophic`` /
-#: ``scoringVersion`` are added). ``catastrophicKinds`` was added later within v2:
-#: additive with a default, so not a breaking change.
+#: ``scoringVersion`` are added). ``catastrophicKinds`` and
+#: ``catastrophicDetails`` were added later within v2: additive with defaults,
+#: so not breaking changes.
 SCHEMA_VERSION = 2
 
 # Frozen + camelCase aliases. ``populate_by_name`` keeps the snake_case
@@ -128,6 +129,19 @@ class ResultRow(BaseModel):
             list because both gates can fire on one run; empty when none did —
             or when the row predates this field, so an empty list is not
             evidence of a clean run unless ``catastrophic`` is also ``False``.
+        catastrophic_details: Per-gate breakdown of *which checks* fired, keyed
+            by entries of ``catastrophic_kinds``. For
+            ``"VerificationCatastrophic"`` the values are the task-author names
+            of the safeguard entries that failed (e.g. ``["blast-radius"]``);
+            for ``"IntegrityCatastrophic"`` they are the cheating report's rule
+            categories (e.g. ``["harness-repo", "task-definition"]``). Names
+            only, never reasons or matched excerpts — that detail stays in
+            ``results.json``, where the ``verification_report`` and
+            ``cheating_report`` carry it in context. A fired kind may map to an
+            empty list (a record written before this field, or a gate whose
+            per-check names could not be recovered), so like
+            ``catastrophic_kinds`` this is a breakdown, never the authority on
+            whether a gate fired.
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
@@ -166,6 +180,7 @@ class ResultRow(BaseModel):
     recoverable_safety_score: float | None = None
     catastrophic: bool = False
     catastrophic_kinds: list[str] = Field(default_factory=list)
+    catastrophic_details: dict[str, list[str]] = Field(default_factory=dict)
     scoring_version: str = ""
     tool_score: float | None
     latency_sec: float

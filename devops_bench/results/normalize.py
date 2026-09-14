@@ -28,6 +28,7 @@ from typing import Any, NamedTuple
 
 from devops_bench.core import score_keys
 from devops_bench.results.row import Manifest, ResultRow
+from devops_bench.verification.rollup import failed_catastrophic_names
 
 __all__ = [
     "OUTCOME_SCORE_KEY",
@@ -69,6 +70,44 @@ _RECOVERABLE_KEYS = (
 # definition. The keys that fired are surfaced verbatim as the row's
 # ``catastrophicKinds``, so the key name doubles as the failure type.
 _CATASTROPHIC_KEYS = score_keys.CATASTROPHIC_SCORE_KEYS
+
+
+def _verification_catastrophic_names(record: Mapping[str, Any]) -> list[str]:
+    """Name the failed catastrophic safeguards from the record's report.
+
+    Delegates the "did this entry fire" predicate to
+    :func:`~devops_bench.verification.rollup.failed_catastrophic_names`, the
+    module whose rollup produced the gate score in the first place — re-deriving
+    it here could list names that disagree with the zero the score applied.
+    """
+    report = record.get("verification_report")
+    return failed_catastrophic_names(report) if isinstance(report, list) else []
+
+
+def _integrity_categories(record: Mapping[str, Any]) -> list[str]:
+    """Read the rule categories off the record's ``cheating_report``.
+
+    Type-checked the same way ``IntegrityMetric`` reads them: the report is
+    persisted data, so a malformed ``categories`` yields ``[]`` rather than an
+    exception that would sink the whole ``build_rows`` pass.
+    """
+    report = record.get("cheating_report")
+    if not isinstance(report, Mapping):
+        return []
+    raw = report.get("categories")
+    return [c for c in raw if isinstance(c, str)] if isinstance(raw, list) else []
+
+
+# What to publish as a fired gate's ``catastrophicDetails`` entry: the names of
+# the individual checks behind it, read from the raw record (this layer sees
+# the full record, not just ``scores``). A gate key with no reader here still
+# fires, flags, and lands in ``catastrophicKinds`` with no wiring — its details
+# are just an empty list until a reader is added, which the row schema
+# documents as "unknown", not "clean".
+_CATASTROPHIC_DETAIL_READERS: dict[str, Any] = {
+    score_keys.VERIFICATION_CATASTROPHIC_KEY: _verification_catastrophic_names,
+    score_keys.INTEGRITY_CATASTROPHIC_KEY: _integrity_categories,
+}
 
 # Token usage aliases per provider, in lookup priority. The canonical keys
 # (``input`` / ``cached`` / ``reasoning`` / ``output``; see
@@ -299,6 +338,12 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         tokens = normalize_tokens(record.get("tokens"))
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
+        # Keyed off the kinds that fired, not off the raw reports, so a detail
+        # can never appear for a gate the score did not apply.
+        catastrophic_details = {
+            kind: reader(record) if (reader := _CATASTROPHIC_DETAIL_READERS.get(kind)) else []
+            for kind in catastrophic_kinds
+        }
         rows.append(
             ResultRow(
                 setup_id=manifest.setup_id,
@@ -315,6 +360,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 recoverable_safety_score=_first_score(scores, _RECOVERABLE_KEYS),
                 catastrophic=bool(catastrophic_kinds),
                 catastrophic_kinds=catastrophic_kinds,
+                catastrophic_details=catastrophic_details,
                 scoring_version=_scoring_version(scores),
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
                 latency_sec=float(record.get("latency") or 0.0),

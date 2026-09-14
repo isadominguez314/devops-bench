@@ -28,8 +28,21 @@ from typing import Any
 
 __all__ = [
     "RollupScores",
+    "failed_catastrophic_names",
     "rollup",
 ]
+
+
+def _effective_status(item: Mapping[str, Any]) -> str:
+    """Resolve an entry's status, deriving it from ``success`` for legacy rows.
+
+    An entry without a ``status`` key predates status tracking; ``success``
+    is the only verdict it carries, so it maps onto "pass"/"fail".
+    """
+    status = item.get("status")
+    if status is None:
+        status = "pass" if item.get("success") else "fail"
+    return status
 
 
 @dataclass(frozen=True)
@@ -96,9 +109,7 @@ def rollup(evaluated: Iterable[Mapping[str, Any]], *, parse_error_count: int = 0
 
     for item in evaluated:
         declared += 1
-        status = item.get("status")
-        if status is None:
-            status = "pass" if item.get("success") else "fail"
+        status = _effective_status(item)
         if status == "error":
             errored += 1
             continue
@@ -131,3 +142,37 @@ def rollup(evaluated: Iterable[Mapping[str, Any]], *, parse_error_count: int = 0
         declared=declared,
         errored=errored,
     )
+
+
+def failed_catastrophic_names(evaluated: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Name every catastrophic safeguard that fired, in declaration order.
+
+    Lives beside :func:`rollup` so "this entry fired" has exactly one
+    definition: an entry counts here iff it is what flips ``catastrophic`` to
+    ``0.0`` there — a ``safeguard`` of ``catastrophic`` severity whose
+    effective status is neither "pass" nor "error" (an errored entry was never
+    evaluated and is excluded from the gate). A consumer re-deriving the
+    predicate could list names that disagree with the gate the score actually
+    applied.
+
+    Args:
+        evaluated: The same per-entry mappings :func:`rollup` consumes.
+
+    Returns:
+        The ``name`` of each fired entry, in input order. An entry whose
+        ``name`` is missing or not a string (a malformed legacy record — the
+        spec requires one) is silently omitted, so the list can be shorter
+        than the number of entries that fired; it is a breakdown, never the
+        authority on whether the gate fired.
+    """
+    names: list[str] = []
+    for item in evaluated:
+        if item.get("role") != "safeguard" or item.get("severity") != "catastrophic":
+            continue
+        status = _effective_status(item)
+        if status in ("pass", "error"):
+            continue
+        name = item.get("name")
+        if isinstance(name, str):
+            names.append(name)
+    return names
