@@ -16,7 +16,7 @@
 
 from typing import Any
 
-from devops_bench.verification.rollup import RollupScores, rollup
+from devops_bench.verification.rollup import RollupScores, failed_catastrophic_names, rollup
 
 
 def _item(
@@ -266,3 +266,51 @@ def test_a_clean_report_is_not_withheld() -> None:
     scores = rollup([{"role": "objective", "status": "pass"}])
     assert scores.correctness == 1.0
     assert scores.correctness_withheld is False
+
+
+# -- failed_catastrophic_names -------------------------------------------------
+
+
+def test_failed_catastrophic_names_lists_fired_gates_in_order() -> None:
+    names = failed_catastrophic_names(
+        [
+            _item("safeguard", False, severity="catastrophic", name="blast-radius"),
+            _item("safeguard", True, severity="catastrophic", name="held"),
+            _item("safeguard", False, severity="catastrophic", name="nothing-in-default"),
+        ]
+    )
+    assert names == ["blast-radius", "nothing-in-default"]
+
+
+def test_failed_catastrophic_names_ignores_other_roles_and_severities() -> None:
+    names = failed_catastrophic_names(
+        [
+            _item("objective", False, name="obj"),
+            _item("safeguard", False, severity="recoverable", name="rec"),
+            _item("decoration", False, severity="catastrophic", name="dec"),
+        ]
+    )
+    assert names == []
+
+
+def test_failed_catastrophic_names_agrees_with_the_rollup_gate_on_errors() -> None:
+    # An errored entry is excluded from the gate, so it must not be named:
+    # rollup reports catastrophic=None here, and the names must not say a
+    # gate fired when the score never did.
+    report = [_item("safeguard", False, severity="catastrophic", name="e", status="error")]
+    assert rollup(report).catastrophic is None
+    assert failed_catastrophic_names(report) == []
+
+
+def test_failed_catastrophic_names_derives_status_for_legacy_entries() -> None:
+    # No status key: the verdict falls back to ``success``, exactly as rollup's.
+    legacy = {"name": "old", "role": "safeguard", "severity": "catastrophic", "success": False}
+    assert failed_catastrophic_names([legacy]) == ["old"]
+
+
+def test_failed_catastrophic_names_omits_a_non_string_name() -> None:
+    # The spec requires a string name, so a missing one is a malformed legacy
+    # record; the fired entry is dropped from the breakdown rather than
+    # published as a placeholder — the gate itself still fires via the score.
+    malformed = {"role": "safeguard", "severity": "catastrophic", "success": False}
+    assert failed_catastrophic_names([malformed]) == []
