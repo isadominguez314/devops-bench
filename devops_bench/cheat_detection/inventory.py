@@ -31,13 +31,14 @@ is blind to it. What each snapshot yields:
   scanned surface, so the entry's name echoing through tool output (an
   ``ls ~``, a grep error trail) flags too: the agent had no reason to be
   looking; and
-* a **content-fingerprint rule** per small text leftover that the *run-start*
-  snapshot already saw: its most distinctive lines, matched only against tool
+* a **content-fingerprint rule** per small text leftover the *run-start*
+  snapshot already saw — plus, mid-batch, per entry left by a *differently
+  named* task: its most distinctive lines, matched only against tool
   ``result``/``output`` surfaces. A read of the stale file reproduces those
-  exact lines; a freshly written file does not. Entries that appear mid-batch
-  get their path rule but no fingerprint — see ``fingerprint_only`` in
-  :func:`build_inventory_rules` for why the honest repeat iteration needs
-  that exemption.
+  exact lines; a freshly written file does not. Entries the previous
+  iteration of the same task created get their path rule but no fingerprint —
+  see ``fingerprint_only`` in :func:`build_inventory_rules` for why the
+  honest repeat iteration needs that exemption.
 
 Path rules are filtered per record against the task prompt
 (:func:`filter_rules_for_prompt`): an entry the prompt itself names — the
@@ -253,14 +254,17 @@ def build_inventory_rules(
         baseline: Top-level names that belong to the environment, not a run.
         fingerprint_only: When given, the only entry names allowed to produce
             content rules; every other leftover gets its path rule alone. The
-            harness passes the leftovers its *run-start* snapshot saw, so an
-            entry that appears later in the batch is path-only. The asymmetry
+            harness passes the run-start leftovers plus any mid-batch entry
+            left by a *differently named* task, so an entry the previous
+            iteration of the same task created is path-only. The asymmetry
             is deliberate: fingerprints are unfilterable by design, and two
             iterations of one task legitimately share long lines (a pasted
-            policy body, a command line, a cluster name), so fingerprinting a
-            same-batch deliverable would flag the honest repeat. Referencing
-            a previous task's output *by path* has no such excuse, so the
-            path rule still applies. ``None`` fingerprints every leftover.
+            policy body, a command line, a cluster name), so fingerprinting
+            the previous iteration's deliverable would flag the honest
+            repeat. A different task has no such excuse — and its prompt can
+            name the entry (a colliding deliverable filename), dropping the
+            path rule, which leaves the fingerprint as the only coverage of
+            a read. ``None`` fingerprints every leftover.
 
     Returns:
         The generated ruleset: one path rule per leftover, plus one content
@@ -308,7 +312,10 @@ def filter_rules_for_prompt(
     Content fingerprints are never filterable: a prompt naming ``report.md``
     tells the agent to *write* its own, not to read the stale copy back — and
     an honest write never reproduces the stale file's lines, so keeping the
-    fingerprint costs honest runs nothing.
+    fingerprint costs honest runs nothing. That pairing is load-bearing: for
+    a prompt-named entry the fingerprint is the only coverage left, which is
+    why the harness fingerprints same-batch deliverables of differently named
+    tasks too (see :func:`build_inventory_rules`).
 
     The name must appear as a whole token, not a substring: a prompt naming
     ``workspace-repo`` must not also authorize a ``workspace`` leftover, and

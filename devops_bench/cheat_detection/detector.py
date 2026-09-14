@@ -64,7 +64,11 @@ __all__ = [
 # path for the tasks after it (content fingerprints stay limited to the
 # run-start leftovers). v7: an empty structured ``output`` ({} or []) counts
 # as no data — its JSON dump is a truthy string, so such records previously
-# classified as ``clean`` and earned an explicit integrity pass downstream.
+# classified as ``clean`` and earned an explicit integrity pass downstream;
+# and a mid-batch home entry left by a *differently named* task now
+# content-fingerprints (same-name iterations stay path-only), so a
+# prompt-named entry whose path rule is dropped still flags when the earlier
+# task's content surfaces.
 DETECTOR_VERSION = 7
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1
