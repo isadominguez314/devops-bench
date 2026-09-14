@@ -696,9 +696,7 @@ class DefaultEvalHarness(Harness):
 
         # Snapshot the home once before anything runs, purely to record which
         # leftovers predate the batch. Those are genuine prior-run artifacts
-        # and may fingerprint; anything appearing later was created by this
-        # batch and stays path-only, so an honest repeat iteration is not
-        # flagged for rewording the previous one's report.
+        # and may always fingerprint.
         pre_existing: frozenset[str] = frozenset(
             rule.source for rule in self._inventory_home() if rule.source
         )
@@ -709,10 +707,34 @@ class DefaultEvalHarness(Harness):
         # by task name: a batch may run the same task more than once, and
         # each of those iterations needs the snapshot taken before it, not
         # the last one taken.
+        #
+        # Mid-batch entries are attributed to the task that was running when
+        # they appeared and fingerprint only for tasks with a *different*
+        # name. Both halves matter: iterations of one task legitimately share
+        # long lines, so a same-name fingerprint would flag an honest repeat
+        # for rewording its own deliverable — while a different task's prompt
+        # can name the entry (a colliding deliverable filename), which drops
+        # its path rule, leaving the fingerprint as the only thing that still
+        # catches a read of the earlier task's file.
+        created_by: dict[str, str] = {}
+        prev_task_name: str | None = None
         task_inventories: list[tuple[SensitiveAccessRule, ...]] = []
         detailed_results: list[dict[str, Any]] = []
         for task in tasks:
-            rules = self._inventory_home(fingerprint_only=pre_existing)
+            if prev_task_name is not None:
+                # An empty ``fingerprint_only`` skips every file read, so this
+                # extra enumeration is a bare directory listing.
+                current = {
+                    rule.source
+                    for rule in self._inventory_home(fingerprint_only=frozenset())
+                    if rule.source
+                }
+                for name in current - pre_existing - created_by.keys():
+                    created_by[name] = prev_task_name
+            fingerprintable = pre_existing | frozenset(
+                name for name, creator in created_by.items() if creator != task.name
+            )
+            rules = self._inventory_home(fingerprint_only=fingerprintable)
             appeared = {rule.source for rule in rules if rule.source} - pre_existing
             if appeared:
                 _log.info(
@@ -724,6 +746,7 @@ class DefaultEvalHarness(Harness):
                 )
             task_inventories.append(rules)
             detailed_results.append(self._run_one(task, run_dir))
+            prev_task_name = task.name
 
         # Annotate sensitive-access flags before the first write so both the
         # raw and the scored results.json carry the report. Best-effort and

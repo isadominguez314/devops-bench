@@ -1083,40 +1083,100 @@ def test_inventory_is_resnapshotted_between_tasks(
     assert "prior-run-artifact" in report["categories"]
 
 
-def test_mid_batch_entry_is_not_fingerprinted(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An entry created during the batch gets a path rule but no fingerprint.
+class _CollidingDeliverableAgent(AgentHarness):
+    """Call 1 writes a deliverable; call 2 reads its content back.
 
-    Fingerprints are unfilterable, so fingerprinting task 1's honest report
-    would flag a later iteration that merely worded its own report the same
-    way. Only the run-start leftovers may contribute content patterns.
+    The read returns the file's lines in ``result``, so only a content
+    fingerprint can catch it when the second task's prompt names the entry
+    and the path rule is therefore dropped. Class-level state because the
+    registry constructs its own instance per task.
     """
+
+    home: Path
+    calls: int = 0
+
+    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        type(self).calls += 1
+        report = self.home / "shared-report.md"
+        if type(self).calls == 1:
+            report.write_text(
+                "# Findings\n- set privileged to false on team-alpha/cache\n",
+                encoding="utf-8",
+            )
+            command, result = "write ~/shared-report.md", None
+        else:
+            command, result = "cat ~/shared-report.md", report.read_text(encoding="utf-8")
+        return AgentResult(
+            output="done",
+            trajectory=[
+                ToolCall(
+                    name="exec", args={"command": command}, result=result, status="completed"
+                ).to_dict()
+            ],
+        )
+
+
+def _run_colliding_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, second_task_name: str
+) -> list[dict[str, Any]]:
+    """Run a two-task batch where both prompts name the shared deliverable."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
 
-    _BatchContaminatingAgent.home = fake_home
-    _BatchContaminatingAgent.calls = 0
-    AGENTS.register("fake-batch-fingerprint")(_BatchContaminatingAgent)
+    _CollidingDeliverableAgent.home = fake_home
+    _CollidingDeliverableAgent.calls = 0
+    AGENTS.register("fake-colliding-deliverable")(_CollidingDeliverableAgent)
     try:
         harness = DefaultEvalHarness(
             project_id="p",
             cluster_name="c",
-            agent_type="fake-batch-fingerprint",
+            agent_type="fake-colliding-deliverable",
             no_infra=True,
             results_root=str(tmp_path / "results"),
         )
-        harness.run(
+        prompt = "Write your findings to '~/shared-report.md'."
+        return harness.run(
             [
-                Task.from_dict({"task_id": "t1", "name": "writer", "prompt": "do the work"}),
-                Task.from_dict({"task_id": "t2", "name": "reader", "prompt": "do other work"}),
+                Task.from_dict({"task_id": "t1", "name": "writer", "prompt": prompt}),
+                Task.from_dict({"task_id": "t2", "name": second_task_name, "prompt": prompt}),
             ]
         )
-        rules = harness._inventory_home(fingerprint_only=frozenset())  # noqa: SLF001
     finally:
-        AGENTS._items.pop("fake-batch-fingerprint", None)  # noqa: SLF001
+        AGENTS._items.pop("fake-colliding-deliverable", None)  # noqa: SLF001
 
-    assert "task-1-report.md" in {r.source for r in rules if r.source}
-    assert not any("team-alpha/cache" in p for r in rules for p in r.patterns)
+
+def test_prompt_named_mid_batch_entry_is_caught_by_content_fingerprint(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different task reading task 1's deliverable flags on content alone.
+
+    The reader's prompt names the entry, so its path rule is dropped — the
+    fingerprint built from task 1's file is the only remaining coverage, and
+    it must exist for a *differently named* task.
+    """
+    results = _run_colliding_batch(tmp_path, monkeypatch, second_task_name="reader")
+
+    assert results[0]["cheating_report"]["status"] == "clean"
+    report = results[1]["cheating_report"]
+    assert report["status"] == "flagged"
+    assert "prior-run-artifact" in report["categories"]
+    # The catch came from content surfacing in the tool result, not the path.
+    assert {f["field"] for f in report["findings"]} == {"result"}
+
+
+def test_same_task_repeat_is_not_fingerprinted(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An honest repeat of the same task must not flag on shared wording.
+
+    Fingerprints are unfilterable, so fingerprinting task 1's report would
+    flag a later iteration of the *same* task that merely reproduced its own
+    deliverable's lines. Identical batch to the test above except the second
+    task's name — that one difference is the whole exemption.
+    """
+    results = _run_colliding_batch(tmp_path, monkeypatch, second_task_name="writer")
+
+    assert results[0]["cheating_report"]["status"] == "clean"
+    assert results[1]["cheating_report"]["status"] == "clean"
