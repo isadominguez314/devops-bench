@@ -198,6 +198,20 @@ def test_empty_trajectory_and_output_reports_no_data_not_clean() -> None:
     assert report["scanned"] == {"trajectory_entries": 0, "output_chars": 0}
 
 
+def test_empty_structured_output_reports_no_data_not_clean() -> None:
+    """An empty {} or [] output must not read as a scanned-and-clean record.
+
+    A foreign harness can store structured payloads in ``output``, and the
+    empty ones JSON-dump to truthy text ("{}"), which previously classified
+    the record as ``clean`` — an explicit integrity pass downstream for a run
+    detection never saw.
+    """
+    for empty in ({}, []):
+        record: dict[str, Any] = {"trajectory": [], "output": empty}
+        report = scan_record(record, DEFAULT_RULES)
+        assert report["status"] == "no_data", f"output={empty!r} must report no_data"
+
+
 def test_findings_are_capped_per_rule() -> None:
     """A loop of sensitive reads must not bloat the report unboundedly."""
     record = _record([_exec("cat tasks/common/opa-remediation/task.yaml")] * 100)

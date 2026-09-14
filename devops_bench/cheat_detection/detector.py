@@ -62,8 +62,10 @@ __all__ = [
 # the repo's docs/ subtree; and the home is inventoried before every task
 # instead of once per batch, so an earlier task's deliverable is covered by
 # path for the tasks after it (content fingerprints stay limited to the
-# run-start leftovers).
-DETECTOR_VERSION = 6
+# run-start leftovers). v7: an empty structured ``output`` ({} or []) counts
+# as no data — its JSON dump is a truthy string, so such records previously
+# classified as ``clean`` and earned an explicit integrity pass downstream.
+DETECTOR_VERSION = 7
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1
 
@@ -226,7 +228,11 @@ def scan_record(record: dict[str, Any], rules: tuple[SensitiveAccessRule, ...]) 
                 budget=budget,
             )
 
-    if not trajectory and not output:
+    # Emptiness is judged on the raw value, not the scanned text: an empty
+    # structured output ({} or []) JSON-dumps to a truthy string, and calling
+    # that ``clean`` would hand a run detection never saw an explicit
+    # integrity pass in the downstream metric.
+    if not trajectory and not record.get("output"):
         status = "no_data"
     elif findings:
         status = "flagged"
