@@ -14,7 +14,7 @@
 
 """Benchmark-integrity gate: turn a run's cheating report into a hard zero.
 
-The detection layer (:mod:`devops_bench.detection`) annotates every record with
+The detection layer (:mod:`devops_bench.cheat_detection`) annotates every record with
 a ``cheating_report`` describing whether the agent touched the benchmark's own
 material — task definitions and their rubrics, the scoring code, prior results,
 the harness environment. This metric is the consequence: a flagged run emits
@@ -32,7 +32,7 @@ Three properties are deliberate:
   it applies to every run of every task. One caveat the harness imposes rather
   than this metric: scoring as a whole is skipped for ``status: "failed"``
   records, so a cheat that also crashed is never gated (see the known
-  limitations in ``docs/components/detection.md``).
+  limitations in ``docs/components/cheat-detection.md``).
 * **Zero, not invalid.** A cheating run keeps its row and shows a visible zero.
   Marking it invalid would drop it from the leaderboard, erasing the very
   signal worth publishing.

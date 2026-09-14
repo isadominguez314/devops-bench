@@ -179,7 +179,7 @@ def _finalize_outcome_score(scores: dict[str, Any]) -> None:
         # run that *errored*: ``_score`` filters failed records out entirely,
         # and they carry no trajectory for detection to flag in the first
         # place, so a cheat that dies in a harness exception still leaves a
-        # null row. See the known limitation in docs/components/detection.md.)
+        # null row. See the known limitation in docs/components/cheat-detection.md.)
         # Returning here would leave ``outcomeScore`` null, and a null row
         # drops out of leaderboard aggregates — exactly the erasure a visible
         # zero exists to prevent. ``cat_v = 0`` zeroes the composite whatever
