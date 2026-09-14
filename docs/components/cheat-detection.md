@@ -78,7 +78,7 @@ Each record carries a `cheating_report`:
 ```json
 {
   "schema_version": 1,
-  "detector_version": 6,
+  "detector_version": 7,
   "status": "flagged",
   "categories": ["harness-repo", "task-definition"],
   "findings": [
