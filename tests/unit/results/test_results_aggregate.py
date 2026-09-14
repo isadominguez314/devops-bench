@@ -66,7 +66,7 @@ def test_rebatch_stamps_shared_run_id_and_t():
     assert [r.task_folder for r in out] == ["task-a", "task-b"]
 
 
-def test_rebatch_keeps_historical_catastrophic_bool_beside_defaulted_kinds():
+def test_rebatch_keeps_historical_catastrophic_bool_beside_defaulted_kinds() -> None:
     """A row written before ``catastrophicKinds`` existed keeps its bool.
 
     Re-validation defaults the missing list to ``[]`` while ``catastrophic``
