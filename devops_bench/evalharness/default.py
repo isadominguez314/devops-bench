@@ -932,6 +932,7 @@ class DefaultEvalHarness(Harness):
         result: dict[str, Any] | None = None
         workspace_path: Path | None = None
         creds_dir: Path | None = None
+        completed_spec: agent_sandbox.SandboxSpec | None = None
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
         # Track the substituted prompt / expectation / safety checklists as they
@@ -1122,6 +1123,21 @@ class DefaultEvalHarness(Harness):
                 # but the exception path reaches here without draining).
                 if scenario_thread is not None:
                     scenario_thread.join(timeout=_SCENARIO_JOIN_SEC)
+            if completed_spec is not None:
+                # Before the infra teardown, while there is still a cluster to
+                # accept the deletes. On a cluster the deployer is about to
+                # destroy this is redundant but cheap; on a REUSED one
+                # (BENCH_NO_TEARDOWN, a kind dev loop, the vcluster host) it
+                # is correctness: the pod-security policy is not
+                # username-scoped, so left behind it denies the OPERATOR's own
+                # privileged workloads on the next run. Teardown never raises
+                # by design; the guard is for the finally block's sake.
+                try:
+                    agent_credentials.teardown_agent_credentials(
+                        completed_spec.network.kubectl_context
+                    )
+                except Exception:
+                    _log.exception("sandbox credential teardown failed; continuing")
             if deployer is not None:
                 self._teardown(deployer, infra_config, task.name)
             if workspace_path is not None:
@@ -1185,13 +1201,21 @@ class DefaultEvalHarness(Harness):
             token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
             pod_security=pod_security,
         )
-        return replace(
-            self._agent_config.sandbox,
-            network=plan,
-            workspace=workspace_path,
-            kubeconfig=kubeconfig,
-            fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
-        )
+        try:
+            return replace(
+                self._agent_config.sandbox,
+                network=plan,
+                workspace=workspace_path,
+                kubeconfig=kubeconfig,
+                fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
+            )
+        except Exception:
+            # The cluster objects are already provisioned, but the completed
+            # spec that would carry their context to the run-end teardown
+            # never comes to exist — so remove them here, keeping the original
+            # error as the one the caller sees (teardown never raises).
+            agent_credentials.teardown_agent_credentials(plan.kubectl_context)
+            raise
 
     def _inventory_sandbox_home(
         self,
