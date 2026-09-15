@@ -81,24 +81,24 @@ def _read_db_tokens(db_path: pathlib.Path) -> dict | None:
 # agy names the reasoning tier separately from the model: every selection in its
 # catalogue is a base model plus one of these, and there is no untiered form --
 # a bare slug is refused with "requires --effort".
-_AGY_EFFORT_TIERS = ("low", "medium", "high")
+_AGY_EFFORT_TIERS: tuple[str, ...] = ("low", "medium", "high")
 
 # Vertex publishes preview model ids with this suffix. agy's catalogue does not
 # carry it and rejects the suffixed id outright, with or without --effort.
-_VERTEX_PREVIEW_SUFFIX = "-preview"
+_VERTEX_PREVIEW_SUFFIX: str = "-preview"
 
 # A display-name selection ("Gemini 3.1 Pro (Low)") already names its tier, and
 # agy errors if --effort is passed alongside one. Recognize it so it survives
 # untouched: it is the spelling ``agy --help`` steers operators towards.
-_DISPLAY_TIER_RE = re.compile(r"\((?:low|medium|high)\)\s*$", re.IGNORECASE)
+_DISPLAY_TIER_RE: re.Pattern[str] = re.compile(r"\((?:low|medium|high)\)\s*$", re.IGNORECASE)
 
 # The tier is a scoring variable, not a formatting detail -- `low` and `high`
 # are materially different agents. `high` is the least surprising default
 # because the other harnesses run their model with no reasoning throttle, so
 # anything lower would hand the agy arm a handicap that reads as a capability
 # gap in the results rather than as the configuration choice it is.
-_DEFAULT_AGY_EFFORT = "high"
-_EFFORT_ENV = "AGENT_MODEL_EFFORT"
+_DEFAULT_AGY_EFFORT: str = "high"
+_EFFORT_ENV: str = "AGENT_MODEL_EFFORT"
 
 
 def _default_effort() -> str:

@@ -339,7 +339,7 @@ def test_build_env_sets_auth_and_presets():
     assert env["OTEL_SDK_DISABLED"] == "true"
 
 
-def test_build_env_does_not_set_gemini_model():
+def test_build_env_does_not_set_gemini_model() -> None:
     # GEMINI_MODEL is a Gemini CLI variable that agy ignores: setting it
     # suggests a lever that does not exist. The model travels on --model.
     config = agents_config.AgentConfig(model="google/gemini-3.5-flash")
@@ -351,7 +351,7 @@ def test_build_env_does_not_set_gemini_model():
 class TestResolveModelName:
     """agy takes an untiered slug plus --effort, and rejects Vertex spellings."""
 
-    def test_strips_provider_prefix_and_preview_suffix(self):
+    def test_strips_provider_prefix_and_preview_suffix(self) -> None:
         # What the matrix actually sends: one AGENT_MODEL shared with the
         # judge, spelled for Vertex, which requires the -preview agy rejects.
         assert agy_mod._resolve_model_name("google/gemini-3.1-pro-preview") == (
@@ -359,17 +359,17 @@ class TestResolveModelName:
             "high",
         )
 
-    def test_supplies_default_tier_when_id_names_none(self):
+    def test_supplies_default_tier_when_id_names_none(self) -> None:
         # agy has no untiered form; a bare slug is refused outright.
         assert agy_mod._resolve_model_name("gemini-3.8-flash") == ("gemini-3.8-flash", "high")
 
-    def test_splits_a_tier_spelled_into_the_slug(self):
+    def test_splits_a_tier_spelled_into_the_slug(self) -> None:
         assert agy_mod._resolve_model_name("gemini-3.8-flash-medium") == (
             "gemini-3.8-flash",
             "medium",
         )
 
-    def test_display_name_keeps_its_own_tier_and_takes_no_effort_flag(self):
+    def test_display_name_keeps_its_own_tier_and_takes_no_effort_flag(self) -> None:
         # agy errors when --effort accompanies a parenthesised tier, so the
         # resolver must report None rather than the default.
         assert agy_mod._resolve_model_name("Gemini 3.1 Pro (Low)") == (
@@ -377,7 +377,7 @@ class TestResolveModelName:
             None,
         )
 
-    def test_display_name_tier_match_is_case_insensitive(self):
+    def test_display_name_tier_match_is_case_insensitive(self) -> None:
         assert agy_mod._resolve_model_name("GEMINI 3.1 PRO (HIGH)") == (
             "GEMINI 3.1 PRO (HIGH)",
             None,
@@ -387,17 +387,17 @@ class TestResolveModelName:
 class TestDefaultEffort:
     """The tier is a scoring variable, so it is explicit and validated."""
 
-    def test_defaults_to_high(self, monkeypatch):
+    def test_defaults_to_high(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(agy_mod._EFFORT_ENV, raising=False)
 
         assert agy_mod._default_effort() == "high"
 
-    def test_env_override_wins(self, monkeypatch):
+    def test_env_override_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(agy_mod._EFFORT_ENV, "Low")
 
         assert agy_mod._default_effort() == "low"
 
-    def test_unknown_tier_is_rejected(self, monkeypatch):
+    def test_unknown_tier_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Fail on the typo, not seconds later on agy's own startup error in
         # the middle of a scored arm.
         monkeypatch.setenv(agy_mod._EFFORT_ENV, "maximum")
