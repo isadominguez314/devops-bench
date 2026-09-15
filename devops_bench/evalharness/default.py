@@ -1190,8 +1190,18 @@ class DefaultEvalHarness(Harness):
         )
         from devops_bench.results import setup_id as results_setup_id
 
+        # ``sandboxed`` is the ARM's property (the run was requested sandboxed),
+        # so it belongs in the setup id: a sandboxed arm aggregates as its own
+        # dashboard setup and the A/B soak is a plain group-by. Per-task
+        # divergence (a requires_unsandboxed exemption) is carried on each
+        # row's own ``sandboxed`` field instead.
+        sandbox = self._agent_config.sandbox
         augmentation = derive_augmentation(
-            {"use_mcp": self.use_mcp, "skills": list(self._granted_skill_paths)}
+            {
+                "use_mcp": self.use_mcp,
+                "skills": list(self._granted_skill_paths),
+                "sandboxed": sandbox is not None,
+            }
         )
         # Record the canonical harness key so an arm selected via a friendly
         # alias (e.g. ``claude-code`` / ``gemini-cli``) aggregates with the
@@ -1207,6 +1217,14 @@ class DefaultEvalHarness(Harness):
             harness=harness,
             augmentation=augmentation,
             judge_model=self._judge_model_name,
+            # A mutable tag is not provenance; the digest is. Resolved at
+            # report time (best-effort, None recorded honestly on failure) so
+            # an A/B pair claiming "the same image" is checkable after the
+            # fact.
+            sandbox_image=sandbox.image if sandbox is not None else None,
+            sandbox_image_digest=(
+                agent_sandbox.image_digest(sandbox.image) if sandbox is not None else None
+            ),
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
@@ -1881,6 +1899,13 @@ class DefaultEvalHarness(Harness):
                 "use_mcp": self.use_mcp,
                 "skills": list(self._granted_skill_paths),
             },
+            # Whether THIS task's agent actually ran inside the container
+            # boundary — per-record, not per-run, because a
+            # ``requires_unsandboxed`` task inside a sandboxed run legitimately
+            # differs from its arm. Read from the task-scoped spec, which is
+            # set before the agent starts and cleared in ``_run_one``'s
+            # finally, so both record builders see the truth for their task.
+            "sandboxed": self._active_sandbox_spec is not None,
             "verification_parse_errors": [],
             "verification_report": [],
             "verification_status": "",
