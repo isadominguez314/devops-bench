@@ -1548,6 +1548,21 @@ class DefaultEvalHarness(Harness):
                 # outlives the task even if a future change adds a path that
                 # skips both (stop() is idempotent and never raises).
                 safeguard_monitor.stop()
+            if completed_spec is not None:
+                # Before the infra teardown, while there is still a cluster to
+                # accept the deletes. On a cluster the deployer is about to
+                # destroy this is redundant but cheap; on a REUSED one
+                # (BENCH_NO_TEARDOWN, a kind dev loop, the vcluster host) it
+                # is correctness: the pod-security policy is not
+                # username-scoped, so left behind it denies the OPERATOR's own
+                # privileged workloads on the next run. Teardown never raises
+                # by design; the guard is for the finally block's sake.
+                try:
+                    agent_credentials.teardown_agent_credentials(
+                        completed_spec.network.kubectl_context
+                    )
+                except Exception:
+                    _log.exception("sandbox credential teardown failed; continuing")
             if deployer is not None:
                 self._teardown(deployer, infra_config, task.name)
             if workspace_path is not None:
@@ -1612,21 +1627,30 @@ class DefaultEvalHarness(Harness):
             token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
             pod_security=pod_security,
         )
-        # A task whose stack declared an agent cloud identity gets a matching
-        # short-lived credential minted for it; every other task gets nothing.
-        # A mint failure raises out of here — a failed record, never a silent
-        # run without the credential the task depends on.
-        cloud_credential_env = (
-            provider.sandbox_cloud_credential_env(cluster_info) if provider is not None else {}
-        )
-        return replace(
-            self._agent_config.sandbox,
-            network=plan,
-            workspace=workspace_path,
-            kubeconfig=kubeconfig,
-            fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
-            cloud_credential_env=cloud_credential_env,
-        )
+        try:
+            # A task whose stack declared an agent cloud identity gets a
+            # matching short-lived credential minted for it; every other task
+            # gets nothing. A mint failure raises out of here — a failed
+            # record, never a silent run without the credential the task
+            # depends on.
+            cloud_credential_env = (
+                provider.sandbox_cloud_credential_env(cluster_info) if provider is not None else {}
+            )
+            return replace(
+                self._agent_config.sandbox,
+                network=plan,
+                workspace=workspace_path,
+                kubeconfig=kubeconfig,
+                fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
+                cloud_credential_env=cloud_credential_env,
+            )
+        except Exception:
+            # The cluster objects are already provisioned, but the completed
+            # spec that would carry their context to the run-end teardown
+            # never comes to exist — so remove them here, keeping the original
+            # error as the one the caller sees (teardown never raises).
+            agent_credentials.teardown_agent_credentials(plan.kubectl_context)
+            raise
 
     def _inventory_sandbox_home(
         self,
