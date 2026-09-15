@@ -115,12 +115,52 @@ def _selector_args(selector: str | None) -> list[str]:
     return ["-l", selector] if selector else []
 
 
-def _run_kubectl(argv: list[str], kubeconfig: KubeconfigSource, **kwargs: Any) -> CompletedProcess:
+def _context_args(context: str | None) -> list[str]:
+    return ["--context", context] if context else []
+
+
+def _insert_context_args(argv: list[str], context: str | None) -> list[str]:
+    """Return argv with context flags placed before any ``--`` separator.
+
+    Everything after a bare ``--`` belongs to the container command, not to
+    kubectl, so appending there would hand the flag to the workload instead of
+    configuring the target cluster.
+
+    Args:
+        argv: Full kubectl command and arguments.
+        context: Optional kubeconfig context to pin the call to.
+
+    Returns:
+        A new argv list with the context flags inserted before the first
+        bare ``--`` element, or appended to the end when there is none.
+    """
+    context_args = _context_args(context)
+    if not context_args:
+        return list(argv)
+    try:
+        split = argv.index("--")
+    except ValueError:
+        return [*argv, *context_args]
+    return [*argv[:split], *context_args, *argv[split:]]
+
+
+def _run_kubectl(
+    argv: list[str],
+    kubeconfig: KubeconfigSource,
+    *,
+    context: str | None = None,
+    **kwargs: Any,
+) -> CompletedProcess:
     """Run ``kubectl`` with the resolved kubeconfig overlaid on the environment.
 
     Args:
         argv: Full kubectl command and arguments, never a shell string.
         kubeconfig: Explicit path, a ``KubeconfigProvider``, or None.
+        context: Optional kubeconfig context to pin the call to (``--context``).
+            Pinning the file alone is not enough: a kubeconfig can carry
+            several contexts, or none selected as current, and an unpinned
+            context means the call silently reads whichever cluster the
+            ambient current-context happens to point at.
         **kwargs: Extra keyword arguments forwarded to ``core.subprocess.run``
             (e.g. ``timeout``).
 
@@ -132,7 +172,7 @@ def _run_kubectl(argv: list[str], kubeconfig: KubeconfigSource, **kwargs: Any) -
     """
     path = _resolve_kubeconfig(kubeconfig)
     extra_env = {"KUBECONFIG": path} if path else None
-    return run(argv, extra_env=extra_env, **kwargs)
+    return run(_insert_context_args(argv, context), extra_env=extra_env, **kwargs)
 
 
 def wait(

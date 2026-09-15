@@ -424,3 +424,22 @@ def test_apply_and_get_resource_omit_the_flag_without_a_context(mocker: MockerFi
 
     for call in mock_run.call_args_list:
         assert "--context" not in call.args[0]
+
+
+# --context pinning. The flags have to land before a bare "--" separator:
+# everything after it belongs to the container command, not to kubectl.
+
+
+def test_context_lands_before_a_bare_separator() -> None:
+    argv = kubectl._insert_context_args(
+        ["kubectl", "exec", "pod/web", "--", "sh", "-c", "echo hi"], "kind-bench"
+    )
+
+    assert argv.index("--context") < argv.index("--")
+
+
+@pytest.mark.parametrize("context", [None, ""])
+def test_no_context_leaves_argv_untouched(context: str | None) -> None:
+    argv = ["kubectl", "get", "pods"]
+
+    assert kubectl._insert_context_args(argv, context) == argv
