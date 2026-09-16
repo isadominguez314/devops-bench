@@ -281,6 +281,22 @@ def _create_legacy_pods(context: str) -> bool:
     for kind in ("validatingadmissionpolicybinding", "validatingadmissionpolicy"):
         _kubectl(context, "delete", kind, "bench-agent-pod-security", "--ignore-not-found")
     _kubectl(context, "create", "namespace", _LEGACY_NAMESPACE)
+    # The namespace's default ServiceAccount is minted asynchronously by the
+    # controller manager, and a pod create that races it is refused with
+    # "serviceaccount \"default\" not found" -- a failure the boundary had
+    # nothing to do with, surfaced live on a freshly created kind cluster.
+    for _ in range(60):
+        if (
+            _kubectl(
+                context, "get", "serviceaccount", "default", "-n", _LEGACY_NAMESPACE
+            ).returncode
+            == 0
+        ):
+            break
+        time.sleep(1)
+    else:
+        print(f"    no default ServiceAccount appeared in {_LEGACY_NAMESPACE} after 60s")
+        return False
     for name, overrides in (
         (_LEGACY_PRIVILEGED_POD, _PRIVILEGED_OVERRIDE),
         (_LEGACY_ORDINARY_POD, _ORDINARY_POD),
