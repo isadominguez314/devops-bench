@@ -18,7 +18,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from devops_bench.core import ClusterInfo, ConfigError, NetworkPlan, get_bool, get_env, get_logger
+from devops_bench.core import (
+    ClusterInfo,
+    ConfigError,
+    NetworkPlan,
+    SandboxError,
+    get_bool,
+    get_env,
+    get_logger,
+)
 from devops_bench.core.subprocess import run
 from devops_bench.providers.base import PROVIDERS, Provider, ResolveContext
 
@@ -130,18 +138,24 @@ class GcpProvider(Provider):
             cluster_info: The provisioned cluster to reach.
 
         Returns:
-            A default plan pinned to this cluster's context, or an unpinned
-            one when the cluster's project or location is unknown — a wrong
-            pin would be worse than none, since the sandbox refuses a context
-            kubectl does not know.
+            A default plan pinned to this cluster's context.
+
+        Raises:
+            SandboxError: When the cluster's project or location is unknown,
+                so its context name cannot be reconstructed. Degrading to an
+                unpinned plan would mint the agent's identity and token on the
+                ambient current-context — whatever cluster the operator's
+                kubeconfig last pointed at, not necessarily this one. Only
+                sandboxed runs reach this method, so failing here cannot
+                affect an ordinary run.
         """
         if not (cluster_info.project and cluster_info.location):
-            _log.warning(
-                "cluster %s has no project/location; the sandbox kubeconfig will be "
-                "built from the ambient current-context",
-                cluster_info.name,
+            raise SandboxError(
+                f"GKE cluster {cluster_info.name!r} reported no project/location, so the "
+                "sandbox cannot pin to its kubectl context; refusing rather than "
+                "provisioning the agent's credential against the ambient context, "
+                "which may be a different cluster entirely"
             )
-            return NetworkPlan()
         return NetworkPlan(
             kubectl_context=_context_name(
                 cluster_info.project, cluster_info.location, cluster_info.name
