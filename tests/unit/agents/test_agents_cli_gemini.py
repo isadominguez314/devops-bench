@@ -43,6 +43,7 @@ from devops_bench.agents.cli.gemini_cli.agent import (
 )
 from devops_bench.agents.sandbox import SandboxSpec
 from devops_bench.core.errors import ConfigError, SubprocessError
+from devops_bench.core.model_providers import ProviderSpec
 
 
 def _stream(*events: dict) -> str:
@@ -277,9 +278,11 @@ def test_build_env_sandboxed_vertex_injects_the_metadata_emulator_vars(
     # Inside the sandbox there is no ADC and the real metadata endpoint is
     # blocked, so the backend's mint-and-inject recipe supplies the credential.
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
-    seen: dict = {}
+    seen: dict[str, str | None] = {}
 
-    def fake_recipe(spec, *, project=None, **kwargs):
+    def fake_recipe(
+        spec: ProviderSpec, *, project: str | None = None, **kwargs: object
+    ) -> dict[str, str]:
         seen["backend"] = spec.backend
         seen["project"] = project
         return {"GCE_METADATA_HOST": "host.docker.internal:41235"}
