@@ -26,8 +26,16 @@ Only ever deliberately — the spec is named `canary.yaml` precisely so no
 
 ```bash
 BENCH_AGENT_SANDBOX=1 BENCH_SANDBOX_IMAGE=<image> \
+BENCH_REQUIRE_FIXTURES=0 \
 python -m devops_bench tasks/canary/sandbox-boundary/canary.yaml
 ```
+
+`BENCH_REQUIRE_FIXTURES=0` is required, not optional: the fixture-completeness
+gate reads every `~/` path in a prompt as an input the stack promised to seed,
+and this canary's prompt is nothing but paths that are *supposed* to be
+absent. Without the override the gate fails the run before the agent starts —
+correctly, by its own contract, but this canary is exactly the "deliberately
+degraded arm" that override exists for.
 
 It also carries `validated: false`, so even a record that does get produced
 never promotes to the leaderboard.
