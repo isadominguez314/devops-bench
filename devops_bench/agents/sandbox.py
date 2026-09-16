@@ -225,13 +225,27 @@ def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> 
         The plan for this run, with any loopback server already rewritten.
 
     Raises:
-        SandboxError: When the provider names a context kubectl does not know
-            (a kubeconfig that never saw this cluster), or when no server URL
-            can be read for a plan that does not supply its own. Refusing
-            beats running against a server the container cannot reach — or
-            handing it credentials for a different cluster entirely.
+        SandboxError: When a provider-backed plan carries no context pin, when
+            the provider names a context kubectl does not know (a kubeconfig
+            that never saw this cluster), or when no server URL can be read
+            for a plan that does not supply its own. Refusing beats running
+            against a server the container cannot reach — or handing it
+            credentials for a different cluster entirely.
     """
     plan = provider.sandbox_network_plan(cluster_info) if provider is not None else NetworkPlan()
+    if provider is not None and not plan.kubectl_context:
+        # An unpinned plan mints the agent's identity and token on the ambient
+        # current-context — whatever the operator's kubeconfig last selected.
+        # That is tolerable only for a run with no cluster identity of its own
+        # (provider ``None``, gated separately behind an explicit env opt-in);
+        # a provider knows which cluster it provisioned, so an unpinned answer
+        # here is a bug in the provider, not a state to run in.
+        raise SandboxError(
+            f"provider {type(provider).__name__} returned a network plan with no "
+            f"kubectl context pin for cluster {cluster_info.name!r}; provisioning "
+            "credentials on the ambient current-context is reserved for runs with "
+            "no provider at all — pin the plan to the context this cluster wrote"
+        )
     if plan.kubectl_context:
         known = (
             run(["kubectl", "config", "get-contexts", "-o", "name"], check=False).stdout or ""

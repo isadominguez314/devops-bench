@@ -245,9 +245,11 @@ def test_build_network_plan_rewrites_a_loopback_server(
 ) -> None:
     """Loopback inside a container is the container, so it must be remapped —
     and the cert only carries ``localhost``, so TLS is redirected, not disabled."""
-    _patch_plan_reads(monkeypatch, server=server)
+    _patch_plan_reads(monkeypatch, contexts=("kind-c1",), server=server)
 
-    plan = sandbox.build_network_plan(_FakeProvider(NetworkPlan()), _cluster())
+    plan = sandbox.build_network_plan(
+        _FakeProvider(NetworkPlan(kubectl_context="kind-c1")), _cluster()
+    )
 
     assert plan.rewrite_server == expected
     assert plan.tls_server_name == "localhost"
@@ -293,9 +295,23 @@ def test_build_network_plan_refuses_a_context_kubectl_does_not_know(
 def test_build_network_plan_refuses_an_unreadable_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_plan_reads(monkeypatch, server="")
+    _patch_plan_reads(monkeypatch, contexts=("kind-c1",), server="")
 
     with pytest.raises(SandboxError, match="server URL"):
+        sandbox.build_network_plan(
+            _FakeProvider(NetworkPlan(kubectl_context="kind-c1")), _cluster()
+        )
+
+
+def test_build_network_plan_refuses_a_provider_backed_plan_without_a_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider that answers with an unpinned plan would mint the agent's
+    credential on the ambient current-context — the exact state the ambient
+    escape hatch waives only for runs with no provider at all."""
+    _patch_plan_reads(monkeypatch, server="https://34.10.0.1")
+
+    with pytest.raises(SandboxError, match="no\\s+kubectl context pin"):
         sandbox.build_network_plan(_FakeProvider(NetworkPlan()), _cluster())
 
 

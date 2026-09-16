@@ -113,13 +113,19 @@ class Provider(ABC):
         the container itself. Only the provider knows whether its endpoint
         already routes and, if not, what to substitute.
 
-        The default suits any cluster whose endpoint is reachable from an
-        ordinary bridge-networked container — every cloud provider, and a
-        vcluster exposed on a routable address. The sandbox additionally
-        rewrites a *loopback* server to ``host.docker.internal`` on top of
-        whatever is returned here, so a provider only overrides this when it
-        needs something that generic step cannot infer: a Docker network to
-        join, an in-network hostname, or a context pin.
+        Implementations must return a plan pinned to the kubectl context this
+        cluster wrote (``kubectl_context``); the sandbox refuses a
+        provider-backed plan without one, because an unpinned plan mints the
+        agent's credential on the ambient current-context — indistinguishable
+        from a run that has no provider at all, and covered by that case's
+        escape hatch. The inherited default returns an *unpinned* plan and so
+        always needs overriding, if only to add the pin. Network surgery
+        beyond that is rarely needed: a routable endpoint (every cloud
+        provider, a vcluster on a routable address) is left alone, and the
+        sandbox already rewrites a *loopback* server to
+        ``host.docker.internal``, so a provider adds more only when the
+        generic step cannot infer it — a Docker network to join, or an
+        in-network hostname.
 
         Args:
             cluster_info: The provisioned cluster to reach.
