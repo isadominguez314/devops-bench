@@ -48,7 +48,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict
 
 from devops_bench.core.config import get_env
-from devops_bench.core.errors import ConfigError
+from devops_bench.core.errors import ConfigError, SubprocessError
 from devops_bench.core.logging import get_logger
 from devops_bench.core.subprocess import run
 
@@ -269,6 +269,12 @@ _TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 _TOKEN_LIFETIME_SEC = 3600
 _TOKEN_REFRESH_MARGIN_SEC = 300
 
+# Ceiling on one mint. The call is a single IAM round-trip, so a minute means
+# something is wedged (a prompting credential helper, a dead network) — and a
+# mint runs under the emulator's lock, so left unbounded it would block every
+# request thread behind it for as long as gcloud cares to hang.
+_MINT_TIMEOUT_SEC = 60
+
 # Every metadata response carries this header, and (per the real server's
 # contract) every request must carry it too.
 _METADATA_FLAVOR_HEADER = "Metadata-Flavor"
@@ -442,16 +448,26 @@ class _VertexMetadataEmulator:
         the rest of the benchmark reaches GCP
         (:mod:`devops_bench.providers.gcp`, the antigravity harness).
         """
-        completed = run(
-            [
-                "gcloud",
-                "auth",
-                "print-access-token",
-                f"--impersonate-service-account={self.service_account}",
-                f"--scopes={_TOKEN_SCOPE}",
-            ],
-            check=False,
-        )
+        try:
+            completed = run(
+                [
+                    "gcloud",
+                    "auth",
+                    "print-access-token",
+                    f"--impersonate-service-account={self.service_account}",
+                    f"--scopes={_TOKEN_SCOPE}",
+                ],
+                check=False,
+                timeout=_MINT_TIMEOUT_SEC,
+            )
+        except SubprocessError as exc:
+            raise ConfigError(
+                f"could not mint a Vertex access token by impersonating "
+                f"{self.service_account}: {exc}. The mint is bounded at "
+                f"{_MINT_TIMEOUT_SEC}s so a wedged gcloud (a prompting credential "
+                "helper, a dead network) cannot hold the emulator's lock and block "
+                "every request behind it"
+            ) from exc
         token = (completed.stdout or "").strip()
         if completed.returncode != 0 or not token:
             raise ConfigError(
