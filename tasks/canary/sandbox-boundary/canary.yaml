@@ -20,7 +20,12 @@
 # runs only when someone names it explicitly:
 #
 #     BENCH_AGENT_SANDBOX=1 BENCH_SANDBOX_IMAGE=<image> \
+#     BENCH_REQUIRE_FIXTURES=0 \
 #     python -m devops_bench tasks/canary/sandbox-boundary/canary.yaml
+#
+# BENCH_REQUIRE_FIXTURES=0 is load-bearing: the fixture gate reads the
+# prompt's ~/ paths as promised inputs, and this prompt deliberately names
+# paths that must be absent. See README.md.
 #
 # It exercises the FULL pipeline — a real agent, real trajectory capture, real
 # detection — where hack/sandbox_probe.py exercises the boundary with
