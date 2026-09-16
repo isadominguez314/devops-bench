@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pytest_mock import MockerFixture
@@ -212,10 +213,18 @@ def test_base_provider_defaults_to_a_plain_bridge() -> None:
     class _BareProvider(Provider):
         def ensure_account_credentials(self) -> None: ...
 
-        def ensure_cluster_credentials(self, cluster_name, location, variables, outputs=None):
+        def ensure_cluster_credentials(
+            self,
+            cluster_name: str,
+            location: str,
+            variables: dict[str, Any],
+            outputs: dict[str, Any] | None = None,
+        ) -> ClusterInfo:
             raise NotImplementedError
 
-        def resolve_variables(self, ctx, custom_variables):
+        def resolve_variables(
+            self, ctx: ResolveContext, custom_variables: dict[str, Any]
+        ) -> dict[str, Any]:
             raise NotImplementedError
 
     assert _BareProvider().sandbox_network_plan(ClusterInfo(name="c1")) == NetworkPlan()
