@@ -27,13 +27,23 @@
 
 # node, not plain debian: agy itself is a static-ish Go binary and needs no
 # runtime, but MCP server bindings are conventionally launched with npx, and a
-# task that declares one would otherwise fail inside the boundary.
-FROM node:22-slim
+# task that declares one would otherwise fail inside the boundary. Pinned by
+# manifest-list digest (covers amd64 and arm64) so the base cannot drift under
+# an unchanged Dockerfile; bump the digest together with the tool pins below.
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
-# Versions are pinned so a rebuild reproduces the image an A/B arm was scored
-# with; bump them deliberately and re-baseline.
+# Everything that defines the arm under test is pinned and checksummed: the
+# base image by digest above, the cluster tools and the agent CLI by version +
+# sha below. Bump them deliberately and re-baseline. The apt layer's support
+# packages (git/jq/ripgrep) deliberately track Debian security updates
+# instead — a scored baseline is identified by the digest of the built image
+# it actually ran, not by a byte-identical rebuild.
 ARG KUBECTL_VERSION=v1.31.0
+ARG KUBECTL_SHA256_AMD64=7c27adc64a84d1c0cc3dcf7bf4b6e916cc00f3f576a2dbac51b318d926032437
+ARG KUBECTL_SHA256_ARM64=f42832db7d77897514639c6df38214a6d8ae1262ee34943364ec1ffaee6c009c
 ARG HELM_VERSION=v3.16.3
+ARG HELM_SHA256_AMD64=f5355c79190951eed23c5432a3b920e071f4c00a64f75e077de0dd4cb7b294ea
+ARG HELM_SHA256_ARM64=5bd34ed774df6914b323ff84a0a156ea6ff2ba1eaf0113962fa773f3f9def798
 # AGY_BUILD is the build id that follows the version in the release path; the
 # two together address one immutable artifact.
 ARG AGY_VERSION=1.2.0
@@ -54,15 +64,25 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/s
 
 # kubectl and helm: resolve the arch from the build platform rather than
 # hardcoding amd64, so the image builds on an arm64 laptop as well as the
-# x86 bastion.
+# x86 bastion. Both artifacts are checksum-verified before install, same as
+# the agy tarball below — a tampered or truncated payload fails the build
+# rather than silently scoring a run. The pins are per-arch because the
+# vendors publish per-arch sums.
 RUN arch="$(dpkg --print-architecture)" \
+    && case "${arch}" in \
+        amd64) kubectl_sha="${KUBECTL_SHA256_AMD64}"; helm_sha="${HELM_SHA256_AMD64}" ;; \
+        arm64) kubectl_sha="${KUBECTL_SHA256_ARM64}"; helm_sha="${HELM_SHA256_ARM64}" ;; \
+        *) echo "unsupported architecture for kubectl/helm: ${arch}" >&2; exit 1 ;; \
+    esac \
     && curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" \
+    && echo "${kubectl_sha}  kubectl" | sha256sum -c - \
     && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl \
     && rm kubectl \
-    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
-        | tar -xz -C /tmp \
+    && curl -fsSL -o /tmp/helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
+    && echo "${helm_sha}  /tmp/helm.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/helm.tar.gz -C /tmp \
     && install -o root -g root -m 0755 "/tmp/linux-${arch}/helm" /usr/local/bin/helm \
-    && rm -rf "/tmp/linux-${arch}"
+    && rm -rf /tmp/helm.tar.gz "/tmp/linux-${arch}"
 
 # The upstream bootstrapper (https://antigravity.google/cli/install.sh) is
 # deliberately not piped to a shell here. It resolves whatever the release
