@@ -250,8 +250,11 @@ to the built-in `edit` role cluster-wide plus a small cluster-scoped supplement
 (namespaces CRUD; nodes, PVs, storage classes, CRDs read-only), mints a
 short-lived token for it, and renders a single-cluster kubeconfig containing
 that token and nothing else. The RBAC deliberately grants no write on
-`rbac.authorization.k8s.io` or `admissionregistration.k8s.io`, so the agent can
-neither escalate its own permissions nor remove the admission policy below.
+`rbac.authorization.k8s.io` or `admissionregistration.k8s.io`, so the agent
+cannot grant itself permissions through RBAC objects or remove the admission
+policy below. That closes the direct route, not every route: `edit` itself
+carries permissions that can reach a stronger identity — see [Known gaps in
+the RBAC scope](#known-gaps-in-the-rbac-scope).
 
 Two consequences worth knowing:
 

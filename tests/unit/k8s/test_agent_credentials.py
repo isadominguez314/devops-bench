@@ -91,7 +91,7 @@ def _patch_kubectl(
                 raise SubprocessError(argv, 1, stderr="forbidden: cannot create token")
             return SimpleNamespace(returncode=0, stdout=f"{token}\n", stderr="")
         if "apply" in argv:
-            if mint_fails and "bench-agent-rbac.yaml" in argv[-1]:
+            if mint_fails and _applies(argv, "bench-agent-rbac.yaml"):
                 raise SubprocessError(argv, 1, stderr="forbidden: cannot create clusterroles")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "get" in argv:

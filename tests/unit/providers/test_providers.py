@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pytest_mock import MockerFixture
@@ -212,10 +213,18 @@ def test_base_provider_defaults_to_a_plain_bridge() -> None:
     class _BareProvider(Provider):
         def ensure_account_credentials(self) -> None: ...
 
-        def ensure_cluster_credentials(self, cluster_name, location, variables, outputs=None):
+        def ensure_cluster_credentials(
+            self,
+            cluster_name: str,
+            location: str,
+            variables: dict[str, Any],
+            outputs: dict[str, Any] | None = None,
+        ) -> ClusterInfo:
             raise NotImplementedError
 
-        def resolve_variables(self, ctx, custom_variables):
+        def resolve_variables(
+            self, ctx: ResolveContext, custom_variables: dict[str, Any]
+        ) -> dict[str, Any]:
             raise NotImplementedError
 
     assert _BareProvider().sandbox_network_plan(ClusterInfo(name="c1")) == NetworkPlan()
@@ -241,12 +250,12 @@ def test_gcp_plan_pins_the_context_without_rewriting() -> None:
     assert plan == NetworkPlan(kubectl_context="gke_p_us-central1-a_c1")
 
 
-def test_gcp_plan_omits_the_pin_when_the_cluster_is_underspecified() -> None:
-    """A wrong pin is worse than none: the sandbox refuses a context kubectl
-    does not know, which would fail the run outright."""
-    plan = GcpProvider().sandbox_network_plan(ClusterInfo(name="c1"))
-
-    assert plan.kubectl_context is None
+def test_gcp_plan_refuses_when_the_cluster_is_underspecified() -> None:
+    """An unpinned plan here is not a degraded plan, it is an unidentified
+    cluster: the agent's identity and token would be minted against the
+    ambient current-context, which no provider vouched for."""
+    with pytest.raises(SandboxError, match="project/location"):
+        GcpProvider().sandbox_network_plan(ClusterInfo(name="c1"))
 
 
 def test_vcluster_plan_pins_the_virtual_clusters_own_context(tmp_path: Path) -> None:
