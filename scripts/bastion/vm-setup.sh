@@ -119,23 +119,37 @@ fi
 # Known limitation: iptables rules do not survive a reboot, and DOCKER-USER
 # itself is created by dockerd. Re-run this script after a reboot rather than
 # pulling in iptables-persistent for these rules. See docs/components/infra.md.
+#
+# Failure here is fatal, not a warning: a host that cannot install the block
+# hands every sandboxed container the VM service account's token (the
+# proposal's second observed incident), and a setup that exits 0 anyway reads
+# as "boundary in place". The one non-fatal path is the missing DOCKER-USER
+# chain — dockerd creates it, so on a fresh VM this script legitimately runs
+# before it exists. That path stays a warn-and-rerun; do not start sandboxed
+# runs until a re-run reports the block installed.
 echo "==> metadata endpoint block (container egress)"
 if ! command -v iptables >/dev/null 2>&1; then
-  echo "    WARN: iptables not found; containers can still reach the metadata server."
+  echo "    ERROR: iptables not found; containers could reach the metadata server." >&2
+  echo "    Install iptables and re-run — refusing to finish setup with the boundary open." >&2
+  exit 1
 elif ! sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
   echo "    WARN: no DOCKER-USER chain yet (is dockerd running?); re-run after Docker starts."
+  echo "    Do NOT start sandboxed runs until a re-run installs the metadata block."
 else
   if sudo iptables -C DOCKER-USER -d 169.254.169.254 -j REJECT >/dev/null 2>&1; then
     echo "    already blocked."
   else
-    sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT \
-      && echo "    containers can no longer reach 169.254.169.254." \
-      || echo "    WARN: could not install the rule; containers can still reach the metadata server."
+    if ! sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT; then
+      echo "    ERROR: could not install the metadata REJECT rule; containers could" >&2
+      echo "    reach the metadata server. Refusing to finish setup with the boundary open." >&2
+      exit 1
+    fi
+    echo "    containers can no longer reach 169.254.169.254."
   fi
   for proto in udp tcp; do
     sudo iptables -C DOCKER-USER -d 169.254.169.254 -p "$proto" --dport 53 -j ACCEPT >/dev/null 2>&1 \
       || sudo iptables -I DOCKER-USER -d 169.254.169.254 -p "$proto" --dport 53 -j ACCEPT \
-      || echo "    WARN: could not permit $proto/53; container DNS will fail on this host."
+      || { echo "    ERROR: could not permit $proto/53; container DNS would fail on this host." >&2; exit 1; }
   done
   echo "    DNS to 169.254.169.254 still permitted (port 53 only)."
 fi
