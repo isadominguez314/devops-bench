@@ -500,9 +500,13 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     assert argv[:3] == ["docker", "run", "--rm"]
     assert argv[argv.index("--name") + 1] == "devops-bench-agent-workspace-abc123"
     assert argv[argv.index("--network") + 1] == "kind"
-    # Boundary invariants: no stdin, host-gateway alias always present.
+    # Boundary invariants: no stdin, host-gateway alias always present, no
+    # capabilities and no setuid re-escalation — the latter pair is what
+    # contains the macOS case, where the process runs as root (no --user).
     assert "-i" not in argv
     assert "host.docker.internal:host-gateway" in argv
+    assert "--cap-drop=ALL" in argv
+    assert "--security-opt=no-new-privileges=true" in argv
     # Mount set: workspace RW, kubeconfig RO.
     assert f"{spec.workspace}:/workspace" in argv
     assert f"{spec.kubeconfig}:/creds/kubeconfig:ro" in argv

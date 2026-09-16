@@ -563,7 +563,12 @@ class SandboxExecutor:
 
         Boundary decisions encoded here, in order of appearance: ``--rm`` so a
         cleanly-exiting container leaves nothing behind; a deterministic
-        ``--name`` so an unclean one can be reaped; the network plan;
+        ``--name`` so an unclean one can be reaped; ``--cap-drop=ALL`` with
+        ``no-new-privileges`` because nothing in the image needs a capability
+        (node, kubectl, helm, git are plain userland) and a setuid binary in
+        the base image must not re-escalate — this is also what contains the
+        macOS case, where no ``--user`` is emitted and the process runs as
+        root; the network plan;
         ``host.docker.internal:host-gateway`` always, so loopback-published
         endpoints resolve on Linux the way Docker Desktop resolves them
         natively; ``--user`` on Linux only, so workspace files stay
@@ -578,6 +583,7 @@ class SandboxExecutor:
         """
         spec = self.spec
         argv: list[str] = ["docker", "run", "--rm", "--name", self.container_name]
+        argv += ["--cap-drop=ALL", "--security-opt=no-new-privileges=true"]
         if spec.network.docker_network:
             argv += ["--network", spec.network.docker_network]
         argv += ["--add-host", "host.docker.internal:host-gateway"]
