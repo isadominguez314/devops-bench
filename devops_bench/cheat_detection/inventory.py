@@ -328,7 +328,10 @@ def build_mount_rules(container_home: str, names: Iterable[str]) -> tuple[Sensit
     Returns:
         One path rule per distinct name, sorted for determinism.
     """
-    prefix = rf"(?:~|\$HOME|{re.escape(container_home)})"
+    # Same left-bounded alternation as the host-home rules — reusing the
+    # builder keeps the two rule families from drifting: an unbounded prefix
+    # here made `/data/workspace/home/x` match the `/workspace/home/x` rule.
+    prefix = _home_prefixes(Path(container_home))
     return tuple(
         _path_rule(name, prefix, origin="mounted into the sandbox home")
         for name in sorted(set(names))
