@@ -22,10 +22,14 @@
 # agent's cluster credential, workspace, and fixtures are mounted at run time
 # by devops_bench/agents/sandbox.py — never baked in here.
 
-FROM node:22-slim
+# Digest-pinned (multi-arch manifest list, amd64 + arm64) so the floating tag
+# cannot move the base under a rebuild.
+FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
-# Versions are pinned so a rebuild reproduces the image an A/B arm was scored
-# with; bump them deliberately and re-baseline.
+# The base digest and these ARGs pin what a Dockerfile can pin; APT contents
+# may still drift between rebuilds (Debian archives move), so the digest of
+# the *built* image — not this file — is the identity of what an A/B arm was
+# scored with. Bump the pins deliberately and re-baseline.
 ARG KUBECTL_VERSION=v1.31.0
 ARG HELM_VERSION=v3.16.3
 ARG GEMINI_CLI_VERSION=0.54.4
