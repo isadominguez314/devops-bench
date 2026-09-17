@@ -190,6 +190,15 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         if project:
             overlay["GOOGLE_CLOUD_PROJECT"] = project
         overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
+    else:
+        # The overlay rides on top of the inherited environment, so *omitting*
+        # the switch cannot protect a non-Vertex run from an operator shell
+        # that exports GOOGLE_GENAI_USE_VERTEXAI=true (a Vertex arm's env
+        # sourced globally, say) — the ambient value would reroute the run at
+        # Vertex. Pin it off explicitly; an overlay value beats the ambient
+        # one. Project/location are left alone: without the switch the SDK
+        # does not read them for routing.
+        overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "false"
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key

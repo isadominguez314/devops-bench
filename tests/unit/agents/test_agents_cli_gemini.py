@@ -253,21 +253,19 @@ def test_build_env_vertex_defaults_the_location_to_global(
     assert env["GOOGLE_CLOUD_LOCATION"] == "global"
 
 
-def test_build_env_non_vertex_writes_no_vertex_routing_vars(
+def test_build_env_non_vertex_pins_the_vertex_switch_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # An ambient GOOGLE_CLOUD_* on the operator's shell must not leak into a
-    # Gemini-API run and silently reroute it at Vertex.
+    # The overlay rides on the inherited environment, so merely omitting the
+    # routing vars cannot shield a Gemini-API run from an operator shell that
+    # exports GOOGLE_GENAI_USE_VERTEXAI=true. The switch must be pinned "false"
+    # (an overlay value beats the ambient one); project/location stay out of
+    # the overlay — without the switch the SDK does not read them for routing.
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", api_key="abc"))
-    assert (
-        not {
-            "GOOGLE_GENAI_USE_VERTEXAI",
-            "GOOGLE_CLOUD_PROJECT",
-            "GOOGLE_CLOUD_LOCATION",
-        }
-        & env.keys()
-    )
+    assert env["GOOGLE_GENAI_USE_VERTEXAI"] == "false"
+    assert not {"GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"} & env.keys()
 
 
 def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
