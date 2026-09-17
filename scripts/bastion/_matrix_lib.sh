@@ -307,10 +307,6 @@ matrix_dispatch() {
     echo '  local d="$OUT/$rid"; mkdir -p "$d"'
     echo '  ('
     echo '    export RUN_ID="$rid"'
-    # The sweep owner scopes stray-container reaping to this combo's own
-    # containers (sandbox.py validates [A-Za-z0-9_], so the rid's hyphens
-    # become underscores). Unused when the sandbox is off.
-    echo '    export BENCH_AGENT_SANDBOX_OWNER="${rid//-/_}"'
     echo '    # eval so values like AGENT_MCP_SERVER=$HOME/mcp-server expand on the bastion'
     echo '    IFS=";"; for kv in $kvs; do eval "export ${kv}"; done'
     echo '    if [ "$arm" = "legacy" ]; then'
