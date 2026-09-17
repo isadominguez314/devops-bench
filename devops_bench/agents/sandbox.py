@@ -20,8 +20,10 @@ can reach the benchmark's own material: ``tasks/**/task.yaml`` (the judge
 rubric and ``verification_spec`` — the answer key), scoring and detection
 code, prior results, the operator's cloud credentials and admin kubeconfig.
 The detection layer is a tripwire, not a boundary; this module is the
-boundary. See ``docs/proposals/agent-sandboxing.md`` for the design and the
-two observed incidents that shaped it.
+boundary. Two observed incidents shaped it: an agent that used the admin
+kubeconfig to run a privileged pod and read the bench checkout through the
+node's host disk, and an agent that mined the harness VM's cloud identity
+from the link-local metadata endpoint when its model credential was missing.
 
 The container sees exactly four things, and what is ABSENT matters more than
 what is present:
@@ -84,6 +86,12 @@ _log = get_logger("agents.sandbox")
 SANDBOX_ENV = "BENCH_AGENT_SANDBOX"
 IMAGE_ENV = "BENCH_SANDBOX_IMAGE"
 _SANDBOX_ENABLED_VALUES = frozenset({"docker", "1", "true"})
+# Values that mean "off" on purpose. Anything outside both sets raises: an
+# operator who typed ``yes`` believes the run is contained, and silently
+# running ambient is exactly the quiet degrade this module promises never to
+# do — the matrix runner also forwards the raw value to detached runners, so
+# one typo would otherwise become a whole unsandboxed matrix.
+_SANDBOX_DISABLED_VALUES = frozenset({"", "0", "false", "no", "off"})
 
 # Env override naming this run's fixtures explicitly, as ``:``-separated host
 # paths. Set it for a stack whose fixture name does not carry the cluster
@@ -112,7 +120,9 @@ _CONTAINER_NAME_PREFIX = "devops-bench-agent-"
 # resolved overlay. Exact names cover the operator's cloud identity plumbing
 # and the two variables the executor itself owns inside the container;
 # prefixes cover the benchmark's own configuration (``BENCH_*`` includes this
-# module's switches) and Terraform state/credential plumbing.
+# module's switches), Terraform state/credential plumbing, and every cloud's
+# credential env family — the boundary is vendor-neutral, so the deny list
+# must be too, not just the one cloud this benchmark happens to run on today.
 _DENIED_ENV_NAMES = frozenset(
     {
         "CLOUDSDK_CONFIG",
@@ -122,7 +132,7 @@ _DENIED_ENV_NAMES = frozenset(
         "PATH",
     }
 )
-_DENIED_ENV_PREFIXES = ("BENCH_", "TF_")
+_DENIED_ENV_PREFIXES = ("BENCH_", "TF_", "AWS_", "AZURE_", "ARM_")
 
 # Variables the executor itself owns inside the container. Unlike the deny
 # list above these are not even allowlistable: docker's last ``-e`` wins, so
@@ -213,13 +223,25 @@ def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
 
     Returns:
         A skeletal :class:`SandboxSpec` when ``BENCH_AGENT_SANDBOX`` is one of
-        ``docker``/``1``/``true``, else ``None``. The image may legitimately
+        ``docker``/``1``/``true``; ``None`` when it is unset or an explicit
+        off value (``0``/``false``/``no``/``off``). The image may legitimately
         still be empty here; the executor is where that fails loud.
+
+    Raises:
+        SandboxError: On any other value. An unrecognized spelling (``yes``,
+            ``podman``) must not silently run the agent ambient while the
+            operator believes it is contained.
     """
     raw = (get_env(SANDBOX_ENV, env=env) or "").strip().lower()
-    if raw not in _SANDBOX_ENABLED_VALUES:
+    if raw in _SANDBOX_ENABLED_VALUES:
+        return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip())
+    if raw in _SANDBOX_DISABLED_VALUES:
         return None
-    return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip())
+    raise SandboxError(
+        f"{SANDBOX_ENV}={raw!r} is not a recognized value; use docker/1/true to "
+        "sandbox, or 0/false/no/off (or unset) to run ambient — refusing to guess, "
+        "because guessing wrong would silently run the agent unsandboxed"
+    )
 
 
 def current_cluster_name() -> str | None:
