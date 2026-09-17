@@ -35,11 +35,11 @@ NODE_MAJOR="22"
 # Pin openclaw so VM rebuilds are reproducible; bump deliberately when adopting a
 # new release rather than tracking @latest.
 #
-# 2026.8.x is a floor, not a preference: an incoming harness change (PR #149,
-# already proven on the integration staging fork) writes a `memory` section into
-# every per-run openclaw.json to keep runs from recalling each other's
-# transcripts, and that section only exists from openclaw's 2026.8.x memory
-# subsystem on. oc rejects a config carrying a section it does not recognize
+# 2026.8.1 or newer is a floor, not a preference: an incoming harness change
+# (PR #149, already proven on the integration staging fork) writes a `memory`
+# section into every per-run openclaw.json to keep runs from recalling each
+# other's transcripts, and that section only exists from openclaw 2026.8.1
+# (where the memory subsystem ships) on. oc rejects a config carrying a section it does not recognize
 # instead of ignoring the key: on the old 2026.6.10 pin the run fails with
 # `OpenClaw config is invalid ... memory: Invalid input` and the agent exits 1
 # having done nothing, which scores as a null row rather than an error. The bump
