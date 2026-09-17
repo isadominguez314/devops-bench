@@ -404,6 +404,23 @@ def test_provision_refuses_the_fallback_for_an_exec_plugin_context(
         creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
 
 
+def test_provision_tears_down_when_the_fallback_render_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exec-plugin refusal fires after the policies (and possibly the
+    identity) are on the cluster, and the completed spec the run-end teardown
+    keys off never comes to exist — so provisioning must clean up itself."""
+    monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
+    calls = _patch_kubectl(monkeypatch, mint_fails=True, cert="", key="")
+
+    with pytest.raises(SandboxError, match="exec"):
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+    deleted = [argv for argv in calls if "delete" in argv]
+    assert any(creds._POLICY_BINDING_KIND in argv for argv in deleted)
+    assert any(creds.AGENT_NAMESPACE in argv for argv in deleted)
+
+
 # -- pod security ------------------------------------------------------------
 
 

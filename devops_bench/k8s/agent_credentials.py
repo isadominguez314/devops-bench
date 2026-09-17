@@ -1091,14 +1091,29 @@ def provision_agent_credentials(
                 f"agent ({exc}); refusing to fall back to the operator's admin "
                 f"credential — set {ALLOW_ADMIN_ENV}=1 to allow that explicitly"
             ) from exc
-        return _render_admin_fallback_kubeconfig(plan, dest_dir)
+        try:
+            return _render_admin_fallback_kubeconfig(plan, dest_dir)
+        except SandboxError:
+            # An exec-plugin context has no static certificate to copy, and by
+            # now the policies (and possibly the identity) are on the cluster;
+            # without this they would outlive a run whose completed spec —
+            # the thing the run-end teardown keys off — never came to exist.
+            _teardown_after_failed_provisioning(plan.kubectl_context)
+            raise
     _log.info(
         "sandboxed agent will authenticate as %s/%s with a %ds token",
         AGENT_NAMESPACE,
         AGENT_SA_NAME,
         token_ttl_sec,
     )
-    return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {token}")
+    try:
+        return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {token}")
+    except SandboxError:
+        # Belt-and-braces: the preflight makes a render failure here unlikely,
+        # but this is the last raise site past the first cluster write, and a
+        # miss strands the non-username-scoped deny policy on a reused cluster.
+        _teardown_after_failed_provisioning(plan.kubectl_context)
+        raise
 
 
 def teardown_agent_credentials(context: str | None = None) -> bool:
