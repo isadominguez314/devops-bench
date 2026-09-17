@@ -239,8 +239,11 @@ a container (`BENCH_SANDBOX_IMAGE`) that sees the run workspace, the task's
 seeded fixtures, a generated kubeconfig, and an explicit env overlay — and not
 the repo checkout, `results/`, your `$HOME`, gcloud config, Terraform state, or
 the Docker socket. With the switch unset the harness behaves exactly as it did
-before the sandbox existed. The design and the incidents behind it are in
-`docs/proposals/agent-sandboxing.md`.
+before the sandbox existed. The design was shaped by two observed incidents:
+an agent that used the admin kubeconfig to run a privileged pod and read the
+bench checkout through the node's disk, and an agent that mined the harness
+VM's cloud identity from the metadata endpoint when its model credential was
+missing.
 
 ### The cluster credential
 
