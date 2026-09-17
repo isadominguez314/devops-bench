@@ -344,6 +344,21 @@ def test_provision_gives_the_agent_a_service_account_token_not_a_certificate(
     assert "client-certificate-data" not in user
 
 
+def test_provision_refuses_before_writing_when_the_kubeconfig_cannot_render(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A context with no embedded CA fails the final render; by then the
+    policies and RBAC are already on the cluster with nothing recording them.
+    The preflight must surface that refusal before the first apply."""
+    calls = _patch_kubectl(monkeypatch, ca="")
+
+    with pytest.raises(SandboxError, match="certificate-authority-data"):
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+    assert not any("apply" in argv for argv in calls)
+    assert not (tmp_path / "kubeconfig").exists()
+
+
 def test_provision_refuses_to_fall_back_to_the_admin_credential(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
