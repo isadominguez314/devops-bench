@@ -30,12 +30,15 @@ BENCH_REQUIRE_FIXTURES=0 \
 python -m devops_bench tasks/canary/sandbox-boundary/canary.yaml
 ```
 
-`BENCH_REQUIRE_FIXTURES=0` is required, not optional: the fixture-completeness
-gate reads every `~/` path in a prompt as an input the stack promised to seed,
-and this canary's prompt is nothing but paths that are *supposed* to be
-absent. Without the override the gate fails the run before the agent starts —
-correctly, by its own contract, but this canary is exactly the "deliberately
-degraded arm" that override exists for.
+`BENCH_REQUIRE_FIXTURES=0` is forward-compatibility: **on current code the
+fixture-completeness gate is not yet in the tree**, so the variable is inert
+and the invocation works without it. Keep it anyway — when the gate lands
+(with the harness-wiring re-cut) it will read every `~/` path in a prompt as
+an input the stack promised to seed, and this canary's prompt is nothing but
+paths that are *supposed* to be absent, so the override becomes required:
+without it the gate fails the run before the agent starts — correctly, by its
+own contract, but this canary is exactly the "deliberately degraded arm" that
+override exists for.
 
 It also carries `validated: false`, so even a record that does get produced
 never promotes to the leaderboard.

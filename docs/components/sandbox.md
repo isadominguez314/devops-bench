@@ -33,7 +33,6 @@ back) rather than starving the agent into hunting.
 | `BENCH_AGENT_SANDBOX` | `docker` / `1` / `true` opts in. Unset, the harness behaves byte-for-byte as before the sandbox existed. |
 | `BENCH_SANDBOX_IMAGE` | The container image holding the agent CLI. Required when sandboxing. |
 | `BENCH_AGENT_FIXTURES` | Optional override for fixture discovery, for a stack that names its seeded inputs unconventionally. |
-| `BENCH_AGENT_SANDBOX_OWNER` | Unique attempt id scoping stray-container reaping; the matrix sets it per combo. |
 
 The matrix runner bakes the opt-in into the detached runner script, so a
 sandboxed remote matrix cannot silently degrade to ambient. The escape
@@ -67,9 +66,11 @@ timeout, applies PSA `baseline` labels, and installs ValidatingAdmissionPolicy
 backstops denying privileged pods, host namespaces, hostPath mounts, exempt-
 namespace writes, and shells into pre-existing non-conformant pods. A task
 whose subject matter *is* privileged workloads declares
-`agent_pod_security: privileged`; a task that cannot run behind the boundary
-at all declares `requires_unsandboxed: true` and runs ambient, loudly, with
-its records saying so. Under vcluster the ServiceAccount lives inside the
+`agent_pod_security: privileged`. (A per-task `requires_unsandboxed` opt-out
+— run this one task ambient, loudly, with its records saying so — is planned
+but **not yet implemented**: the schema ignores unknown keys, so declaring it
+today changes nothing and the task still runs sandboxed.) Under vcluster the
+ServiceAccount lives inside the
 virtual cluster, so the token is cryptographically useless against the host.
 
 **Teardown mirrors provisioning**: at the end of every sandboxed task — and
@@ -85,8 +86,9 @@ recovery on clusters last touched by older runs).
 A sandboxed arm carries a `sandboxed` augmentation token, so it lands in the
 `setup_id` and aggregates as its own dashboard setup — the sandboxed-vs-ambient
 comparison is a plain group-by on rows. Each row additionally carries its own
-`sandboxed` boolean, because the arm's token is not the per-task truth (a
-`requires_unsandboxed` task inside a sandboxed arm ran ambient). The run
+`sandboxed` boolean, because the arm's token is not the per-task truth (once
+per-task exemptions exist, an exempted task inside a sandboxed arm runs
+ambient and its row must say so; older records read `null` — unknown). The run
 manifest records the sandbox image **and its content digest**, so "both runs
 used the same image" is checkable rather than a mutable-tag claim.
 
