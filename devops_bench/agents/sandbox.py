@@ -269,10 +269,12 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     so the port still reaches the same listener.
 
     The apiserver certificate will not carry that name, so ``tls-server-name``
-    is set to ``localhost`` — the SAN a loopback-published cluster does have.
-    That keeps TLS verified rather than disabled: the container still checks
-    the certificate chain and the name, just against the name the certificate
-    was actually issued for.
+    is redirected — to whatever the source kubeconfig already declared when it
+    declares one (a cluster that needed an override outside the sandbox needs
+    the same one inside), and otherwise to ``localhost``, the SAN a
+    loopback-published cluster does have. That keeps TLS verified rather than
+    disabled: the container still checks the certificate chain and the name,
+    just against the name the certificate was actually issued for.
 
     A plan that already carries a ``rewrite_server`` is returned untouched: the
     provider knew better (kind's in-network control-plane name verifies with
@@ -290,6 +292,9 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     if parsed.hostname not in _LOOPBACK_HOSTS:
         return plan
     port = f":{parsed.port}" if parsed.port else ""
+    declared = kubectl.config_value(
+        "{.clusters[0].cluster.tls-server-name}", context=plan.kubectl_context
+    )
     _log.info(
         "cluster apiserver is published on loopback (%s); the container will reach it "
         "at host.docker.internal%s",
@@ -299,7 +304,7 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     return replace(
         plan,
         rewrite_server=f"https://host.docker.internal{port}",
-        tls_server_name=plan.tls_server_name or "localhost",
+        tls_server_name=plan.tls_server_name or declared or "localhost",
     )
 
 
