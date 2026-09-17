@@ -406,8 +406,11 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_execute_defaults_the_location_to_global(
-    mock_run, mock_home, _mock_gcloud_location, tmp_path
-):
+    mock_run: mock.MagicMock,
+    mock_home: mock.MagicMock,
+    _mock_gcloud_location: mock.MagicMock,
+    tmp_path: pathlib.Path,
+) -> None:
     # Nothing in the env chain and no gcloud default: the run must land on
     # "global", not a region — the -preview model ids 404 on regional endpoints.
     mock_home.return_value = tmp_path
@@ -430,8 +433,11 @@ def test_agy_cli_agent_execute_defaults_the_location_to_global(
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_execute_ignores_the_cluster_zone_for_routing(
-    mock_run, mock_home, mock_gcloud_location, tmp_path
-):
+    mock_run: mock.MagicMock,
+    mock_home: mock.MagicMock,
+    mock_gcloud_location: mock.MagicMock,
+    tmp_path: pathlib.Path,
+) -> None:
     # GCP_LOCATION is the deployers' cluster *zone* and is not read for routing;
     # the Vertex-specific spelling decides. The overlay still *writes* the zone
     # spelling for agy's own GCP tooling, now carrying the routed location.
