@@ -45,8 +45,8 @@ on the agent's behalf by a controller under another identity), so on a REUSED
 cluster a surviving policy denies the *operator's* next privileged workload
 too — the first live validation hit exactly that.
 
-Review rule (see ``docs/proposals/agent-sandboxing.md``): no cloud CLI —
-``gcloud``, ``aws``, ``az`` — is invoked anywhere in this module. Everything
+Review rule: no cloud CLI — ``gcloud``, ``aws``, ``az`` — is invoked
+anywhere in this module. Everything
 it does is plain Kubernetes API surface reached through ``kubectl``, so it
 behaves identically on every provider and adds no cloud dependency to the
 credential path.
@@ -960,6 +960,12 @@ def render_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path, *, user_fields: s
     if plan.tls_server_name:
         cluster_fields += f", tls-server-name: {plan.tls_server_name}"
     path = dest_dir / "kubeconfig"
+    # 0600 from the moment the file exists. Write-then-chmod would leave a
+    # umask-wide window with a live bearer token inside, on a host that may
+    # be shared; touch's mode only applies on creation, so the chmod stays
+    # for the (re-render) case where the file is already there.
+    path.touch(mode=0o600)
+    path.chmod(0o600)
     path.write_text(
         "apiVersion: v1\n"
         "kind: Config\n"
@@ -968,8 +974,38 @@ def render_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path, *, user_fields: s
         "contexts: [{name: ctx, context: {cluster: c, user: u}}]\n"
         "current-context: ctx\n"
     )
-    path.chmod(0o600)
     return path
+
+
+def _preflight_render_inputs(plan: NetworkPlan) -> None:
+    """Refuse before the first cluster write when the kubeconfig cannot render.
+
+    :func:`render_agent_kubeconfig` needs the context's embedded CA bundle and
+    a server URL, and it runs *last* — after the admission policies and RBAC
+    are already on the cluster. A context that cannot render (a
+    ``certificate-authority`` file path instead of embedded ``-data``, no
+    readable server) would strand those objects with nothing recording that
+    they exist. The same reads up front cost one kubectl call each and keep
+    every render failure ahead of the first write.
+
+    Raises:
+        SandboxError: When the context carries no embedded CA, or no server
+            URL can be determined for a plan without its own rewrite.
+    """
+    ctx = plan.kubectl_context
+    if not kubectl.config_value("{.clusters[0].cluster.certificate-authority-data}", context=ctx):
+        raise SandboxError(
+            "the run's kubectl context embeds no certificate-authority-data (a "
+            "certificate-authority file path cannot cross into the container); "
+            "refusing before anything is written to the cluster"
+        )
+    if not (
+        plan.rewrite_server or kubectl.config_value("{.clusters[0].cluster.server}", context=ctx)
+    ):
+        raise SandboxError(
+            "could not read the cluster server URL from the run's kubectl context; "
+            "refusing before anything is written to the cluster"
+        )
 
 
 def provision_agent_credentials(
@@ -1003,11 +1039,14 @@ def provision_agent_credentials(
 
     Raises:
         SandboxError: When the plan carries no context pin and
-            :data:`ALLOW_AMBIENT_ENV` is unset; when pod security cannot be
-            enforced; or when no scoped credential can be minted — unless the
-            admin fallback is explicitly enabled.
+            :data:`ALLOW_AMBIENT_ENV` is unset; when the context cannot render
+            a kubeconfig (checked up front, before anything is written to the
+            cluster); when pod security cannot be enforced; or when no scoped
+            credential can be minted — unless the admin fallback is explicitly
+            enabled.
     """
     _refuse_unpinned_cluster(plan)
+    _preflight_render_inputs(plan)
     # One switch covers both failures below, because they have one cause: an
     # operator whose credential cannot create cluster roles cannot create an
     # admission policy either.
@@ -1052,14 +1091,29 @@ def provision_agent_credentials(
                 f"agent ({exc}); refusing to fall back to the operator's admin "
                 f"credential — set {ALLOW_ADMIN_ENV}=1 to allow that explicitly"
             ) from exc
-        return _render_admin_fallback_kubeconfig(plan, dest_dir)
+        try:
+            return _render_admin_fallback_kubeconfig(plan, dest_dir)
+        except SandboxError:
+            # An exec-plugin context has no static certificate to copy, and by
+            # now the policies (and possibly the identity) are on the cluster;
+            # without this they would outlive a run whose completed spec —
+            # the thing the run-end teardown keys off — never came to exist.
+            _teardown_after_failed_provisioning(plan.kubectl_context)
+            raise
     _log.info(
         "sandboxed agent will authenticate as %s/%s with a %ds token",
         AGENT_NAMESPACE,
         AGENT_SA_NAME,
         token_ttl_sec,
     )
-    return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {token}")
+    try:
+        return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {token}")
+    except SandboxError:
+        # Belt-and-braces: the preflight makes a render failure here unlikely,
+        # but this is the last raise site past the first cluster write, and a
+        # miss strands the non-username-scoped deny policy on a reused cluster.
+        _teardown_after_failed_provisioning(plan.kubectl_context)
+        raise
 
 
 def teardown_agent_credentials(context: str | None = None) -> bool:

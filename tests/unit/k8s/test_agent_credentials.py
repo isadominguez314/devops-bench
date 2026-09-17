@@ -350,6 +350,21 @@ def test_provision_gives_the_agent_a_service_account_token_not_a_certificate(
     assert "client-certificate-data" not in user
 
 
+def test_provision_refuses_before_writing_when_the_kubeconfig_cannot_render(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A context with no embedded CA fails the final render; by then the
+    policies and RBAC are already on the cluster with nothing recording them.
+    The preflight must surface that refusal before the first apply."""
+    calls = _patch_kubectl(monkeypatch, ca="")
+
+    with pytest.raises(SandboxError, match="certificate-authority-data"):
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+    assert not any("apply" in argv for argv in calls)
+    assert not (tmp_path / "kubeconfig").exists()
+
+
 def test_provision_refuses_to_fall_back_to_the_admin_credential(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -387,6 +402,23 @@ def test_provision_refuses_the_fallback_for_an_exec_plugin_context(
 
     with pytest.raises(SandboxError, match="exec"):
         creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+
+def test_provision_tears_down_when_the_fallback_render_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exec-plugin refusal fires after the policies (and possibly the
+    identity) are on the cluster, and the completed spec the run-end teardown
+    keys off never comes to exist — so provisioning must clean up itself."""
+    monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
+    calls = _patch_kubectl(monkeypatch, mint_fails=True, cert="", key="")
+
+    with pytest.raises(SandboxError, match="exec"):
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+    deleted = [argv for argv in calls if "delete" in argv]
+    assert any(creds._POLICY_BINDING_KIND in argv for argv in deleted)
+    assert any(creds.AGENT_NAMESPACE in argv for argv in deleted)
 
 
 # -- pod security ------------------------------------------------------------

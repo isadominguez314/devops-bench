@@ -475,7 +475,8 @@ class _VertexMetadataEmulator:
                 f"{self.service_account}: gcloud exited {completed.returncode}: "
                 f"{(completed.stderr or '').strip() or '<no stderr>'}. The host identity "
                 "needs roles/iam.serviceAccountTokenCreator on that service account "
-                "(note that IAM bindings on this project are stripped periodically)"
+                "(if this worked before, verify the binding still exists — some "
+                "organizations expire or strip IAM grants)"
             )
         return token
 
