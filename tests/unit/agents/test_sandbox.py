@@ -70,9 +70,16 @@ def test_spec_from_env_accepts_the_documented_switch_values(value: str) -> None:
     assert spec.image == "img:1"
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", "podman"])
-def test_spec_from_env_rejects_other_values(value: str) -> None:
+@pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+def test_spec_from_env_is_none_on_an_explicit_off_value(value: str) -> None:
     assert sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": value}) is None
+
+
+@pytest.mark.parametrize("value", ["yes", "podman", "on", "enabled"])
+def test_spec_from_env_raises_on_an_unrecognized_value(value: str) -> None:
+    """An unrecognized spelling must fail loud, never silently run ambient."""
+    with pytest.raises(SandboxError, match="not a recognized value"):
+        sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": value})
 
 
 def test_spec_from_env_tolerates_a_missing_image() -> None:
@@ -431,6 +438,9 @@ def test_filter_boundary_env_rejects_credential_and_benchmark_vars() -> None:
         "GOOGLE_APPLICATION_CREDENTIALS": "/home/op/adc.json",
         "BENCH_CHEAT_DETECT": "0",
         "TF_VAR_project": "p",
+        "AWS_ACCESS_KEY_ID": "AKIA...",
+        "AZURE_CLIENT_SECRET": "s",
+        "ARM_CLIENT_ID": "c",
         "HOME": "/home/op",
         "KUBECONFIG": "/home/op/.kube/config",
     }
