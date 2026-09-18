@@ -1263,40 +1263,29 @@ def test_inventory_sandbox_home_records_rules_per_task(
     assert harness._sandbox_inventory_rules["fresh-task"] == ()  # noqa: SLF001
 
 
-def test_inventory_covers_fixture_mounts_at_their_container_paths(
+def test_fixture_mounts_are_not_inventoried(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fixture mounts only materialize inside the container, so the host-side
-    home scan cannot see them; each mounted name must get a container-path
-    rule, and the prompt filter must drop exactly the ones the task names."""
-    import re
-
-    from devops_bench.cheat_detection import filter_rules_for_prompt
-
+    """A mount is this run's declared input, not a leftover: ``discover_fixture_mounts``
+    keys on the run-unique cluster token, so covering mounts only ever flagged honest
+    reads of a delivered fixture whose name the prompt does not happen to repeat."""
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
     harness = _sandboxed_harness(monkeypatch, tmp_path)
 
     home = tmp_path / "ws" / "home"
     home.mkdir(parents=True)
-    harness._inventory_sandbox_home(  # noqa: SLF001
-        "t",
-        home,
-        {
-            "/home/op/opa-repo-c1.git": "/workspace/home/opa-repo-c1.git",
-            "/home/op/stale-notes-c1.md": "/workspace/home/stale-notes-c1.md",
-        },
-    )
-    rules = harness._sandbox_inventory_rules["t"]  # noqa: SLF001
-    assert {r.source for r in rules} == {"opa-repo-c1.git", "stale-notes-c1.md"}
-    # The rules match the container-side spellings the trajectory records.
-    repo_rule = next(r for r in rules if r.source == "opa-repo-c1.git")
-    assert re.search(repo_rule.patterns[0], "cat /workspace/home/opa-repo-c1.git/config")
-    assert re.search(repo_rule.patterns[0], "git clone ~/opa-repo-c1.git")
+    # The container-side fixture home is empty on the host, which is the whole
+    # reason mounts were covered separately; an empty ruleset is now correct.
+    harness._inventory_sandbox_home("t", home)  # noqa: SLF001
+    assert harness._sandbox_inventory_rules["t"] == ()  # noqa: SLF001
 
-    # A prompt naming the repo authorizes it for that record; the mount the
-    # prompt never asked for (a leftover swept in by the token glob) stays.
-    surviving = filter_rules_for_prompt(rules, "Fix the policy and push to '~/opa-repo-c1.git'.")
-    assert {r.source for r in surviving} == {"stale-notes-c1.md"}
+    # A leftover the run did not mount is still covered, so dropping the mount
+    # rules did not blunt the host-home tripwire.
+    dirty = tmp_path / "ws2" / "home"
+    dirty.mkdir(parents=True)
+    (dirty / "stale-notes.md").write_text("a prior run's distinctive leftover line\n" * 3)
+    harness._inventory_sandbox_home("t2", dirty)  # noqa: SLF001
+    assert "stale-notes.md" in {r.source for r in harness._sandbox_inventory_rules["t2"]}  # noqa: SLF001
 
 
 def test_stray_container_sweep_is_skipped_under_parallel(

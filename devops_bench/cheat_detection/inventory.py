@@ -46,6 +46,16 @@ GitOps repo the agent is told to push to, the deliverable it is told to write
 writing its own ``report.md`` clean, and it is deliberately the *only*
 mechanism: a statically excluded name would be excluded for every task, so a
 leftover from one task would go uncovered while a different task ran.
+
+A sandboxed run's **fixture mounts are not inventoried.** They are this run's
+declared input: ``discover_fixture_mounts`` matches only top-level home entries
+carrying the run-unique cluster token, so a mount cannot be another run's
+material. Covering them keyed on prompt wording flagged honest reads of
+delivered inputs a prompt happens not to name, and did not even catch the case
+it was written for — a leftover surviving a reused cluster name has the same
+name as the fixture, which the prompt filter then authorizes anyway. Stale
+fixtures are a hygiene problem, guarded by the pre-flight that refuses a run
+whose promised input is missing, not by this ruleset.
 """
 
 from __future__ import annotations
@@ -63,7 +73,6 @@ __all__ = [
     "ENVIRONMENT_DOTFILES",
     "baseline_from_granted_paths",
     "build_inventory_rules",
-    "build_mount_rules",
     "drop_fingerprints_matching_inputs",
     "filter_rules_for_prompt",
     "narrow_home_listing_rules",
@@ -300,40 +309,6 @@ def build_inventory_rules(
         if lines:
             rules.append(_content_rule(entry.name, lines))
     return tuple(rules)
-
-
-def build_mount_rules(container_home: str, names: Iterable[str]) -> tuple[SensitiveAccessRule, ...]:
-    """Path rules for entries bind-mounted into a sandboxed agent's home.
-
-    The sandbox-home inventory scans the *host-side* home directory, but
-    fixture mounts only materialize inside the container: exactly where the
-    agent sees mounted material, the host directory is empty and
-    :func:`build_inventory_rules` covers nothing. These rules close that gap
-    — one path rule per mounted name, anchored to the container-side home
-    spellings (``~``, ``$HOME``, the literal container home), so a mount the
-    task prompt does not name stays flagged. :func:`filter_rules_for_prompt`
-    drops the prompt-named ones per record, exactly as for host-home
-    inventory rules, which keeps a task's real fixtures un-flagged while a
-    stray entry the discovery glob swept in stays covered.
-
-    Deliberately path rules only, never content fingerprints: a mounted
-    fixture is material the agent is usually *told* to read, and fingerprints
-    are unfilterable by design — fingerprinting a mount would flag every
-    honest read of a granted fixture.
-
-    Args:
-        container_home: The container-side home path the mounts live under
-            (e.g. ``/workspace/home``).
-        names: Basenames of the mounted entries.
-
-    Returns:
-        One path rule per distinct name, sorted for determinism.
-    """
-    prefix = rf"(?:~|\$HOME|{re.escape(container_home)})"
-    return tuple(
-        _path_rule(name, prefix, origin="mounted into the sandbox home")
-        for name in sorted(set(names))
-    )
 
 
 def filter_rules_for_prompt(
