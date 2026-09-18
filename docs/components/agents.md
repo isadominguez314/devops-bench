@@ -478,6 +478,13 @@ The agent's kubeconfig mount remains read-only. Provider authentication uses
 explicit overlays; host credential files are not copied into the sandbox.
 
 
+`AGENT_PROVIDER=openai-codex` runs OpenAI models through a ChatGPT/Codex
+subscription login instead of an API key. No key is threaded: openclaw's
+`openai` provider bootstraps an OAuth profile into the per-run store from the
+Codex CLI login at `$CODEX_HOME/auth.json` (default `~/.codex`) and refreshes
+it in place, so the login must exist on the host that runs `oc` (unsandboxed).
+Pin the reasoning effort with `AGENT_EXTRA_FLAGS="--thinking high"`.
+
 OpenClaw's per-run catalog also registers `gemini-3.8-flash` with the `google`
 or `google-vertex` provider, and `claude-fable-5-1` with `anthropic-vertex`.
 Select them with `AGENT_MODEL` and `AGENT_PROVIDER`; the harness pins the matching

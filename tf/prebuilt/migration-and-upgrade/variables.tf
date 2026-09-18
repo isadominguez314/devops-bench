@@ -77,3 +77,9 @@ variable "repo_path" {
   description = "Local bare git repo the agent clones the manifests from. Empty (default) derives a per-run-unique path from cluster_name so concurrent runs on the shared bastion don't collide (see locals)."
   default     = ""
 }
+
+variable "token_creator_member" {
+  type        = string
+  description = "IAM member (user:... or serviceAccount:...) allowed to mint tokens for the agent's upgrader service account; empty derives it from the provisioner's ADC identity when possible"
+  default     = ""
+}

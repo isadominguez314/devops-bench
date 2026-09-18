@@ -2,6 +2,9 @@
 # review). Bumped to a value outside the current 1-15 / 1001 range to be unique.
 task_id: 16
 name: "migration-and-upgrade"
+# Sandboxed runs get a short-lived impersonated token for the stack's
+# `agent_cloud_identity` (a run-unique service account that may administer only
+# this run's cluster), so the upgrade can be driven from inside the sandbox.
 infrastructure:
   deployer: "tofu"
   stack: "prebuilt/migration-and-upgrade"

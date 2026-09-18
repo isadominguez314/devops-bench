@@ -1449,3 +1449,78 @@ def test_latest_models_have_per_run_catalog_and_transport(
     assert entry["models"] == [{"id": model, "name": model}]
     assert entry["api"] == transport
     assert override["agents"]["defaults"]["models"] == {f"{provider}/{model}": {}}
+
+
+# ---------------------------------------------------------------------------
+# Direct-Anthropic and OpenAI-compatible (self-hosted) providers.
+# ---------------------------------------------------------------------------
+
+
+def test_model_override_anthropic_direct_pins_messages_transport() -> None:
+    """A Claude 5 id on the direct API gets the anthropic-messages transport."""
+    override = _build_model_override(AgentConfig(model="claude-fable-5-1", provider="anthropic"))
+    entry = override["models"]["providers"]["anthropic"]
+    assert entry["api"] == "anthropic-messages"
+    assert entry["baseUrl"] == "https://api.anthropic.com"
+    assert entry["models"] == [{"id": "claude-fable-5-1", "name": "claude-fable-5-1"}]
+    assert override["agents"]["defaults"]["models"] == {"anthropic/claude-fable-5-1": {}}
+
+
+def test_model_override_openai_without_base_url_is_empty(monkeypatch) -> None:
+    """Without OPENAI_BASE_URL an unknown openai id is left to oc's own catalog."""
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    assert _build_model_override(AgentConfig(model="qwen3.8-27b", provider="openai")) == {}
+
+
+def test_model_override_openai_custom_endpoint(monkeypatch) -> None:
+    """OPENAI_BASE_URL registers the server's model id with the completions transport."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1/")
+    monkeypatch.setenv("AGENT_CONTEXT_WINDOW", "262144")
+    override = _build_model_override(AgentConfig(model="qwen3.8-27b", provider="openai"))
+    entry = override["models"]["providers"]["openai"]
+    assert entry["api"] == "openai-completions"
+    assert entry["baseUrl"] == "http://127.0.0.1:8000/v1"
+    assert entry["request"] == {"allowPrivateNetwork": True}
+    assert entry["models"] == [
+        {"id": "qwen3.8-27b", "name": "qwen3.8-27b", "contextWindow": 262144}
+    ]
+    assert override["agents"]["defaults"]["models"] == {"openai/qwen3.8-27b": {}}
+
+
+def test_model_override_rejects_non_integer_context_window(monkeypatch) -> None:
+    from devops_bench.core.errors import ConfigError
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("AGENT_CONTEXT_WINDOW", "lots")
+    with pytest.raises(ConfigError):
+        _build_model_override(AgentConfig(model="qwen3.8-27b", provider="openai"))
+
+
+def test_model_override_custom_endpoint_declares_reasoning(monkeypatch) -> None:
+    """AGENT_MODEL_REASONING marks the model reasoning-capable so oc accepts --thinking."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.delenv("AGENT_CONTEXT_WINDOW", raising=False)
+    monkeypatch.setenv("AGENT_MODEL_REASONING", "true")
+    override = _build_model_override(AgentConfig(model="qwen3.8-27b", provider="openai"))
+    assert override["models"]["providers"]["openai"]["models"] == [
+        {"id": "qwen3.8-27b", "name": "qwen3.8-27b", "reasoning": True}
+    ]
+
+
+def test_model_override_custom_endpoint_max_output_tokens(monkeypatch) -> None:
+    """AGENT_MAX_OUTPUT_TOKENS lifts oc's 8192-token default on a per-run model entry."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.delenv("AGENT_CONTEXT_WINDOW", raising=False)
+    monkeypatch.delenv("AGENT_MODEL_REASONING", raising=False)
+    monkeypatch.setenv("AGENT_MAX_OUTPUT_TOKENS", "65536")
+    override = _build_model_override(AgentConfig(model="qwen3.8-27b", provider="openai"))
+    assert override["models"]["providers"]["openai"]["models"] == [
+        {"id": "qwen3.8-27b", "name": "qwen3.8-27b", "maxTokens": 65536}
+    ]
+
+
+def test_oc_timeout_flag_follows_agent_budget() -> None:
+    from devops_bench.agents.cli.openclaw.agent import _oc_timeout_flag
+
+    assert _oc_timeout_flag(AgentConfig(timeout_sec=3600)) == "--timeout 3600 "
+    assert _oc_timeout_flag(AgentConfig(timeout_sec=None)) == ""
