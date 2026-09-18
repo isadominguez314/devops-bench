@@ -159,11 +159,18 @@ def derive_augmentation(capabilities_granted: Mapping[str, Any] | None) -> list[
     """Map a record's ``capabilities_granted`` to sorted augmentation tokens.
 
     ``use_mcp`` contributes ``"mcp"``; a non-empty ``skills`` list contributes
-    ``"skills"``. An arm with neither yields ``[]`` (baseline).
+    ``"skills"``; a truthy ``sandboxed`` contributes ``"sandboxed"``. An arm
+    with none of them yields ``[]`` (baseline).
+
+    ``sandboxed`` is an augmentation token deliberately: it lands in the
+    ``setup_id``, so a sandboxed arm aggregates as its own dashboard setup and
+    the sandbox A/B soak is a plain group-by on rows — no re-scoring, no
+    side-channel metadata join.
 
     Args:
         capabilities_granted: The record's ``capabilities_granted`` mapping
-            (``{"use_mcp": bool, "skills": list}``), or ``None``.
+            (``{"use_mcp": bool, "skills": list, "sandboxed": bool}``), or
+            ``None``.
 
     Returns:
         Sorted, de-duplicated capability tokens.
@@ -174,6 +181,8 @@ def derive_augmentation(capabilities_granted: Mapping[str, Any] | None) -> list[
         tokens.add("mcp")
     if caps.get("skills"):
         tokens.add("skills")
+    if caps.get("sandboxed"):
+        tokens.add("sandboxed")
     return sorted(tokens)
 
 
@@ -429,6 +438,12 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         # rebuilt row contradicts itself: correctness withheld, composite 1.0.
         outcome = None if unattributable else extract_score(scores, OUTCOME_SCORE_KEY)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
+        # Per-record, not per-manifest: within a sandboxed arm a task that
+        # declared ``requires_unsandboxed`` ran OUTSIDE the boundary, and its
+        # row must say so. Absent (a record predating the field) stays None —
+        # unknown, which is not the same claim as False.
+        raw_sandboxed = record.get("sandboxed")
+        sandboxed = raw_sandboxed if isinstance(raw_sandboxed, bool) else None
         tool_calls, tool_errors = count_tool_calls(record.get("trajectory"), record.get("errors"))
         # A reported 0 is a parse miss, not a run that never called the model;
         # a negative one is corrupt.
@@ -468,6 +483,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 terminal_reason=record.get("terminal_reason", "") or "",
                 timeout_sec=manifest.timeout_sec,
                 validated=bool(record.get("validated", False)),
+                sandboxed=sandboxed,
             )
         )
     return rows

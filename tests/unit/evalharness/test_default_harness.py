@@ -813,6 +813,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "verification_status",
         "generation_only",
         "validated",
+        "sandboxed",
     }
 )
 
@@ -1327,6 +1328,69 @@ def test_run_one_tears_down_sandbox_credentials_in_its_finally(
         assert torn_down == ["kind-c1"]
     finally:
         AGENTS._items.pop("fake-sandbox-teardown", None)  # noqa: SLF001
+
+
+def test_write_run_artifacts_records_sandbox_provenance(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm's sandboxing lands in the setup id (A/B is a group-by), and the
+    image is pinned by digest — a mutable tag is not provenance."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "image_digest", lambda image: f"{image}@sha256:feed"
+    )
+    written: dict[str, Any] = {}
+    monkeypatch.setattr(
+        harness.reporter, "write_rows", lambda run_dir, rows: written.update(rows=rows)
+    )
+    monkeypatch.setattr(
+        harness.reporter, "write_manifest", lambda run_dir, m: written.update(manifest=m)
+    )
+
+    record = {"name": "t", "folder": "f", "status": "success", "sandboxed": True}
+    harness._write_run_artifacts(tmp_path, [record])  # noqa: SLF001
+
+    manifest = written["manifest"]
+    assert "sandboxed" in manifest["augmentation"]
+    assert "sandboxed" in manifest["setupId"]
+    assert manifest["sandboxImage"] == "agent-sandbox:test"
+    assert manifest["sandboxImageDigest"] == "agent-sandbox:test@sha256:feed"
+    assert written["rows"][0]["sandboxed"] is True
+
+
+def test_write_run_artifacts_stays_baseline_when_unsandboxed(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    harness = DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results")
+    )
+    written: dict[str, Any] = {}
+    monkeypatch.setattr(harness.reporter, "write_rows", lambda run_dir, rows: None)
+    monkeypatch.setattr(
+        harness.reporter, "write_manifest", lambda run_dir, m: written.update(manifest=m)
+    )
+
+    harness._write_run_artifacts(tmp_path, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001
+
+    manifest = written["manifest"]
+    assert "sandboxed" not in manifest["augmentation"]
+    assert manifest["sandboxImage"] is None
+    assert manifest["sandboxImageDigest"] is None
+
+
+def test_empty_record_carries_the_task_scoped_sandboxed_flag(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-record truth: the flag reads the task-scoped spec, so an exempt
+    task inside a sandboxed arm records False while its siblings record True."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+
+    assert harness._empty_record(task)["sandboxed"] is False  # noqa: SLF001
+    harness._active_sandbox_spec = harness.build_agent_config().sandbox  # noqa: SLF001
+    assert harness._empty_record(task)["sandboxed"] is True  # noqa: SLF001
+    harness._active_sandbox_spec = None  # noqa: SLF001
 
 
 def test_run_one_does_not_tear_down_for_a_sandbox_exempt_task(
