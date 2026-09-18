@@ -1656,33 +1656,24 @@ def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -
     assert harness.build_agent_config().sandbox is not None
 
 
-def test_secret_rotation_declares_requires_unsandboxed() -> None:
-    """The exemption travels with the task that needs it, not with a runner flag.
+def test_secret_rotation_runs_sandboxed() -> None:
+    """secret-rotation no longer opts out: its cloud credential crosses by value.
 
+    The stack exports ``agent_cloud_identity`` and the provider mints a
+    short-lived impersonated token for it, so the sandbox can do the task.
     Loaded through the real loader, not read as raw YAML: ``Task.from_dict``
-    builds an explicit field mapping and ``Task`` ignores unknown keys, so a key
-    missing from that mapping is dropped silently — a raw-YAML assertion stays
-    green while the harness sees the ``False`` default. The raw-YAML check stays
-    alongside as a spec-content check, but the loader path is the coverage.
+    builds an explicit field mapping and ``Task`` ignores unknown keys, so this
+    is the path the harness actually sees.
     """
-    import pathlib
-
-    import yaml as _yaml
-
     from devops_bench.tasks.loader import FileSystemTaskLoader
 
     tasks = FileSystemTaskLoader().load_tasks("tasks/gcp/secret-rotation/task.yaml")
     assert len(tasks) == 1
-    assert tasks[0].requires_unsandboxed is True
-
-    spec = _yaml.safe_load(
-        pathlib.Path("tasks/gcp/secret-rotation/task.yaml").read_text(encoding="utf-8")
-    )
-    assert spec.get("requires_unsandboxed") is True
+    assert tasks[0].requires_unsandboxed is False
 
 
-def test_no_other_task_opts_out_of_the_sandbox() -> None:
-    """Exactly one exemption; a second would need its own justification."""
+def test_no_task_opts_out_of_the_sandbox() -> None:
+    """No exemptions in tree; a new one would need its own justification."""
     import pathlib
 
     import yaml as _yaml
@@ -1692,4 +1683,4 @@ def test_no_other_task_opts_out_of_the_sandbox() -> None:
         for p in sorted(pathlib.Path("tasks").glob("*/*/task.yaml"))
         if (_yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("requires_unsandboxed")
     ]
-    assert exempt == ["secret-rotation"]
+    assert exempt == []
