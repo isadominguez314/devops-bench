@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -282,6 +283,7 @@ class GeminiCliAgent(AgentHarness):
                 (gemini_dir / _GEMINI_SETTINGS_FILE).write_text(
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
+            started = time.monotonic()
             try:
                 # Through the sandbox seam: containerised when
                 # ``config.sandbox`` is set, byte-identical to a direct
@@ -299,25 +301,39 @@ class GeminiCliAgent(AgentHarness):
                     host_run=run,
                 )
             except SubprocessError as exc:
-                return AgentResult.errored(f"gemini subprocess error: {exc}")
+                # The stream-json written before the kill is a valid prefix of
+                # the event stream, so the trajectory and tokens the run did
+                # manage are still parseable. Recovering them keeps a timed-out
+                # gemini row comparable with openclaw's and antigravity's,
+                # which also recover partial telemetry.
+                partial = parse_stream_json(exc.stdout or "")
+                return partial.to_result(
+                    latency=time.monotonic() - started,
+                    terminal_reason="timeout" if exc.timed_out else "error",
+                    output=partial.output or f"Error: gemini subprocess error: {exc}",
+                    errors=[f"gemini subprocess error: {exc}", *partial.errors],
+                )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
-                return AgentResult.errored(f"gemini binary unavailable: {exc}")
+                return AgentResult.errored(
+                    f"gemini binary unavailable: {exc}", latency=time.monotonic() - started
+                )
+            agent_sec = time.monotonic() - started
 
-        output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
-        errors: list[str] = list(parse_errors)
+        parsed = parse_stream_json(completed.stdout or "")
+        output = parsed.output
+        errors: list[str] = list(parsed.errors)
+        metadata: dict = {}
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
             if not output:
                 output = f"Error: gemini exited {completed.returncode}"
-        metadata: dict = {}
-        if completed.returncode != 0:
             metadata["returncode"] = completed.returncode
-        return AgentResult(
+        return parsed.to_result(
+            latency=agent_sec,
+            terminal_reason="error" if completed.returncode != 0 else "completed",
             output=output,
-            trajectory=trajectory,
-            tokens=tokens,
             errors=errors,
             metadata=metadata,
         )

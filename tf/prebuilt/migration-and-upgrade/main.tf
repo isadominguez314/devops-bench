@@ -26,6 +26,10 @@ terraform {
       source  = "hashicorp/null"
       version = ">= 3.0.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = ">= 3.0.0"
+    }
   }
 }
 
@@ -48,17 +52,22 @@ provider "kind" {}
 # GKE/KinD "production" cluster at the START version. The agent migrates the deprecated
 # manifests, validates them, applies them, then performs the upgrade.
 module "cluster" {
-  source                = "../../modules/cluster"
-  infra_provider        = var.infra_provider
-  project_id            = var.project_id
-  cluster_name          = var.cluster_name
-  location              = var.location
-  node_count            = var.node_count
-  machine_type          = var.machine_type
-  kubernetes_version    = var.start_version
-  node_image            = var.node_image
-  kubeconfig_path       = var.kubeconfig_path
-  agent_service_account = var.project_id != "" ? "openclaw-vm-sa@${var.project_id}.iam.gserviceaccount.com" : ""
+  source             = "../../modules/cluster"
+  infra_provider     = var.infra_provider
+  project_id         = var.project_id
+  cluster_name       = var.cluster_name
+  location           = var.location
+  node_count         = var.node_count
+  machine_type       = var.machine_type
+  kubernetes_version = var.start_version
+  node_image         = var.node_image
+  kubeconfig_path    = var.kubeconfig_path
+  # Not the operator's identity: the module would then own a project-level
+  # container.admin binding for it and strip it on teardown, breaking every
+  # later run that relies on that grant. The sandboxed agent's cloud calls use
+  # the run-scoped upgrader identity (identity.tf); an unsandboxed run inherits
+  # whatever the host already holds.
+  agent_service_account = ""
   enable_iap_ssh        = true
 }
 

@@ -57,6 +57,7 @@ import os
 import re
 import shlex
 import shutil
+import time
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -76,6 +77,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.telemetry import ParsedRun
 from devops_bench.agents.shared.vertex_env import vertex_location
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError
@@ -212,6 +214,12 @@ _OPENCLAW_STATE_DIRNAME = "state"
 _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
+# Trajectory extraction runs after the agent turn, including after it timed out,
+# so it cannot inherit the turn's budget: two reads at ``timeout_sec`` each would
+# let one task occupy three times its allotted wall clock. These are local
+# metadata reads, not agent work.
+_EXTRACT_TIMEOUT_SEC = 120
+
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
 # catalog; the harness registers these per-run (see :func:`_build_model_override`).
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
@@ -250,7 +258,33 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
         "baseUrl": "https://aiplatform.googleapis.com",
         "apiKey": _VERTEX_CREDENTIALS_MARKER,
     },
+    # Direct Anthropic API; the key reaches oc as ANTHROPIC_API_KEY via _build_env.
+    "anthropic": {
+        "api": "anthropic-messages",
+        "baseUrl": "https://api.anthropic.com",
+    },
+    # Any OpenAI-compatible server (vLLM, SGLang, a Vertex dedicated endpoint).
+    # ``baseUrl`` comes from OPENAI_BASE_URL at build time; the key reaches oc
+    # as OPENAI_API_KEY via _build_env.
+    "openai": {
+        "api": "openai-completions",
+    },
 }
+
+# Points the ``openai`` provider at a self-hosted OpenAI-compatible server. When
+# set, every ``openai/<id>`` model is registered per run (the server's ids are
+# unknown to oc's catalog) and AGENT_CONTEXT_WINDOW, if set, is passed through
+# as the model's context window so oc sizes its history accordingly.
+_OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
+_CONTEXT_WINDOW_ENV = "AGENT_CONTEXT_WINDOW"
+# oc only accepts a ``--thinking`` level for models whose catalog entry declares
+# reasoning; a per-run entry defaults to none, so a reasoning model behind a
+# custom endpoint must say so explicitly.
+_MODEL_REASONING_ENV = "AGENT_MODEL_REASONING"
+# oc caps a per-run model entry at 8192 output tokens (its DEFAULT_MAX_TOKENS);
+# a reasoning model can spend that on thinking alone and end the turn with
+# stopReason=length and no tool call, so let the run raise the cap.
+_MAX_OUTPUT_TOKENS_ENV = "AGENT_MAX_OUTPUT_TOKENS"
 # Per-run layout of the node-fetch->native-fetch ESM loader shim (see
 # :func:`_write_node_fetch_shim`), written under the run's own workdir so it
 # is visible inside the sandboxed container at ``/workspace/node-fetch-shim``.
@@ -373,7 +407,9 @@ def _build_model_override(config: AgentConfig) -> dict:
     if not model_id:
         return {}
     provider, _, bare = model_id.partition("/")
-    if bare not in _CATALOG_OVERRIDES:
+    custom_base_url = os.environ.get(_OPENAI_BASE_URL_ENV, "").strip().rstrip("/")
+    custom_endpoint = provider == "openai" and bool(custom_base_url)
+    if bare not in _CATALOG_OVERRIDES and not custom_endpoint:
         return {}
     # A per-run provider entry *replaces* oc's built-in one, so it must pin a
     # transport; without one oc falls back to the OpenAI transport and 401s. Fail
@@ -386,7 +422,31 @@ def _build_model_override(config: AgentConfig) -> dict:
             f"{', '.join(sorted(_PROVIDER_TRANSPORT))})"
         )
     provider_entry: dict = dict(_PROVIDER_TRANSPORT[provider])
-    provider_entry["models"] = [{"id": bare, "name": bare}]
+    if custom_endpoint:
+        provider_entry["baseUrl"] = custom_base_url
+        # A self-hosted server usually sits on a loopback or VPC address, which
+        # oc's SSRF guard refuses for model fetches unless the provider opts in.
+        provider_entry["request"] = {"allowPrivateNetwork": True}
+    model_entry: dict = {"id": bare, "name": bare}
+    context_window = os.environ.get(_CONTEXT_WINDOW_ENV, "").strip()
+    if context_window:
+        try:
+            model_entry["contextWindow"] = int(context_window)
+        except ValueError as exc:
+            raise ConfigError(
+                f"{_CONTEXT_WINDOW_ENV} must be an integer, got {context_window!r}"
+            ) from exc
+    if os.environ.get(_MODEL_REASONING_ENV, "").strip().lower() in ("1", "true", "yes"):
+        model_entry["reasoning"] = True
+    max_output = os.environ.get(_MAX_OUTPUT_TOKENS_ENV, "").strip()
+    if max_output:
+        try:
+            model_entry["maxTokens"] = int(max_output)
+        except ValueError as exc:
+            raise ConfigError(
+                f"{_MAX_OUTPUT_TOKENS_ENV} must be an integer, got {max_output!r}"
+            ) from exc
+    provider_entry["models"] = [model_entry]
     return {
         "models": {"providers": {provider: provider_entry}},
         # Allowlist ``provider/id`` for the agent's per-run ``--model`` override.
@@ -603,6 +663,17 @@ def _oc_model_flag(config: AgentConfig) -> str:
     return f"--model {shlex.quote(model_id)} "
 
 
+def _oc_timeout_flag(config: AgentConfig) -> str:
+    """Forward the run's agent budget as oc's ``--timeout``.
+
+    oc's own agent command timeout defaults to 600 s and would end a long turn
+    before the harness's ``timeout_sec`` does; keep the two aligned.
+    """
+    if not config.timeout_sec:
+        return ""
+    return f"--timeout {int(config.timeout_sec)} "
+
+
 def _oc_provider_or_none(config: AgentConfig) -> str | None:
     """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
 
@@ -713,7 +784,7 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
         f"{auth_setup}{quoted_oc} --log-level debug agent --local "
         f"--agent {shlex.quote(agent_name)} {_oc_model_flag(config)}"
-        f"{extra_flags_str}-m {shlex.quote(prompt)}"
+        f"{_oc_timeout_flag(config)}{extra_flags_str}-m {shlex.quote(prompt)}"
     )
 
 
@@ -837,6 +908,7 @@ class OpenClawAgent(AgentHarness):
             # consuming Vertex quota). Run in its own process group
             # (start_new_session=True) and os.killpg(...) on timeout. Tracked as a
             # separate, more intrusive change to generalize across all CLI agents.
+            started = time.monotonic()
             try:
                 # bash -c (as argv, never shell=True) so nvm.sh can be sourced;
                 # every value interpolated into `command` is shlex.quoted.
@@ -848,40 +920,63 @@ class OpenClawAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                     host_run=run,
                 )
-            except SubprocessError:
-                # With check=False the only SubprocessError here is a timeout.
-                return AgentResult.errored(f"oc agent timed out after {self.config.timeout_sec}s")
+            except SubprocessError as exc:
+                # Deliberately no early return. The kill ends the agent turn,
+                # but the session it wrote survives in ``OPENCLAW_STATE_DIR``
+                # and export-trajectory is a separate subprocess, so the tokens
+                # and tool calls it managed before the budget hit are still
+                # recoverable -- and a timed-out row is exactly where "how far
+                # did it get" is worth knowing. Antigravity recovers its
+                # transcript the same way.
+                completed, timed_out, agent_stdout = None, exc.timed_out, exc.stdout
             except OSError as exc:
-                return AgentResult.errored(f"oc binary unavailable: {exc}")
+                return AgentResult.errored(
+                    f"oc binary unavailable: {exc}", latency=time.monotonic() - started
+                )
+            else:
+                timed_out, agent_stdout = False, completed.stdout
+            agent_sec = time.monotonic() - started
 
-            stdout_text = _strip_ansi(completed.stdout or "")
+            stdout_text = _strip_ansi(agent_stdout or "")
             errors: list[str] = []
             metadata: dict = {}
 
-            if completed.returncode != 0:
+            if completed is None:
+                errors.append(
+                    f"oc agent timed out after {self.config.timeout_sec}s"
+                    if timed_out
+                    else "oc agent subprocess failed before returning"
+                )
+            elif completed.returncode != 0:
                 stderr = (completed.stderr or "").strip()
                 errors.append(f"oc agent exited {completed.returncode}: {stderr or '<no stderr>'}")
                 metadata["returncode"] = completed.returncode
 
-            trajectory, tokens, bundle_output, export_errors = self._extract_trajectory(
-                oc_bin, env_overlay, workdir
-            )
-            errors.extend(export_errors)
+            export = self._extract_trajectory(oc_bin, env_overlay, workdir)
+            errors.extend(export.errors)
 
         # Bundle text is clean; bash stdout carries debug noise — fall back only if empty.
-        output = bundle_output if bundle_output else stdout_text
+        output = export.output if export.output else stdout_text
+        if not output and errors:
+            output = f"Error: {errors[0]}"
 
-        return AgentResult(
+        if completed is None:
+            reason = "timeout" if timed_out else "error"
+        else:
+            reason = "error" if completed.returncode != 0 else "completed"
+
+        return export.to_result(
+            latency=agent_sec,
+            # A failed trajectory export is not a reason the *agent* stopped.
+            terminal_reason=reason,
             output=output,
-            trajectory=trajectory,
-            tokens=tokens,
             errors=errors,
             metadata=metadata,
         )
 
     def _extract_trajectory(
         self, oc_bin: str, env_overlay: dict[str, str], export_workspace: Path
-    ) -> tuple[list[dict], dict, str, list[str]]:
+    ) -> ParsedRun:
         """Run ``oc sessions`` + ``export-trajectory`` and parse the bundle.
 
         ``env_overlay`` carries ``OPENCLAW_STATE_DIR`` (and ``OPENCLAW_CONFIG_PATH``
@@ -899,10 +994,11 @@ class OpenClawAgent(AgentHarness):
         this temp dir).
 
         Returns:
-            A ``(trajectory, tokens, output_text, errors)`` tuple. ``output_text``
-            is the agent's final answer parsed from the bundle's ``events.jsonl``
+            A :class:`~...shared.telemetry.ParsedRun`. Its ``output`` is the agent's
+            final answer parsed from the bundle's ``events.jsonl``
             (``model.completed.assistantTexts``) when present, else ``""``; the
             caller falls back to the ansi-stripped subprocess stdout when empty.
+            Every early-exit path returns an empty export carrying the errors.
         """
         errors: list[str] = []
         # The agent turn sources nvm inside a bash command, but these extraction
@@ -914,25 +1010,25 @@ class OpenClawAgent(AgentHarness):
             sessions = run(
                 [oc_bin, "sessions", "--agent", self.agent_name, "--json"],
                 check=False,
-                timeout=self.config.timeout_sec,
+                timeout=_EXTRACT_TIMEOUT_SEC,
                 extra_env=env_overlay,
             )
         except SubprocessError as exc:
             errors.append(f"oc sessions failed: {exc}")
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
         except OSError as exc:
             errors.append(f"oc sessions: binary unavailable: {exc}")
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
 
         if sessions.returncode != 0:
             stderr = (sessions.stderr or "").strip()
             errors.append(f"oc sessions exited {sessions.returncode}: {stderr or '<no stderr>'}")
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
 
         key = _pick_session_key(sessions.stdout or "")
         if key is None:
             errors.append("oc sessions returned no session key")
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
 
         try:
             export = run(
@@ -947,28 +1043,28 @@ class OpenClawAgent(AgentHarness):
                     "--json",
                 ],
                 check=False,
-                timeout=self.config.timeout_sec,
+                timeout=_EXTRACT_TIMEOUT_SEC,
                 extra_env=env_overlay,
             )
         except SubprocessError as exc:
             errors.append(f"oc export-trajectory failed: {exc}")
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
         except OSError as exc:
             errors.append(f"oc export-trajectory: binary unavailable: {exc}")
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
 
         if export.returncode != 0:
             stderr = (export.stderr or "").strip()
             errors.append(
                 f"oc export-trajectory exited {export.returncode}: {stderr or '<no stderr>'}"
             )
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
 
         events_text, read_errors = _read_export_bundle(export_workspace)
         errors.extend(read_errors)
         if not events_text:
-            return [], {}, "", errors
+            return ParsedRun(errors=errors)
 
-        trajectory, tokens, output_text, parse_errors = parse_trajectory_export(events_text)
-        errors.extend(parse_errors)
-        return trajectory, tokens, output_text, errors
+        parsed = parse_trajectory_export(events_text)
+        parsed.errors = errors + parsed.errors
+        return parsed

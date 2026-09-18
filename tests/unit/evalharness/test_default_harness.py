@@ -792,6 +792,10 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "status",
         "error",
         "errors",
+        "terminal_reason",
+        "model_turns",
+        "tool_wait_sec",
+        "served_models",
         "scores",
         "expected_output",
         "expected_output_raw",
@@ -849,6 +853,7 @@ def _stub_agent_result() -> AgentResult:
         ],
         tokens={"input": 10, "output": 5},
         latency=1.5,
+        terminal_reason="completed",
     )
 
 
@@ -868,6 +873,7 @@ def test_success_record_keys_match_golden(isolated_env: None) -> None:
     assert record["output"] == "done"
     assert record["error"] is None
     assert record["errors"] == []
+    assert record["terminal_reason"] == "completed"
     assert record["scores"] == {}
 
 
@@ -881,6 +887,9 @@ def test_failed_record_keys_match_golden(isolated_env: None) -> None:
     assert record["status"] == "failed"
     assert record["error"] == "deployer.up() failed"
     assert record["errors"] == ["deployer.up() failed"]
+    # The failure happened outside the agent, so there is no agent ending to
+    # report — "" rather than "error", which would blame the agent.
+    assert record["terminal_reason"] == ""
 
 
 def test_success_and_failed_records_have_identical_top_level_keys(isolated_env: None) -> None:
@@ -1459,40 +1468,29 @@ def test_inventory_sandbox_home_records_rules_per_task(
     assert harness._sandbox_inventory_rules["fresh-task"] == ()  # noqa: SLF001
 
 
-def test_inventory_covers_fixture_mounts_at_their_container_paths(
+def test_fixture_mounts_are_not_inventoried(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fixture mounts only materialize inside the container, so the host-side
-    home scan cannot see them; each mounted name must get a container-path
-    rule, and the prompt filter must drop exactly the ones the task names."""
-    import re
-
-    from devops_bench.cheat_detection import filter_rules_for_prompt
-
+    """A mount is this run's declared input, not a leftover: ``discover_fixture_mounts``
+    keys on the run-unique cluster token, so covering mounts only ever flagged honest
+    reads of a delivered fixture whose name the prompt does not happen to repeat."""
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
     harness = _sandboxed_harness(monkeypatch, tmp_path)
 
     home = tmp_path / "ws" / "home"
     home.mkdir(parents=True)
-    harness._inventory_sandbox_home(  # noqa: SLF001
-        "t",
-        home,
-        {
-            "/home/op/opa-repo-c1.git": "/workspace/home/opa-repo-c1.git",
-            "/home/op/stale-notes-c1.md": "/workspace/home/stale-notes-c1.md",
-        },
-    )
-    rules = harness._sandbox_inventory_rules["t"]  # noqa: SLF001
-    assert {r.source for r in rules} == {"opa-repo-c1.git", "stale-notes-c1.md"}
-    # The rules match the container-side spellings the trajectory records.
-    repo_rule = next(r for r in rules if r.source == "opa-repo-c1.git")
-    assert re.search(repo_rule.patterns[0], "cat /workspace/home/opa-repo-c1.git/config")
-    assert re.search(repo_rule.patterns[0], "git clone ~/opa-repo-c1.git")
+    # The container-side fixture home is empty on the host, which is the whole
+    # reason mounts were covered separately; an empty ruleset is now correct.
+    harness._inventory_sandbox_home("t", home)  # noqa: SLF001
+    assert harness._sandbox_inventory_rules["t"] == ()  # noqa: SLF001
 
-    # A prompt naming the repo authorizes it for that record; the mount the
-    # prompt never asked for (a leftover swept in by the token glob) stays.
-    surviving = filter_rules_for_prompt(rules, "Fix the policy and push to '~/opa-repo-c1.git'.")
-    assert {r.source for r in surviving} == {"stale-notes-c1.md"}
+    # A leftover the run did not mount is still covered, so dropping the mount
+    # rules did not blunt the host-home tripwire.
+    dirty = tmp_path / "ws2" / "home"
+    dirty.mkdir(parents=True)
+    (dirty / "stale-notes.md").write_text("a prior run's distinctive leftover line\n" * 3)
+    harness._inventory_sandbox_home("t2", dirty)  # noqa: SLF001
+    assert "stale-notes.md" in {r.source for r in harness._sandbox_inventory_rules["t2"]}  # noqa: SLF001
 
 
 def test_stray_container_sweep_is_skipped_under_parallel(
@@ -1852,33 +1850,24 @@ def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -
     assert harness.build_agent_config().sandbox is not None
 
 
-def test_secret_rotation_declares_requires_unsandboxed() -> None:
-    """The exemption travels with the task that needs it, not with a runner flag.
+def test_secret_rotation_runs_sandboxed() -> None:
+    """secret-rotation no longer opts out: its cloud credential crosses by value.
 
+    The stack exports ``agent_cloud_identity`` and the provider mints a
+    short-lived impersonated token for it, so the sandbox can do the task.
     Loaded through the real loader, not read as raw YAML: ``Task.from_dict``
-    builds an explicit field mapping and ``Task`` ignores unknown keys, so a key
-    missing from that mapping is dropped silently — a raw-YAML assertion stays
-    green while the harness sees the ``False`` default. The raw-YAML check stays
-    alongside as a spec-content check, but the loader path is the coverage.
+    builds an explicit field mapping and ``Task`` ignores unknown keys, so this
+    is the path the harness actually sees.
     """
-    import pathlib
-
-    import yaml as _yaml
-
     from devops_bench.tasks.loader import FileSystemTaskLoader
 
     tasks = FileSystemTaskLoader().load_tasks("tasks/gcp/secret-rotation/task.yaml")
     assert len(tasks) == 1
-    assert tasks[0].requires_unsandboxed is True
-
-    spec = _yaml.safe_load(
-        pathlib.Path("tasks/gcp/secret-rotation/task.yaml").read_text(encoding="utf-8")
-    )
-    assert spec.get("requires_unsandboxed") is True
+    assert tasks[0].requires_unsandboxed is False
 
 
-def test_no_other_task_opts_out_of_the_sandbox() -> None:
-    """Exactly one exemption; a second would need its own justification."""
+def test_no_task_opts_out_of_the_sandbox() -> None:
+    """No exemptions in tree; a new one would need its own justification."""
     import pathlib
 
     import yaml as _yaml
@@ -1888,4 +1877,4 @@ def test_no_other_task_opts_out_of_the_sandbox() -> None:
         for p in sorted(pathlib.Path("tasks").glob("*/*/task.yaml"))
         if (_yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("requires_unsandboxed")
     ]
-    assert exempt == ["secret-rotation"]
+    assert exempt == []

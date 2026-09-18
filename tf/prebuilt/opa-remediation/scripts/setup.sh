@@ -90,6 +90,10 @@ echo "==> Removing Kyverno's built-in report cleanup CronJobs..."
 kubectl delete cronjob -n kyverno --all --ignore-not-found
 kubectl delete job -n kyverno --all --ignore-not-found
 
+echo "==> Aggregating a Kyverno policy-editor role into edit..."
+# Kyverno aggregates into view and admin only; the sandboxed agent is edit-bound.
+kubectl apply -f "${MANIFESTS_DIR}/rbac/"
+
 echo "==> Applying compliance policies (audit mode)..."
 # The Kyverno admission webhook (mutate-policy.kyverno.svc) can take several seconds
 # to start serving *after* its deployment reports Available, so a plain apply can fail

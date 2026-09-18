@@ -61,7 +61,8 @@ _ROWS = [
     ("anthropic-bedrock", "anthropic-bedrock", "claude", "anthropic-bedrock", (), True, "bedrock"),
     ("anthropic_bedrock", "anthropic-bedrock", "claude", "anthropic-bedrock", (), True, "bedrock"),
     ("openai", "openai", "openai", "openai", ("OPENAI_API_KEY",), False, None),
-    ("ollama", "ollama", "ollama", "ollama", (), True, None),
+    ("openai-codex", "openai-codex", "openai", "openai", (), True, None),
+    ("ollama", "ollama", "ollama", "ollama", ("OLLAMA_API_KEY",), True, None),
 ]
 
 
@@ -97,9 +98,10 @@ def test_unknown_provider_raises_with_known_list():
     assert "gemini" in msg and "anthropic" in msg
 
 
-def test_only_vertex_bedrock_ollama_are_keyless():
+def test_only_vertex_bedrock_ollama_codex_are_keyless():
     keyless = {raw for raw, *_ in _ROWS if resolve_provider(raw).keyless_ok}
     assert keyless == {
+        "openai-codex",
         "google-vertex",
         "google_vertex",
         "anthropic-vertex",

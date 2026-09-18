@@ -25,7 +25,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentResult
@@ -43,7 +43,6 @@ from devops_bench.cheat_detection import (
     annotate_records,
     baseline_from_granted_paths,
     build_inventory_rules,
-    build_mount_rules,
     drop_fingerprints_matching_inputs,
     filter_rules_for_prompt,
     load_ruleset,
@@ -102,6 +101,7 @@ _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
     "devops_bench.agents.cli.openclaw",
     "devops_bench.agents.cli.antigravity",
     "devops_bench.agents.api.agent",
+    "devops_bench.agents.adk.agent",
 )
 
 # Aliases normalized to canonical agent keys before registry lookup.
@@ -1216,6 +1216,10 @@ class DefaultEvalHarness(Harness):
             model=model,
             harness=harness,
             augmentation=augmentation,
+            # Only the wall-clock cap: ``max_turns`` binds the API agent and the
+            # Claude CLI but no other harness, so stamping it run-wide would
+            # advertise the other arms a budget that never bound them.
+            timeout_sec=self._agent_config.timeout_sec,
             judge_model=self._judge_model_name,
             # A mutable tag is not provenance; the digest is. Resolved at
             # report time (best-effort, None recorded honestly on failure) so
@@ -1289,10 +1293,10 @@ class DefaultEvalHarness(Harness):
             # working directory), not the harness process's launch cwd.
             workspace_path = Path(tempfile.mkdtemp(prefix="devops-bench-workspace-"))
             if self._agent_config.sandbox is not None and task.requires_unsandboxed:
-                # The task declared that it cannot run behind the boundary —
-                # secret-rotation drives Secret Manager through ADC, and ADC is
-                # exactly what the sandbox strips. Skip the sandbox for this
-                # task instead of failing it, and say so: an operator who asked
+                # The task declared that it cannot run behind the boundary,
+                # e.g. it needs a cloud credential no provider can mint for it
+                # by value. Skip the sandbox for this task instead of failing
+                # it, and say so: an operator who asked
                 # for a sandboxed matrix must be able to see which tasks did not
                 # get one, rather than discovering it in the manifest later.
                 _log.warning(
@@ -1318,9 +1322,7 @@ class DefaultEvalHarness(Harness):
                     task.agent_pod_security,
                 )
                 self._active_sandbox_spec = completed_spec
-                self._inventory_sandbox_home(
-                    task.name, workspace_path / "home", completed_spec.fixture_mounts
-                )
+                self._inventory_sandbox_home(task.name, workspace_path / "home")
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
@@ -1674,7 +1676,6 @@ class DefaultEvalHarness(Harness):
         self,
         task_name: str,
         home: Path,
-        fixture_mounts: Mapping[str, str] | None = None,
     ) -> None:
         """Point the pre-run detection inventory at the sandbox home.
 
@@ -1687,13 +1688,11 @@ class DefaultEvalHarness(Harness):
         here (a future harness step seeding the home) gets covered
         automatically.
 
-        Fixture mounts are covered separately: they only materialize inside
-        the container, so the host-side scan above cannot see them. Each
-        mounted name gets a container-path rule
-        (:func:`~devops_bench.cheat_detection.build_mount_rules`); the per-record
-        prompt filter then authorizes the ones the task itself names, leaving
-        anything the discovery glob swept in that the prompt never asked for
-        — a prior run's leftover on a reused cluster name — flagged.
+        Fixture mounts are deliberately **not** covered. They are this run's
+        declared input — ``discover_fixture_mounts`` matches only top-level
+        home entries carrying the run-unique cluster token — so a mount cannot
+        be another run's material, and rules keyed on prompt wording flagged
+        honest reads of a delivered input the prompt happens not to name.
         Best-effort, like the run-level inventory.
         """
         if not (self.cheat_detect and self.cheat_inventory):
@@ -1704,12 +1703,6 @@ class DefaultEvalHarness(Harness):
                 baseline=DEFAULT_BASELINE
                 | baseline_from_granted_paths(home, self._granted_skill_paths),
             )
-            mounted_names = [
-                PurePosixPath(container_path).name
-                for container_path in (fixture_mounts or {}).values()
-            ]
-            if mounted_names:
-                rules += build_mount_rules(agent_sandbox.CONTAINER_HOME, mounted_names)
             self._sandbox_inventory_rules[task_name] = rules
         except Exception:  # noqa: BLE001 - detection must never block execution
             _log.exception(
@@ -1770,6 +1763,10 @@ class DefaultEvalHarness(Harness):
                     task.validated and not agent_errors and bool(dumped.get("trajectory"))
                 ),
                 "errors": agent_errors,
+                "terminal_reason": dumped.get("terminal_reason", ""),
+                "model_turns": dumped.get("model_turns"),
+                "tool_wait_sec": dumped.get("tool_wait_sec"),
+                "served_models": dumped.get("served_models") or [],
                 # First-error scalar so a parser reading ``error`` finds the
                 # same key on the success shape (None when nothing went wrong).
                 "error": agent_errors[0] if agent_errors else None,
@@ -1877,6 +1874,15 @@ class DefaultEvalHarness(Harness):
             "status": "",
             "error": None,
             "errors": [],
+            # Why the agent stopped (see ``agents.result.TERMINAL_REASONS``).
+            # Empty on a failed record: the harness never got far enough to
+            # observe the agent's own ending.
+            "terminal_reason": "",
+            # Model round-trips and time inside tools; both unknown on a
+            # record the harness never ran.
+            "model_turns": None,
+            "tool_wait_sec": None,
+            "served_models": [],
             # ``scores`` (the per-metric mapping) is populated by ``_score`` for
             # success records; failed records leave it as the empty dict so the
             # key is always present. There is no aggregate scalar score: the
