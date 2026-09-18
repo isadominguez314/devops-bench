@@ -37,6 +37,14 @@ virtual clusters both appear in the operator's kubeconfig, and creating the
 ServiceAccount in the virtual one is what makes its token cryptographically
 useless against the host.
 
+What provisioning writes, teardown removes — same names, same module, so the
+two cannot drift apart unnoticed (a unit test holds the teardown inventory to
+the manifests). Teardown is a correctness requirement, not hygiene: the
+pod-security policy is deliberately not username-scoped (a pod may be created
+on the agent's behalf by a controller under another identity), so on a REUSED
+cluster a surviving policy denies the *operator's* next privileged workload
+too — the first live validation hit exactly that.
+
 Review rule (see ``docs/proposals/agent-sandboxing.md``): no cloud CLI —
 ``gcloud``, ``aws``, ``az`` — is invoked anywhere in this module. Everything
 it does is plain Kubernetes API surface reached through ``kubectl``, so it
@@ -63,6 +71,7 @@ __all__ = [
     "mint_agent_token",
     "provision_agent_credentials",
     "render_agent_kubeconfig",
+    "teardown_agent_credentials",
     "token_ttl_for",
 ]
 
@@ -163,6 +172,23 @@ _ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
 _LABEL_EXEMPT_NAMESPACES = _POLICY_EXEMPT_NAMESPACES | {AGENT_NAMESPACE}
 
 _PSA_ENFORCE_LABEL = "pod-security.kubernetes.io/enforce"
+
+# Every pod-security level this module sets on a namespace, so teardown can
+# remove exactly what enforcement wrote and nothing else.
+_PSA_LABEL_KEYS = (
+    _PSA_ENFORCE_LABEL,
+    "pod-security.kubernetes.io/warn",
+    "pod-security.kubernetes.io/audit",
+)
+
+# Marker stamped alongside the PSA labels on every namespace THIS module
+# labelled. It is what makes teardown stateless: "which namespaces did we
+# label" cannot be answered from the PSA labels themselves (an operator or a
+# task may set identical values for reasons of their own), and an in-memory
+# list would not survive the crashed run whose leftovers teardown exists to
+# remove. Namespaces that already declared an ``enforce`` level are skipped by
+# the labeller, never carry the marker, and are therefore never unlabelled.
+_PSA_MANAGED_LABEL = "devops-bench.io/psa-managed"
 
 # The agent's own apiserver username, as RBAC and admission see it.
 _AGENT_USERNAME = f"system:serviceaccount:{AGENT_NAMESPACE}:{AGENT_SA_NAME}"
@@ -406,6 +432,31 @@ spec:
 """
 
 _NONCONFORMANT_GUARD_NAME = "bench-agent-nonconformant-pod-guard"
+
+# Everything provisioning writes to the cluster, by kind and name, for
+# teardown. Kept adjacent to the manifests above that create them, and held in
+# lockstep by a unit test that parses those manifests — a policy added there
+# without a row here fails the suite rather than surviving the run.
+_POLICY_KIND = "validatingadmissionpolicies.admissionregistration.k8s.io"
+_POLICY_BINDING_KIND = "validatingadmissionpolicybindings.admissionregistration.k8s.io"
+_POLICY_NAMES = (
+    "bench-agent-pod-security",
+    "bench-agent-namespace-guard",
+    "bench-agent-exempt-namespace-guard",
+    _NONCONFORMANT_GUARD_NAME,
+)
+_POLICY_BINDING_NAMES = (
+    "bench-agent-pod-security",
+    "bench-agent-namespace-guard",
+    "bench-agent-exempt-namespace-guard-by-name",
+    "bench-agent-exempt-namespace-guard-by-label",
+    _NONCONFORMANT_GUARD_NAME,
+)
+_CLUSTER_ROLE_BINDING_NAMES = (
+    f"{AGENT_SA_NAME}-edit",
+    f"{AGENT_SA_NAME}-cluster-supplement",
+)
+_CLUSTER_ROLE_NAMES = (f"{AGENT_SA_NAME}-cluster-supplement",)
 
 
 def _render_nonconformant_pod_guard(pods: list[str]) -> str:
@@ -656,9 +707,10 @@ def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
                 "namespace",
                 name,
                 {
-                    _PSA_ENFORCE_LABEL: POD_SECURITY_BASELINE,
-                    "pod-security.kubernetes.io/warn": POD_SECURITY_BASELINE,
-                    "pod-security.kubernetes.io/audit": POD_SECURITY_BASELINE,
+                    # The marker rides along so teardown can find exactly the
+                    # namespaces this run labelled; see _PSA_MANAGED_LABEL.
+                    **{key: POD_SECURITY_BASELINE for key in _PSA_LABEL_KEYS},
+                    _PSA_MANAGED_LABEL: "true",
                 },
                 overwrite=True,
                 context=context,
@@ -976,6 +1028,7 @@ def provision_agent_credentials(
             # makes, so letting it escape uncaught would make the escape hatch
             # unreachable for the very operator it exists for.
             if not allow_admin:
+                _teardown_after_failed_provisioning(plan.kubectl_context)
                 raise SandboxError(
                     f"could not enforce pod security for the sandboxed agent ({exc}); "
                     "refusing to run against a cluster where the privileged-pod and "
@@ -993,6 +1046,7 @@ def provision_agent_credentials(
         token = mint_agent_token(token_ttl_sec, plan.kubectl_context)
     except SubprocessError as exc:
         if not allow_admin:
+            _teardown_after_failed_provisioning(plan.kubectl_context)
             raise SandboxError(
                 "could not mint a scoped ServiceAccount credential for the sandboxed "
                 f"agent ({exc}); refusing to fall back to the operator's admin "
@@ -1006,6 +1060,118 @@ def provision_agent_credentials(
         token_ttl_sec,
     )
     return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {token}")
+
+
+def teardown_agent_credentials(context: str | None = None) -> bool:
+    """Remove everything :func:`provision_agent_credentials` wrote to the cluster.
+
+    Runs at the end of every sandboxed task, and again from provisioning's own
+    failure path when it raised after its first cluster write. Both callers
+    sit on paths where a second failure must not eclipse the first, so this
+    never raises: every step is attempted regardless of the ones before it,
+    failures are logged with the object they stranded, and the return value
+    says whether the cluster came out clean.
+
+    Order matters at the front: the policy BINDINGS go first, because a
+    binding is what makes a policy enforce — with the bindings gone the
+    cluster stops denying anyone immediately, and everything after is
+    bookkeeping. The namespace goes last, and with kubectl's default wait, so
+    the next run's ``apply`` on a reused cluster cannot race a Terminating
+    ``bench-system`` and fail with "object is being deleted".
+
+    Args:
+        context: kubectl context pinning every call to the run's own cluster.
+
+    Returns:
+        True when every object is confirmed removed (already-absent counts —
+        the deletes ignore not-found); False when any step failed and the
+        cluster may still carry sandbox residue.
+    """
+    clean = True
+
+    def _delete(kind: str, *names: str, timeout: float) -> None:
+        nonlocal clean
+        try:
+            kubectl.delete(kind, *names, context=context, timeout=timeout)
+        except SubprocessError as exc:
+            clean = False
+            _log.warning("teardown could not delete %s %s: %s", kind, ", ".join(names), exc)
+
+    _delete(_POLICY_BINDING_KIND, *_POLICY_BINDING_NAMES, timeout=120)
+    _delete(_POLICY_KIND, *_POLICY_NAMES, timeout=120)
+    if not _remove_managed_pod_security_labels(context):
+        clean = False
+    _delete("clusterrolebinding", *_CLUSTER_ROLE_BINDING_NAMES, timeout=120)
+    _delete("clusterrole", *_CLUSTER_ROLE_NAMES, timeout=120)
+    # The namespace carries the ServiceAccount away with it.
+    _delete("namespace", AGENT_NAMESPACE, timeout=300)
+
+    if clean:
+        _log.info(
+            "sandbox cluster objects torn down: admission policies, PSA labels, RBAC, %s",
+            AGENT_NAMESPACE,
+        )
+    else:
+        _log.error(
+            "sandbox teardown left residue on the cluster. The pod-security policy is "
+            "not username-scoped, so if its binding survived, a reused cluster will "
+            "deny the OPERATOR's privileged workloads too — re-run teardown or delete "
+            "the bench-agent-* policies by hand before the next run on this cluster"
+        )
+    return clean
+
+
+def _remove_managed_pod_security_labels(context: str | None) -> bool:
+    """Unlabel every namespace the enforcement step marked as this module's.
+
+    Only namespaces carrying :data:`_PSA_MANAGED_LABEL` are touched. A PSA
+    label anyone else set — a task's own ``restricted`` assertion, an
+    operator's standing policy — never carries the marker (the labeller skips
+    namespaces that already declare an ``enforce`` level) and is therefore
+    never removed here.
+
+    Args:
+        context: kubectl context pinning every call.
+
+    Returns:
+        True when every marked namespace was unlabelled; no marked namespaces
+        counts as clean.
+    """
+    try:
+        listing = kubectl.get_resource("namespaces", context=context, timeout=60)
+    except SubprocessError as exc:
+        _log.warning("teardown could not list namespaces to remove PSA labels: %s", exc)
+        return False
+    removals: dict[str, str | None] = dict.fromkeys((*_PSA_LABEL_KEYS, _PSA_MANAGED_LABEL))
+    ok = True
+    for item in listing.get("items", []):
+        meta = item.get("metadata", {})
+        name = meta.get("name", "")
+        if not name or _PSA_MANAGED_LABEL not in (meta.get("labels") or {}):
+            continue
+        try:
+            kubectl.label("namespace", name, removals, context=context)
+        except SubprocessError as exc:
+            ok = False
+            _log.warning("teardown could not remove PSA labels from namespace %s: %s", name, exc)
+    return ok
+
+
+def _teardown_after_failed_provisioning(context: str | None) -> None:
+    """Remove whatever a half-finished provisioning already wrote.
+
+    Provisioning raises between its cluster writes — pod security lands
+    before the identity, the identity before the token — so its failure paths
+    would otherwise strand cluster-scoped objects with nothing recording that
+    they exist: the harness only tears down what a *completed* spec points
+    at. Best-effort by construction (teardown never raises), and the original
+    error stays the one the caller sees.
+
+    Args:
+        context: kubectl context pinning every call.
+    """
+    _log.info("provisioning failed after writing to the cluster; removing what it left")
+    teardown_agent_credentials(context)
 
 
 def _refuse_unpinned_cluster(plan: NetworkPlan) -> None:
