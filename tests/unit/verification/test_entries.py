@@ -167,6 +167,65 @@ def test_display_fields_are_parsed_verbatim() -> None:
     assert entry.failure_hint == "The image tag is usually wrong."
 
 
+def test_parse_errors_carry_the_declared_role_and_severity() -> None:
+    bad_check = {**_CHECK, "bogus_key": "x"}
+    _, errors = parse_entries(
+        [
+            _entry(role="safeguard", severity="catastrophic", check=bad_check),
+            _entry(name="e2", check=bad_check),
+            _entry(name="e3", role=7, check=bad_check),
+        ]
+    )
+    assert [(e["name"], e.get("role"), e.get("severity")) for e in errors] == [
+        ("e1", "safeguard", "catastrophic"),
+        ("e2", "objective", None),
+        ("e3", None, None),  # a non-string declaration is left out, not guessed
+    ]
+
+
+def test_parse_errors_carry_the_declared_display_fields() -> None:
+    _, errors = parse_entries(
+        [
+            _entry(
+                title="web is healthy",
+                description="Every web pod is Ready.",
+                group="workload",
+                failure_hint=42,  # not a string: left out, not guessed
+                check={**_CHECK, "bogus_key": "x"},
+            )
+        ]
+    )
+    assert errors == [
+        {
+            "name": "e1",
+            "reason": errors[0]["reason"],
+            "role": "objective",
+            "title": "web is healthy",
+            "description": "Every web pod is Ready.",
+            "group": "workload",
+        }
+    ]
+
+
+def test_duplicate_name_error_carries_the_fields_of_the_dropped_entry() -> None:
+    _, errors = parse_entries(
+        [
+            _entry(),
+            _entry(role="safeguard", severity="recoverable", title="Second", group="g"),
+        ]
+    )
+    assert errors == [
+        {
+            "name": "e1",
+            "reason": "duplicate verification entry name 'e1'",
+            "role": "safeguard",
+            "severity": "recoverable",
+            "title": "Second",
+            "group": "g",
+        }
+    ]
+
+
 def test_display_fields_are_stripped() -> None:
     entries, errors = parse_entries(
         [_entry(title="  web is healthy ", description=" d ", group=" g ", failure_hint=" h ")]
