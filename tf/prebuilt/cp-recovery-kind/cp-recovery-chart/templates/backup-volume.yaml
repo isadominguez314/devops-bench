@@ -1,7 +1,5 @@
-# Backup volume for the verified etcd snapshot. Backed by a hostPath on the worker
-# node; the fault-injection step (../scripts/inject-fault.sh) stages
-# etcd-backup.db + etcd-backup.sha256 into /backup on that node before the agent runs.
-# The agent mounts etcd-backup-pvc in a helper pod to verify + use the snapshot.
+# hostPath on the worker node; inject-fault.sh stages etcd-backup.db and
+# etcd-backup.sha256 into /backup there before the agent runs.
 apiVersion: v1
 kind: PersistentVolume
 metadata:

@@ -34,7 +34,6 @@ provider "google" {
   zone    = var.location
 }
 
-# 1. GKE Cluster & GCP IAM/Secrets provisioning
 module "cluster" {
   source               = "./cluster"
   project_id           = var.project_id
@@ -46,14 +45,11 @@ module "cluster" {
   token_creator_member = var.token_creator_member
 }
 
-# 2. Dynamic GKE Credentials Loading
 data "google_client_config" "default" {}
 
-# managed_endpoint, not endpoint: the latter falls back to the vcluster
-# submodule, whose own resources are served by these providers, so configuring
-# them from it is a dependency cycle tofu rejects before planning anything --
-# the task could not provision on any provider. See the output's own comment in
-# modules/cluster/outputs.tf.
+# managed_endpoint rather than endpoint: endpoint falls back to the vcluster
+# submodule, whose resources these providers serve, so configuring them from
+# it is a dependency cycle.
 provider "kubernetes" {
   host                   = "https://${module.cluster.managed_endpoint}"
   token                  = data.google_client_config.default.access_token
@@ -68,7 +64,6 @@ provider "helm" {
   }
 }
 
-# 3. Kubernetes resources configuration
 module "k8s_config" {
   source                   = "./k8s_config"
   project_id               = var.project_id

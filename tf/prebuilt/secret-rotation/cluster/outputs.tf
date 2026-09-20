@@ -42,9 +42,8 @@ output "cluster_ca_certificate" {
   value = module.cluster.cluster_ca_certificate
 }
 
-# Forwarded so the root providers can avoid `endpoint`, which falls back to the
-# vcluster submodule and closes a dependency cycle when a provider is
-# configured from it. See modules/cluster/outputs.tf.
+# Forwarded so the root providers can avoid endpoint, which falls back to the
+# vcluster submodule and closes a dependency cycle.
 output "managed_endpoint" {
   value = module.cluster.managed_endpoint
 }

@@ -1,3 +1,17 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 terraform {
   required_providers {
     kind = {
@@ -21,10 +35,8 @@ terraform {
 
 provider "kind" {}
 
-# 1. A real, multi-node kind cluster.
-#    Three control-plane nodes give us a real 3-member stacked etcd (Raft quorum,
-#    leader election) — the actual control plane we recover, no simulation.
-#    One worker hosts the benign workloads (control-plane nodes are tainted).
+# Three control-plane nodes give a real three-member stacked etcd; the worker
+# hosts the workloads, since control-plane nodes are tainted.
 resource "kind_cluster" "default" {
   name            = var.cluster_name
   node_image      = var.node_image
@@ -50,7 +62,6 @@ resource "kind_cluster" "default" {
   }
 }
 
-# 2. Point the kubernetes/helm providers at the freshly created kind cluster.
 provider "kubernetes" {
   host                   = kind_cluster.default.endpoint
   client_certificate     = kind_cluster.default.client_certificate
@@ -67,8 +78,6 @@ provider "helm" {
   }
 }
 
-# 3. Benign task resources: desired-state workloads, the GitOps desired state,
-#    and the backup volume the verified etcd snapshot is staged into.
 resource "helm_release" "workloads" {
   name             = "cp-recovery-workloads"
   chart            = "${path.module}/cp-recovery-chart"
@@ -86,11 +95,8 @@ resource "helm_release" "workloads" {
   }
 }
 
-# 4. Fault injection — runs from OUTSIDE the cluster during `tofu apply`
-#    (i.e. before the agent ever starts). It takes a verified etcd snapshot,
-#    stages it into the backup PVC, then corrupts a single etcd member so the
-#    cluster is recoverably degraded (quorum holds, API server stays up).
-#    Nothing is left inside the cluster for the agent to read.
+# Runs during tofu apply, before the agent starts, and leaves nothing in the
+# cluster that describes the fault.
 resource "null_resource" "inject_fault" {
   depends_on = [helm_release.workloads]
 

@@ -12,15 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The upgrade is a GKE API write, and a sandboxed agent has no ambient cloud
-# identity to make it with. So the stack provisions the identity the agent's
-# gcloud calls run as: a run-unique service account that may administer
-# exactly this run's cluster (cluster and node-pool upgrades, operation
-# polling) and read cluster metadata project-wide, which the version lookups
-# need. The harness impersonates it to mint a short-lived token for the
-# container; the provisioning identity is granted tokenCreator on it here, an
-# SA-level binding that tears down with the run's own SA. GKE-only: on kind
-# there is no API to call and no identity is created.
+# A sandboxed agent has no ambient cloud identity, so the stack creates a
+# run-unique service account scoped to this cluster's upgrade calls and the
+# harness impersonates it for a short-lived token. GKE only.
 
 locals {
   gcp        = var.project_id != "" && var.infra_provider == "gcp"
@@ -43,8 +37,8 @@ resource "google_project_iam_member" "agent_cluster_admin" {
   project = var.project_id
   role    = "roles/container.clusterAdmin"
   member  = "serviceAccount:${google_service_account.agent_upgrader[0].email}"
-  # Cluster and node-pool resource names both start with the cluster's, so one
-  # prefix condition covers the upgrade calls and nothing in another run.
+  # Node-pool resource names start with the cluster's, so one prefix condition
+  # covers both upgrade calls.
   condition {
     title       = "this-run-cluster-only"
     description = "Administer only ${var.cluster_name}"
@@ -59,11 +53,9 @@ resource "google_project_iam_member" "agent_cluster_viewer" {
   member  = "serviceAccount:${google_service_account.agent_upgrader[0].email}"
 }
 
-# Who may mint tokens for the upgrader account: an explicit
-# var.token_creator_member, else the provisioner's own identity derived from
-# the ADC userinfo endpoint (null for a VM service-account credential without
-# the userinfo-email scope, in which case the binding is skipped and the
-# harness's mint fails loud rather than running unsandboxed).
+# Token minting: var.token_creator_member, else the provisioner's ADC identity.
+# A VM credential without the userinfo-email scope yields null, so the binding
+# is skipped and the harness's mint fails rather than running unsandboxed.
 data "google_client_openid_userinfo" "provisioner" {
   count = local.gcp ? 1 : 0
 }

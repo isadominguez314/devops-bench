@@ -32,16 +32,11 @@ terraform {
 provider "kind" {}
 
 locals {
-  # Host-side artifact on the shared bastion. cluster_name is run-token-prefixed,
-  # making it per-run unique so concurrent runs never collide. The task prompt
-  # references the same path via the {{CLUSTER_NAME}} placeholder. An explicit
-  # override wins.
+  # Per-run path so concurrent runs do not share the report.
   report_path = var.report_path != "" ? var.report_path : "~/rightsizing-report-${var.cluster_name}.json"
 }
 
-# Multi-node kind cluster: 1 control-plane + 3 workers. setup.sh designates one
-# worker as the "on-demand" pool and taints/labels the other two as a reserved
-# "spot" pool (control-plane is tainted by kind, so workloads land on workers).
+# setup.sh labels and taints two of the three workers as the Spot pool.
 resource "kind_cluster" "default" {
   name            = var.cluster_name
   node_image      = var.node_image
@@ -67,25 +62,17 @@ resource "kind_cluster" "default" {
   }
 }
 
-# Deliver the rightsizing (VPA) report declaratively. Managed by TF, so it is
-# removed automatically on `tofu destroy` — no teardown shell needed.
+# Managed by Terraform so `tofu destroy` removes it.
 resource "local_file" "rightsizing_report" {
   filename = pathexpand(local.report_path)
   content  = file("${path.module}/manifests/rightsizing-report.json")
 
-  # World-readable on purpose. The agent may not be the user that provisioned:
-  # seeded as root into a 0700 home, or as one uid while the agent runs as
-  # another, the report is present but unreadable, and the agent guesses its
-  # own rightsizing numbers instead. The verifiers encode this report's exact
-  # values, so a guess fails checks the agent was never able to satisfy. There
-  # is nothing secret here — it is task input, not answer material.
+  # The agent may run as a different uid than the provisioner, and the
+  # verifiers encode this report's values, so it has to be readable.
   file_permission = "0644"
 }
 
-# Outside-the-cluster setup: label/taint the node pools and deploy the fleet. The
-# node taints/labels need kubectl (the kind provider can't express per-node taints
-# declaratively); the fleet apply + readiness wait round it out. Runs during
-# `tofu apply`, before the agent starts.
+# Per-node taints need kubectl; the kind provider cannot express them.
 resource "null_resource" "setup" {
   triggers = {
     cluster = kind_cluster.default.name
