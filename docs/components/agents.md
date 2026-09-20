@@ -407,7 +407,9 @@ defaults to a digest-pinned `v1.30.0`; lowering it breaks every sandboxed run.
 A task whose subject matter genuinely is privileged workloads opts out with
 `agent_pod_security: privileged` in its `task.yaml` (see
 [Add a task](../how-to/add-a-task.md)). The default is `baseline`, and any other
-value is a load-time validation error rather than a silent fall-back.
+value is a load-time validation error rather than a silent fall-back. The
+credential's `ResourceQuota`/`LimitRange` write grant is likewise on by
+default and declined per task with `agent_quota_writes: false`.
 
 **None of this is torn down.** `bench-system`, the ClusterRoleBindings, the
 admission policies and the PSA labels outlive the run. On a disposable cluster that is

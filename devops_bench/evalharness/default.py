@@ -1171,6 +1171,7 @@ class DefaultEvalHarness(Harness):
                     deployer.provider,
                     task.agent_pod_security,
                     with_cluster=infra_config.get("deployer") != "noop",
+                    quota_writes=task.agent_quota_writes,
                 )
                 sandbox_rules = self._inventory_sandbox_home(
                     task.name, workspace_path / "home", completed_spec.fixture_mounts
@@ -1411,6 +1412,7 @@ class DefaultEvalHarness(Harness):
         pod_security: str,
         *,
         with_cluster: bool = True,
+        quota_writes: bool = True,
     ) -> agent_sandbox.SandboxSpec:
         """Complete the skeletal sandbox spec for one provisioned task.
 
@@ -1419,8 +1421,9 @@ class DefaultEvalHarness(Harness):
         ServiceAccount credential, and discovers fixture mounts.
         ``with_cluster=False`` (noop deployer / no_infra) skips both and
         mounts a credential-free stub kubeconfig so a stale context cannot
-        leak in. Raises :class:`SandboxError` when a plan or credential
-        cannot be built; the caller records a failed task, never degrades.
+        leak in. ``quota_writes`` is the task's ``agent_quota_writes``.
+        Raises :class:`SandboxError` when a plan or credential cannot be
+        built; the caller records a failed task, never degrades.
         """
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
         if with_cluster:
@@ -1430,6 +1433,7 @@ class DefaultEvalHarness(Harness):
                 creds_dir,
                 token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
                 pod_security=pod_security,
+                quota_writes=quota_writes,
             )
         else:
             plan = agent_sandbox.NetworkPlan()
