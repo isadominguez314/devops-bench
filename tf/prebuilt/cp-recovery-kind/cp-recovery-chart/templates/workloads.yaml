@@ -1,7 +1,5 @@
-# Desired-state workloads. workload-1 and workload-2 are deployed; workload-3 is
-# intentionally NOT created here — it represents a resource present in the desired
-# (GitOps) state but missing from the live cluster, which the agent must reconcile
-# after recovery.
+# workload-3 is declared in gitops-state but never created; reconciling it is
+# part of the task.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,7 +42,6 @@ spec:
       - name: app
         image: redis:latest
 ---
-# Desired state (GitOps source of truth). Lists workload-3, which is not running.
 apiVersion: v1
 kind: ConfigMap
 metadata:

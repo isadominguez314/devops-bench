@@ -31,9 +31,8 @@ variable "cluster_name" {
 variable "location" {
   description = "GCP zone/region or 'local'"
   type        = string
-  # Empty by default so the cluster router picks the provider-appropriate value
-  # (us-central1-a for GKE, "local" for KinD), matching the minimum/gpu-stress-test
-  # stacks. A literal "local" here would be forwarded verbatim to the GKE module.
+  # Empty so the cluster module picks the provider default; a literal "local"
+  # would be forwarded verbatim to the GKE module.
   default = ""
 }
 

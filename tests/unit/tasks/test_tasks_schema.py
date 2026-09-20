@@ -322,6 +322,8 @@ def test_empty_agent_pod_security_coalesces_to_the_default():
     assert Task.from_dict({"name": "n", "agent_pod_security": None}).agent_pod_security == (
         "baseline"
     )
+
+
 # -- display metadata --------------------------------------------------------
 
 

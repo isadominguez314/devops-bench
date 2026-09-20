@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
+# Copyright 2026 The Kubernetes Authors.
 #
-# Fault injection for the cp-recovery (kind) task.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Runs from OUTSIDE the cluster during `tofu apply`, before the agent starts:
-#   1. Takes a verified etcd snapshot from a healthy member and stages it
-#      (+ sha256 checksum) into the backup PVC's hostPath on the worker node.
-#   2. Corrupts a SINGLE etcd member's on-disk database and restarts it, so the
-#      cluster is recoverably degraded: one member crashloops while the other two
-#      keep Raft quorum and the API server stays up (the agent keeps kubectl).
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Nothing is left inside the cluster pointing at "corruption" — the agent must
-# diagnose the unhealthy member itself.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# Runs during tofu apply: stages an etcd snapshot and its sha256 in the backup
+# volume, then corrupts one member's database so it crash-loops with quorum kept.
 set -euo pipefail
 
 CLUSTER_NAME="${CLUSTER_NAME:?CLUSTER_NAME is required}"
@@ -27,10 +32,9 @@ ETCD_CERTS=(
 echo "==> Waiting for all nodes to be Ready..."
 kubectl wait --for=condition=Ready nodes --all --timeout=180s
 
-# Record pre-run identity baselines for workload-1/workload-2, so a "delete and
-# redeploy from the gitops-state ConfigMap" reconciliation shortcut is distinguishable
-# from an in-place fix: metadata.uid/creationTimestamp are server-assigned and never
-# survive a delete+recreate, even if every other field looks identical afterward.
+# metadata.uid and creationTimestamp are server-assigned and do not survive a
+# delete and recreate, so the baseline distinguishes an in-place fix from a
+# redeploy of the namespace.
 echo "==> Recording pre-run identity baselines for workload-1/workload-2..."
 UID_KEY="devops-bench.io/original-uid"
 CREATED_KEY="devops-bench.io/original-creation-timestamp"
@@ -42,8 +46,7 @@ for name in workload-1 workload-2; do
     "${CREATED_KEY}=${created}"
 done
 
-# Discover node names dynamically (kind names the docker containers the same as
-# the Kubernetes node names, e.g. <cluster>-control-plane / <cluster>-worker).
+# kind names the docker containers after the Kubernetes node names.
 mapfile -t CP_NODES < <(kubectl get nodes \
   -l node-role.kubernetes.io/control-plane \
   -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
@@ -67,8 +70,8 @@ echo "==> Waiting for etcd members to be running..."
 kubectl -n kube-system wait --for=condition=Ready "pod/etcd-${SNAP_NODE}" --timeout=120s
 
 echo "==> Taking a verified etcd snapshot from ${SNAP_NODE}..."
-# etcdctl ships in the etcd image and defaults to API v3; write into the etcd
-# data dir (a hostPath), so the file is reachable from the node container.
+# Written into the etcd data dir, a hostPath, so the file is reachable from
+# the node container.
 kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
   etcdctl "${ETCD_CERTS[@]}" snapshot save /var/lib/etcd/etcd-backup.db
 
@@ -79,7 +82,6 @@ docker exec "${WORKER_NODE}" mkdir -p /backup
 docker cp /tmp/etcd-backup.db "${WORKER_NODE}:/backup/etcd-backup.db"
 docker cp /tmp/etcd-backup.sha256 "${WORKER_NODE}:/backup/etcd-backup.sha256"
 
-# Remove the staged copy from the live etcd data dir and the local temp files.
 docker exec "${SNAP_NODE}" rm -f /var/lib/etcd/etcd-backup.db
 rm -f /tmp/etcd-backup.db /tmp/etcd-backup.sha256
 echo "    backup staged: /backup/etcd-backup.db (+ .sha256)"
@@ -88,8 +90,7 @@ echo "==> Corrupting the etcd member on ${TARGET_NODE} (minority; quorum preserv
 # Overwrite the bbolt database pages so etcd cannot reopen the store.
 docker exec "${TARGET_NODE}" sh -c \
   'dd if=/dev/urandom of=/var/lib/etcd/member/snap/db bs=1M count=2 conv=notrunc'
-# Restart the etcd static pod so the kubelet re-reads the corrupted data and the
-# member enters CrashLoopBackOff.
+# Restart the static pod so the kubelet re-reads the corrupted data.
 docker exec "${TARGET_NODE}" sh -c \
   'crictl rm -f $(crictl ps -a -q --name etcd) 2>/dev/null || true'
 

@@ -36,9 +36,6 @@ provider "google" {
 
 provider "kind" {}
 
-# GKE/KinD cluster. cluster_name is run-token-prefixed by the harness under parallel
-# runs, so every concurrent run gets its own cluster — all in-cluster objects
-# below are therefore collision-free without any name suffixing.
 module "cluster" {
   source          = "../../modules/cluster"
   infra_provider  = var.infra_provider
@@ -56,9 +53,8 @@ data "google_client_config" "default" {
 }
 
 provider "kubernetes" {
-  # managed_endpoint, not endpoint: the latter names the vcluster submodule and
-  # configuring this provider from it is a dependency cycle (see the output's
-  # own comment in modules/cluster/outputs.tf).
+  # managed_endpoint rather than endpoint: endpoint names the vcluster
+  # submodule, and configuring this provider from it is a dependency cycle.
   host                   = var.infra_provider == "gcp" ? "https://${module.cluster.managed_endpoint}" : module.cluster.managed_endpoint
   token                  = var.infra_provider == "gcp" ? data.google_client_config.default[0].access_token : null
   client_certificate     = var.infra_provider == "kind" ? module.cluster.client_certificate : null
@@ -67,21 +63,8 @@ provider "kubernetes" {
 }
 
 
-# Pre-seeded target workload the agent must optimize. It is deliberately
-# misconfigured for autoscaling: NO resource requests/limits and NO HPA. The
-# task asks the agent to add requests/limits, create an HPA (minReplicas > 1),
-# and survive a load spike. The app + service are named
-# ${var.target_deployment_name} so the prompt / chaos service_url /
-# verification placeholders resolve to it:
-#   http://{{TARGET_DEPLOYMENT_NAME}}.{{NAMESPACE}}.svc.cluster.local
-#
-# Image: registry.k8s.io/hpa-example — the canonical CPU-burn app from the
-# Kubernetes HPA walkthrough; each HTTP request consumes CPU, so generated load
-# drives CPU up and a correctly-configured HPA scales out.
-# metrics-server, kind only. The HPA objective grades ScalingActive=True, which
-# needs a live metrics pipeline; GKE ships one and a stock kind cluster does
-# not, so without this the objective fails for provider reasons rather than for
-# anything the agent did. Same install the b-0011 / b-0024 stacks use.
+# A stock kind cluster ships no metrics-server, and the HPA objective needs
+# ScalingActive=True.
 resource "null_resource" "metrics_server" {
   count = var.infra_provider == "kind" ? 1 : 0
 
@@ -108,6 +91,7 @@ resource "null_resource" "metrics_server" {
   }
 }
 
+# The workload the agent must make surge-ready: no resources block and no HPA.
 resource "kubernetes_deployment_v1" "target" {
   metadata {
     name      = var.target_deployment_name
@@ -138,13 +122,8 @@ resource "kubernetes_deployment_v1" "target" {
           name  = "web"
           image = "python:3.11-slim"
 
-          # CPU-burn HTTP server on port 8080. The chaos harness port-forwards
-          # `deployment/<target>` to a FIXED remote port 8080
-          # (devops_bench/chaos/faults/generate_load.py:_LOCAL_PORT, passed as
-          # remote_port), so the workload MUST listen on 8080 or the generated
-          # load never reaches it. (registry.k8s.io/hpa-example listens on :80 and
-          # would silently drop the spike — the run only "passes" because the
-          # agent's HPA minReplicas scales it independent of load.)
+          # The load generator port-forwards to a fixed remote port 8080, so
+          # the server must listen there or the spike never reaches it.
           command = ["python3", "-c"]
           args = [
             <<-PY
@@ -169,15 +148,14 @@ resource "kubernetes_deployment_v1" "target" {
           port {
             container_port = 8080
           }
-          # No resources block on purpose: adding requests/limits is the agent's
-          # job. Resource-based HPA cannot target CPU without requests set.
+          # No resources block on purpose; adding requests and limits is the
+          # agent's job.
         }
       }
     }
   }
 
-  # The HPA the agent creates changes the replica count; ignore it so any
-  # re-apply does not fight the agent's autoscaling.
+  # The agent's HPA changes the replica count; a re-apply must not fight it.
   lifecycle {
     ignore_changes = [
       spec[0].replicas,
@@ -201,20 +179,11 @@ resource "kubernetes_service_v1" "target" {
       target_port = 8080
     }
 
-    # External LoadBalancer so the chaos load fault can reach the workload from
-    # any runner (in-VPC bastion or off-VPC local) without a port-forward, which
-    # drops connections under sustained 300 qps. GKE auto-provisions a network
-    # LB with an external IP and an ALLOW firewall rule on the default VPC; the
-    # harness resolves status.loadBalancer.ingress[0].ip and points the load at
-    # http://<ip>:8080 directly.
-    #
-    # On KinD, we use ClusterIP and rely on the harness port-forward fallback,
-    # avoiding a pending external IP wait.
+    # LoadBalancer on GKE so the load generator can reach the Service directly;
+    # ClusterIP on kind, where the harness falls back to a port-forward.
     type = var.infra_provider == "gcp" ? "LoadBalancer" : "ClusterIP"
   }
 
-  # Wait for the LB IP to be assigned before terraform returns, so the harness
-  # can resolve the external IP immediately after apply. Only applicable to GKE.
   wait_for_load_balancer = var.infra_provider == "gcp" ? true : false
 }
 

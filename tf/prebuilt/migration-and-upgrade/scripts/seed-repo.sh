@@ -13,21 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Seeds a local bare git repository with the application manifests, so the agent
-# can `git clone` it, migrate the deprecated APIs, and push the changes back —
-# without depending on any cloud-hosted git service. Shared by both the kind and
-# GKE stacks (portable across substrates).
+# Seeds a local bare git repo with the application manifests for the agent to
+# clone and push back to.
 #
 # Env:
-#   REPO_PATH      absolute path of the bare repo to create (e.g. $HOME/migration-repo.git)
+#   REPO_PATH      absolute path of the bare repo to create
 #   MANIFESTS_DIR  directory containing the *.yaml manifests to seed
 set -euo pipefail
 
 REPO_PATH="${REPO_PATH:?REPO_PATH is required}"
 MANIFESTS_DIR="${MANIFESTS_DIR:?MANIFESTS_DIR is required}"
 REPO_PATH="${REPO_PATH/#\~/$HOME}"   # expand a leading ~ if present
-# Resolve MANIFESTS_DIR to an absolute path now (callers pass it relative to the
-# stack dir), since we `cd` into a temp dir before copying from it.
+# Absolute path, since the copy happens after a cd into a temp dir.
 MANIFESTS_DIR="$(cd "${MANIFESTS_DIR}" && pwd)"
 
 echo "==> Seeding manifests repo at ${REPO_PATH}"
@@ -49,14 +46,10 @@ WORK="$(mktemp -d)"
 )
 rm -rf "${WORK}"
 
-# Point the bare repo's HEAD at main so a plain `git clone` checks it out
-# (git init --bare defaults HEAD to the nonexistent 'master').
+# git init --bare points HEAD at master; a plain `git clone` needs main.
 git -c safe.bareRepository=all -C "${REPO_PATH}" symbolic-ref HEAD refs/heads/main
 
-# The agent may not be the user that provisioned. Seeding as root into a 0700
-# home, or as one uid while the agent runs as another, leaves the repo present
-# but unreadable — which the agent experiences as "the repo my prompt named
-# does not exist".
+# The agent may run as a different uid than the provisioner.
 chmod -R a+rX "${REPO_PATH}" 2>/dev/null || true
 chmod a+x "$(dirname "${REPO_PATH}")" 2>/dev/null || true
 
