@@ -61,12 +61,14 @@ kubeconfig, ADC, and the Docker socket do not exist inside.
 
 Provisioning (host-side, per run, pinned to the run's own kubectl context)
 creates a `bench-agent` ServiceAccount bound to `edit` plus a read-mostly
-cluster supplement, mints a token that expires just after the agent's
-timeout, applies PSA `baseline` labels, and installs ValidatingAdmissionPolicy
-backstops denying privileged pods, host namespaces, hostPath mounts, exempt-
-namespace writes, and shells into pre-existing non-conformant pods. A task
-whose subject matter *is* privileged workloads declares
-`agent_pod_security: privileged`. (A per-task `requires_unsandboxed` opt-out
+cluster supplement and a `ResourceQuota`/`LimitRange` write grant, mints a
+token that expires just after the agent's timeout, applies PSA `baseline`
+labels, and installs ValidatingAdmissionPolicy backstops denying privileged
+pods, host namespaces, hostPath mounts, exempt-namespace writes, and shells
+into pre-existing non-conformant pods. A task whose subject matter *is*
+privileged workloads declares `agent_pod_security: privileged`; one whose
+premise is that the operator cannot touch the quota declares
+`agent_quota_writes: false`. (A per-task `requires_unsandboxed` opt-out
 — run this one task ambient, loudly, with its records saying so — is planned
 but **not yet implemented**: the schema ignores unknown keys, so declaring it
 today changes nothing and the task still runs sandboxed.) Under vcluster the

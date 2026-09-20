@@ -991,6 +991,7 @@ class DefaultEvalHarness(Harness):
                     deployer.provider,
                     task.agent_pod_security,
                     with_cluster=infra_config.get("deployer") != "noop",
+                    quota_writes=task.agent_quota_writes,
                 )
                 sandbox_rules = self._inventory_sandbox_home(
                     task.name, workspace_path / "home", completed_spec.fixture_mounts
@@ -1191,12 +1192,14 @@ class DefaultEvalHarness(Harness):
         pod_security: str,
         *,
         with_cluster: bool = True,
+        quota_writes: bool = True,
     ) -> agent_sandbox.SandboxSpec:
         """Complete the skeletal sandbox spec for one provisioned task.
 
         Builds the context-pinned network plan, provisions the scoped cluster
         credential, and discovers fixture mounts; ``with_cluster=False`` mounts a
-        credential-free stub kubeconfig instead. Raises :class:`SandboxError`
+        credential-free stub kubeconfig instead. ``quota_writes`` is the task's
+        ``agent_quota_writes``. Raises :class:`SandboxError`
         rather than degrading to an ambient run.
         """
         if self._agent_config.sandbox is None:
@@ -1215,6 +1218,7 @@ class DefaultEvalHarness(Harness):
                 creds_dir,
                 token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
                 pod_security=pod_security,
+                quota_writes=quota_writes,
             )
         else:
             plan = agent_sandbox.NetworkPlan()
