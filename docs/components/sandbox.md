@@ -62,12 +62,13 @@ kubeconfig, ADC, and the Docker socket do not exist inside.
 
 Provisioning (host-side, per run, pinned to the run's own kubectl context)
 creates a `bench-agent` ServiceAccount bound to `edit` plus a read-mostly
-cluster supplement, mints a token that expires just after the agent's
+cluster supplement and a `ResourceQuota`/`LimitRange` write grant, mints a token that expires just after the agent's
 timeout, applies PSA `baseline` labels, and installs ValidatingAdmissionPolicy
 backstops denying privileged pods, host namespaces, hostPath mounts, exempt-
 namespace writes, and shells into pre-existing non-conformant pods. A task
 whose subject matter *is* privileged workloads declares
-`agent_pod_security: privileged`. A task whose objective needs the ambient
+`agent_pod_security: privileged`; one whose premise is that the operator cannot
+touch the quota declares `agent_quota_writes: false`. A task whose objective needs the ambient
 cloud identity itself declares `requires_unsandboxed: true` and runs outside
 the boundary — loudly, and with its record's `sandboxed` field reading `false`
 (the harness refuses to pair an exemption with a sandbox spec, so the two can
