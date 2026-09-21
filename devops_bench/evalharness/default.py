@@ -23,6 +23,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -78,7 +79,7 @@ from devops_bench.verification import (
 )
 from devops_bench.verification.hold_defaults import effective_poll_interval
 
-__all__ = ["DefaultEvalHarness"]
+__all__ = ["DefaultEvalHarness", "chaos_invalidated_entries"]
 
 _log = get_logger("evalharness.default")
 
@@ -118,6 +119,52 @@ _CHAOS_ACTIVE_WAIT_SEC = 45
 # so a slow-but-completing verification is not cut off, which would otherwise
 # yield partial reports and race teardown.
 _SCENARIO_JOIN_SEC = VERIFICATION_TIMEOUT_SEC + 60
+
+
+def chaos_invalidated_entries(
+    chaos_specs: Sequence[ChaosSpec],
+    chaos_report: Mapping[str, Any],
+) -> dict[str, str]:
+    """Name the chaos-referenced entries that must not be scored, and why.
+
+    A ``verify:`` entry only means something while the planned disruption is
+    live. The post-run pass evaluates every entry unconditionally, so when
+    injection failed it re-runs that entry against a cluster that was never
+    disrupted — which passes, and records a satisfied objective for a fault
+    that never happened. Naming the entry here makes the caller record it as
+    ``status: "error"`` instead: never observed, so it leaves the correctness
+    denominator and drops ``VerificationCoverage`` below 1.0 rather than
+    granting credit.
+
+    Only the scheduled spec is considered:
+    :meth:`DefaultEvalHarness.start_scenario` drives ``chaos_specs[0]`` and
+    warns about the rest, so it is the only reference that was ever meant to
+    be observed under load.
+
+    Args:
+        chaos_specs: The task's parsed chaos specs, in declaration order.
+        chaos_report: The drained chaos report for this run.
+
+    Returns:
+        ``{entry_name: reason}`` for each reference that must not be scored;
+        empty when the task declared no chaos, the report is empty (no
+        scenario ran), the scheduled spec opted out of verification, or the
+        injection succeeded.
+    """
+    if not chaos_specs or not chaos_report:
+        return {}
+    if chaos_report.get("status") == "success":
+        return {}
+    spec = chaos_specs[0]
+    if not spec.verify:
+        return {}
+    detail = chaos_report.get("error") or f"chaos status {chaos_report.get('status')!r}"
+    return {
+        spec.verify: (
+            f"planned disruption {spec.name!r} was never injected ({detail}); "
+            "this entry was never observed under the intended disruption"
+        )
+    }
 
 
 def _ensure_builtin_agents_registered() -> None:
@@ -509,19 +556,53 @@ class DefaultEvalHarness(Harness):
         entries = resolved if isinstance(resolved, list) else [resolved]
         return [ChaosSpec.model_validate(entry) for entry in entries if entry]
 
+    @staticmethod
+    def _never_observed(entry: VerificationEntry, reason: str) -> dict[str, Any]:
+        """Shape an entry that was never evaluated, not one observed false.
+
+        ``status: "error"`` is what the rollup keys off to keep an entry out of
+        every signal's numerator *and* denominator while dropping
+        ``VerificationCoverage`` below 1.0 — the established way to say "this
+        was not observed" without scoring it either way.
+
+        Args:
+            entry: The entry that went unevaluated.
+            reason: Operator-facing explanation, recorded verbatim.
+
+        Returns:
+            One report mapping in the shape ``rollup`` consumes.
+        """
+        return {
+            "name": entry.name,
+            **_entry_display_fields(entry),
+            "role": entry.role,
+            "severity": entry.severity,
+            "weight": entry.weight,
+            "mode": entry.resolved_mode,
+            "success": False,
+            "status": "error",
+            "reason": reason,
+            "elapsed_time": 0.0,
+            "children": [],
+        }
+
     def _run_verification(
         self,
         entries: list[VerificationEntry],
         timeout_sec: float = VERIFICATION_TIMEOUT_SEC,
         *,
         hold_observations: dict[str, HoldObservation] | None = None,
+        invalidated: Mapping[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Evaluate every entry against the live cluster after the agent finishes.
 
         Every entry runs, unconditionally, whether or not a chaos fault
-        references it. One entry that raises is recorded as a failure and the
-        rest still run, matching how the metrics pipeline isolates a failing
-        evaluator.
+        references it — *except* an entry named in ``invalidated``, whose
+        chaos disruption never landed. Evaluating that one here would measure
+        an undisturbed cluster and record a pass for a fault that did not
+        happen, so it is recorded as never-observed instead. One entry that
+        raises is recorded as a failure and the rest still run, matching how
+        the metrics pipeline isolates a failing evaluator.
 
         Two budgets apply. ``timeout_sec`` is the per-entry cap for a single
         converging entry's checks. :data:`VERIFICATION_TOTAL_BUDGET_SEC` is
@@ -561,6 +642,10 @@ class DefaultEvalHarness(Harness):
                 ``None`` (or a missing name) is treated the same as zero
                 samples. Never consulted for ``objective``-role hold entries,
                 which are soaked in this same pass instead.
+            invalidated: ``{entry_name: reason}`` for entries whose chaos
+                disruption never landed, as returned by
+                :func:`chaos_invalidated_entries`. Those entries are recorded
+                unevaluated.
 
         Returns:
             One raw mapping per entry, in declaration order, carrying the
@@ -571,6 +656,7 @@ class DefaultEvalHarness(Harness):
         report: list[dict[str, Any]] = []
         total_deadline = time.monotonic() + VERIFICATION_TOTAL_BUDGET_SEC
         hold_observations = hold_observations or {}
+        invalidated = invalidated or {}
 
         # Objective holds soak last, so converging objectives claim the shared
         # budget before any soak can consume it. Rows keep declaration order.
@@ -578,6 +664,14 @@ class DefaultEvalHarness(Harness):
         objective_holds: list[int] = []
 
         for index, entry in enumerate(entries):
+            # Checked ahead of the mode/role split: an entry whose disruption
+            # never landed was not observed under *any* mode, so a hold entry
+            # named here is skipped exactly like a converging one.
+            chaos_reason = invalidated.get(entry.name)
+            if chaos_reason is not None:
+                _log.warning("not scoring verification entry %r: %s", entry.name, chaos_reason)
+                rows[index] = self._never_observed(entry, chaos_reason)
+                continue
             if entry.resolved_mode == "hold" and entry.role == "safeguard":
                 rows[index] = self._hold_report_entry(entry, hold_observations.get(entry.name))
                 continue
@@ -620,19 +714,9 @@ class DefaultEvalHarness(Harness):
         remaining = total_deadline - time.monotonic()
         if entry.resolved_mode != "assert" and remaining < MIN_LEAF_BUDGET_SECONDS:
             # Never evaluated, not a condition observed false.
-            return {
-                "name": entry.name,
-                **_entry_display_fields(entry),
-                "role": entry.role,
-                "severity": entry.severity,
-                "weight": entry.weight,
-                "mode": entry.resolved_mode,
-                "success": False,
-                "status": "error",
-                "reason": "verification total budget exhausted before evaluation",
-                "elapsed_time": 0.0,
-                "children": [],
-            }
+            return self._never_observed(
+                entry, "verification total budget exhausted before evaluation"
+            )
 
         try:
             result = agent.run_entry(entry, timeout_sec=min(timeout_sec, remaining))
@@ -1010,6 +1094,9 @@ class DefaultEvalHarness(Harness):
         workspace_path: Path | None = None
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
+        # Tracked from parse time so the exception path can also tell whether a
+        # chaos-referenced entry went un-injected before it scores anything.
+        chaos_specs: list[ChaosSpec] = []
         # Track the substituted prompt / expectation / safety checklists as they
         # are computed so a failed record can carry the same resolved strings a
         # success record would, falling back to the raw task fields before
@@ -1149,7 +1236,9 @@ class DefaultEvalHarness(Harness):
                 verification_status = "skipped_no_infra"
             else:
                 verification_report = self._run_verification(
-                    entries, hold_observations=hold_observations
+                    entries,
+                    hold_observations=hold_observations,
+                    invalidated=chaos_invalidated_entries(chaos_specs, chaos_report),
                 )
                 verification_status = "evaluated"
 
@@ -1182,8 +1271,16 @@ class DefaultEvalHarness(Harness):
                 exception_verification_status = "skipped_no_infra"
             elif infra_up and entries:
                 try:
+                    # The success path drains the scenario before verifying; on
+                    # this path it may never have been drained, so snapshot it
+                    # here to apply the same chaos-invalidation rule.
+                    partial_chaos_report: dict[str, Any] = {}
+                    if scenario_manager is not None:
+                        partial_chaos_report, _ = scenario_manager.get_reports()
                     exception_verification_report = self._run_verification(
-                        entries, hold_observations=hold_observations
+                        entries,
+                        hold_observations=hold_observations,
+                        invalidated=chaos_invalidated_entries(chaos_specs, partial_chaos_report),
                     )
                     exception_verification_status = "evaluated"
                 except Exception:  # noqa: BLE001 - a crash here must not mask the original failure
