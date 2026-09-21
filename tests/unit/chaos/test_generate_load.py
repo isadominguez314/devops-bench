@@ -492,3 +492,34 @@ class TestLoadCommandTimeout:
     )
     def test_go_duration_parsing(self, value, expected):
         assert gl._go_duration_seconds(value) == expected
+
+
+class TestToolOutputClamp:
+    """One chatty load run must not exhaust the model's context."""
+
+    def test_short_output_is_passed_through_untouched(self):
+        assert gl._clamp_tool_output("Stdout: done\n") == "Stdout: done\n"
+
+    def test_a_per_request_log_is_bounded_and_keeps_both_ends(self):
+        # fortio logs a line per request; a 300s spike at 300 QPS is what
+        # overflowed a one-million-token context on the recorded runs.
+        text = "HEAD-MARKER\n" + "".join(f"request {i} ok\n" for i in range(90_000))
+        text += "\nAll done 90000 calls\nTAIL-MARKER"
+
+        clamped = gl._clamp_tool_output(text)
+
+        assert len(clamped) < len(text)
+        # The summary is the whole reason the output is read at all.
+        assert clamped.endswith("TAIL-MARKER")
+        assert "All done 90000 calls" in clamped
+        assert clamped.startswith("HEAD-MARKER")
+        # Told it was elided, rather than silently shown a truncated log.
+        assert "elided by the harness" in clamped
+
+    def test_the_elision_marker_reports_how_much_went_missing(self):
+        text = "x" * (gl._MAX_TOOL_OUTPUT_CHARS + 500)
+        assert "[500 characters elided" in gl._clamp_tool_output(text)
+
+    def test_output_at_the_limit_is_not_clamped(self):
+        text = "y" * gl._MAX_TOOL_OUTPUT_CHARS
+        assert gl._clamp_tool_output(text) == text
