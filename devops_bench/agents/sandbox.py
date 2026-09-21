@@ -35,8 +35,11 @@ what is present:
 * a generated single-cluster **kubeconfig**, read-only at ``/creds/kubeconfig``:
   one cluster, one context, no ``exec:`` plugin blocks, never the operator's
   own kubeconfig or Application Default Credentials
-* an explicit **env overlay**, passed by value as ``-e`` flags after a deny
-  filter — never scraped from ``os.environ``
+* an explicit **env overlay** after a deny filter — never scraped from
+  ``os.environ``, and never inline in the argv: the flags are name-only
+  ``-e``, with values delivered through the docker client's environment so
+  a provider API key cannot surface in the world-readable command line, in
+  logs, or in a rendered error message
 
 Never in the container: the repo checkout, ``results/``, operator ``$HOME``,
 gcloud config, Terraform state, or the Docker socket (with the socket the
@@ -432,7 +435,9 @@ def filter_boundary_env(
             (container-owned names excepted).
 
     Returns:
-        The filtered mapping that becomes ``-e`` flags.
+        The filtered mapping that crosses the boundary: its names become the
+        name-only ``-e`` flags, its values ride the docker client's
+        environment (never the argv).
     """
     kept: dict[str, str] = {}
     for name, value in (overlay or {}).items():
@@ -522,8 +527,12 @@ class SandboxExecutor:
         operator-owned (Docker Desktop already remaps ownership on macOS); the
         four-mount set (workspace RW, kubeconfig RO, fixtures RW — the write
         bit is deliberate, several tasks ask the agent to commit its fix back
-        to the seeded repo); the filtered env overlay by value, then the
-        container-owned ``HOME``/``KUBECONFIG`` last so they win any
+        to the seeded repo); the filtered env overlay as **name-only** ``-e``
+        flags whose values travel through the docker client's environment,
+        never the argv (the argv is world-readable in ``/proc`` and rendered
+        into error messages, so an inline API key would leak on every
+        timeout); then the container-owned ``HOME``/``KUBECONFIG`` last —
+        inline, their values are non-secret constants — so they win any
         duplicate ``-e``; and **no ``-i``** — keeping stdin open gives the
         agent an open, non-TTY stdin to block on, and a headless prompt run
         never reads it.
@@ -542,11 +551,18 @@ class SandboxExecutor:
         argv += ["-v", f"{spec.kubeconfig}:{CONTAINER_KUBECONFIG}:ro"]
         for host_path, container_path in spec.fixture_mounts.items():
             argv += ["-v", f"{host_path}:{container_path}"]
-        for name, value in filter_boundary_env(extra_env, spec.env_allowlist).items():
-            argv += ["-e", f"{name}={value}"]
-        # Container-owned env comes AFTER the overlay: docker's last ``-e``
-        # wins, so even a filter regression could not let an overlay value
-        # repoint HOME or the credential path inside the boundary.
+        # Name-only ``-e`` flags: docker reads each value from the docker
+        # *client's* environment (populated by ``run()``), so provider API
+        # keys never sit in the argv — which is world-readable in
+        # /proc/<pid>/cmdline for the whole run and rendered verbatim into
+        # SubprocessError messages and the harness log on timeout.
+        for name in filter_boundary_env(extra_env, spec.env_allowlist):
+            argv += ["-e", name]
+        # Container-owned env comes AFTER the overlay and stays inline: the
+        # values are non-secret constants, name-only would read the *host's*
+        # HOME/KUBECONFIG instead, and docker's last ``-e`` wins — so even a
+        # filter regression could not let an overlay value repoint HOME or
+        # the credential path inside the boundary.
         argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
         argv.append(spec.image)
@@ -598,9 +614,23 @@ class SandboxExecutor:
             raise SandboxError(
                 "the sandboxed agent runs without stdin (no -i, by design); input= is unsupported"
             )
-        wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=extra_env)
+        # Filter once: the crossing set is both the name-only ``-e`` flags in
+        # the argv (wrap_argv re-filters, a no-op on this pre-filtered
+        # mapping) and the values handed to the docker client process, which
+        # is where name-only ``-e`` reads them from. Values live in the
+        # client's /proc/<pid>/environ (same-uid/root-readable), never its
+        # world-readable cmdline.
+        crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
+        wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
         try:
-            return run(wrapped, check=check, capture=capture, text=text, timeout=timeout)
+            return run(
+                wrapped,
+                extra_env=crossing,
+                check=check,
+                capture=capture,
+                text=text,
+                timeout=timeout,
+            )
         finally:
             kill_container(self.container_name)
 
