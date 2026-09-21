@@ -37,6 +37,10 @@ from devops_bench.agents.capabilities import (
     SkillBinding,
 )
 from devops_bench.chaos import ChaosSpec
+from devops_bench.chaos.faults.generate_load import (
+    _LOAD_TIMEOUT_CEILING_SEC,
+    _go_duration_seconds,
+)
 from devops_bench.cheat_detection import (
     DEFAULT_BASELINE,
     SensitiveAccessRule,
@@ -128,6 +132,38 @@ _CHAOS_ACTIVE_WAIT_SEC = 45
 # so a slow-but-completing verification is not cut off, which would otherwise
 # yield partial reports and race teardown.
 _SCENARIO_JOIN_SEC = VERIFICATION_TIMEOUT_SEC + 60
+
+
+def _scenario_join_budget(chaos_specs: Sequence[ChaosSpec]) -> float:
+    """The drain budget, widened to cover a spike still running by design.
+
+    ``_SCENARIO_JOIN_SEC`` alone assumes the scenario thread is essentially
+    done by the time the agent's turn ends. A load spike breaks that
+    assumption deliberately: optimize-scale declares 300s precisely so the
+    surge is still live when verification starts, and the scenario thread
+    cannot finish until fortio does. Draining on the flat budget would join
+    for 180s against a spike with ~300s left, stamp ``"timed_out"``, and hand
+    :func:`chaos_invalidated_entries` a non-success status — discarding a run
+    whose fault fired exactly as intended.
+
+    This was unreachable while every command was capped at 40s. Deriving the
+    budget from the same declared duration the fault derives its own timeout
+    from keeps the two in step.
+    """
+    if not chaos_specs:
+        return _SCENARIO_JOIN_SEC
+    # Duck-typed rather than imported: only some faults declare a duration,
+    # and the harness has no business knowing which concrete target model it
+    # is holding.
+    declared = getattr(getattr(chaos_specs[0].action, "target", None), "duration", None)
+    if not isinstance(declared, str):
+        return _SCENARIO_JOIN_SEC
+    # Same parser and same ceiling the fault uses to size its own timeout, so
+    # the drain budget cannot drift away from what the spike is allowed to run.
+    seconds = _go_duration_seconds(declared)
+    if seconds is None:
+        return _SCENARIO_JOIN_SEC
+    return _SCENARIO_JOIN_SEC + min(seconds, _LOAD_TIMEOUT_CEILING_SEC)
 
 
 def chaos_invalidated_entries(
@@ -1447,7 +1483,9 @@ class DefaultEvalHarness(Harness):
                 task.expected_output, active_cluster_name, target_dep, ns
             )
 
-            chaos_report, perf_report = self._drain_scenario(scenario_manager, scenario_thread)
+            chaos_report, perf_report = self._drain_scenario(
+                scenario_manager, scenario_thread, chaos_specs
+            )
 
             if self.no_infra:
                 # no_infra means no real cluster to check; issuing kubectl
@@ -1930,6 +1968,7 @@ class DefaultEvalHarness(Harness):
         self,
         scenario_manager: ScenarioManager | None,
         scenario_thread: threading.Thread | None,
+        chaos_specs: Sequence[ChaosSpec] = (),
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Join the scenario thread and return its chaos and perf reports.
 
@@ -1942,6 +1981,8 @@ class DefaultEvalHarness(Harness):
         Args:
             scenario_manager: The running scenario, or None.
             scenario_thread: The scenario's daemon thread, or None.
+            chaos_specs: The scheduled specs, used only to size the join
+                budget against a spike that is still running by design.
 
         Returns:
             A ``(chaos_report, perf_report)`` pair; both empty when no chaos
@@ -1950,13 +1991,14 @@ class DefaultEvalHarness(Harness):
         if scenario_manager is None or scenario_thread is None:
             return {}, {}
         _log.info("waiting for background metrics collection to complete...")
-        scenario_thread.join(timeout=_SCENARIO_JOIN_SEC)
+        join_budget = _scenario_join_budget(chaos_specs)
+        scenario_thread.join(timeout=join_budget)
         chaos_report, perf_report = scenario_manager.get_reports()
         if scenario_thread.is_alive():
             _log.warning(
                 "scenario thread still alive after %ss join budget; "
                 "stamping chaos_report.status='timed_out'",
-                _SCENARIO_JOIN_SEC,
+                join_budget,
             )
             # get_reports() already handed back a locked deep copy, so this
             # snapshot is private and safe to stamp even though the daemon thread
