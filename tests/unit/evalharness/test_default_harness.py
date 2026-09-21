@@ -35,6 +35,7 @@ import pytest
 from devops_bench.agents import AGENTS, AgentHarness
 from devops_bench.agents.result import AgentResult, ToolCall
 from devops_bench.chaos import ChaosSpec
+from devops_bench.chaos.faults import generate_load as gl
 from devops_bench.core import ConfigError, MissingDependencyError
 from devops_bench.core.score_keys import INTEGRITY_CATASTROPHIC_KEY, OUTCOME_SCORE_KEY
 from devops_bench.evalharness import default as harness_default
@@ -1436,3 +1437,59 @@ def test_invalidated_entry_carries_the_same_display_metadata_as_every_other_row(
     assert report[0]["description"] == "The HPA scales out under the planned surge."
     assert report[0]["group"] == "scaling"
     assert report[0]["failure_hint"] == "Check the HPA's target utilization."
+
+
+class TestScenarioJoinBudget:
+    """The drain must outlast a spike the task deliberately keeps running."""
+
+    @staticmethod
+    def _spec_with_duration(duration: Any) -> Any:
+        return ChaosSpec.model_validate(
+            {
+                "name": "Planned Load Spike",
+                "trigger": {"type": "time", "delay_seconds": 5},
+                "action": {
+                    "type": "generate_load",
+                    "target": {"service_url": "http://svc", "qps": 300, "duration": duration},
+                },
+                "verify": "Planned Load Spike Verification",
+            }
+        )
+
+    def test_no_chaos_keeps_the_flat_budget(self) -> None:
+        assert harness_default._scenario_join_budget(()) == harness_default._SCENARIO_JOIN_SEC  # noqa: SLF001
+
+    def test_a_spec_without_a_declared_duration_keeps_the_flat_budget(self) -> None:
+        assert harness_default._scenario_join_budget([_spike_spec()]) == (  # noqa: SLF001
+            harness_default._SCENARIO_JOIN_SEC  # noqa: SLF001
+        )
+
+    def test_the_budget_covers_the_declared_spike(self) -> None:
+        """The optimize-scale case: 300s of spike must not be cut off at 180s.
+
+        The task declares 300s precisely so the surge is still live when
+        verification starts, so the flat budget would join against a spike
+        with ~300s left, stamp "timed_out", and invalidate a run whose fault
+        fired exactly as designed. Unreachable while every command was capped
+        at 40s, which is why it never showed up before.
+        """
+        budget = harness_default._scenario_join_budget(  # noqa: SLF001
+            [self._spec_with_duration("300s")]
+        )
+
+        assert budget == harness_default._SCENARIO_JOIN_SEC + 300  # noqa: SLF001
+        assert budget > 5 + 300
+
+    def test_the_budget_is_bounded_like_the_fault_s_own_timeout(self) -> None:
+        budget = harness_default._scenario_join_budget(  # noqa: SLF001
+            [self._spec_with_duration("24h")]
+        )
+        assert budget == harness_default._SCENARIO_JOIN_SEC + gl._LOAD_TIMEOUT_CEILING_SEC  # noqa: SLF001
+
+    def test_an_unparsable_duration_falls_back_rather_than_guessing(self) -> None:
+        assert (
+            harness_default._scenario_join_budget(  # noqa: SLF001
+                [self._spec_with_duration("banana")]
+            )
+            == harness_default._SCENARIO_JOIN_SEC
+        )  # noqa: SLF001
