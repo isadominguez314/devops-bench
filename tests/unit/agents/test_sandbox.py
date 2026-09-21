@@ -489,7 +489,7 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     spec = _complete_spec(tmp_path)
     executor = sandbox.SandboxExecutor(spec)
 
-    argv = executor.wrap_argv(["gemini", "-p", "hi"], extra_env={"GEMINI_API_KEY": "k"})
+    argv = executor.wrap_argv(["gemini", "-p", "hi"], extra_env={"GEMINI_API_KEY": "sekrit"})
 
     assert argv[:3] == ["docker", "run", "--rm"]
     assert argv[argv.index("--name") + 1] == "devops-bench-agent-workspace-abc123"
@@ -504,10 +504,14 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     # Mount set: workspace RW, kubeconfig RO.
     assert f"{spec.workspace}:/workspace" in argv
     assert f"{spec.kubeconfig}:/creds/kubeconfig:ro" in argv
-    # Env: container-owned vars plus the filtered overlay, by value.
+    # Env: container-owned vars inline (non-secret constants), the overlay
+    # as name-only -e flags — the secret value must never appear in the
+    # argv, which is world-readable in /proc and rendered into error
+    # messages on timeout.
     assert "HOME=/workspace/home" in argv
     assert "KUBECONFIG=/creds/kubeconfig" in argv
-    assert "GEMINI_API_KEY=k" in argv
+    assert "GEMINI_API_KEY" in argv
+    assert all("sekrit" not in part for part in argv)
     # Default working directory is the workspace; image then the raw argv.
     assert argv[argv.index("-w") + 1] == "/workspace"
     assert argv[-4:] == ["agent-image", "gemini", "-p", "hi"]
@@ -519,8 +523,8 @@ def test_wrap_argv_container_owned_env_flags_come_last(tmp_path: Path) -> None:
     last-one-wins keeps them authoritative no matter what crossed."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     argv = executor.wrap_argv(["gemini"], extra_env={"GEMINI_API_KEY": "k"})
-    assert argv.index("HOME=/workspace/home") > argv.index("GEMINI_API_KEY=k")
-    assert argv.index("KUBECONFIG=/creds/kubeconfig") > argv.index("GEMINI_API_KEY=k")
+    assert argv.index("HOME=/workspace/home") > argv.index("GEMINI_API_KEY")
+    assert argv.index("KUBECONFIG=/creds/kubeconfig") > argv.index("GEMINI_API_KEY")
 
 
 def test_wrap_argv_never_forwards_denied_env(tmp_path: Path) -> None:
@@ -661,6 +665,38 @@ def test_executor_run_passes_through_check_and_timeout(
 
     assert seen["check"] is False
     assert seen["timeout"] == 15.5
+
+
+def test_executor_run_keeps_secret_values_out_of_the_argv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The overlay's values ride the docker client's environment (extra_env
+    on the host run), never the ``docker run`` command line: the argv is
+    world-readable in /proc for the whole run and is rendered into
+    SubprocessError messages — which the harness embeds in errored results —
+    so an inline key would leak on every timeout."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["docker", "run"]:
+            seen["argv"] = argv
+            seen["extra_env"] = kwargs.get("extra_env")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    executor.run(
+        ["gemini"],
+        extra_env={"GEMINI_API_KEY": "sekrit", "GOOGLE_APPLICATION_CREDENTIALS": "/adc.json"},
+    )
+
+    # The name crosses as a name-only -e flag; the value only via extra_env.
+    assert "GEMINI_API_KEY" in seen["argv"]
+    assert all("sekrit" not in part for part in seen["argv"])
+    assert seen["extra_env"] == {"GEMINI_API_KEY": "sekrit"}
+    # The deny filter guards the client-env transport too: a denied var's
+    # value must not reach the docker client process either.
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in seen["extra_env"]
 
 
 # -- the run_agent_cmd seam --------------------------------------------------------
