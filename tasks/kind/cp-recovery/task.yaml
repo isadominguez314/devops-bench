@@ -20,8 +20,9 @@ check_groups:
     title: "Existing workloads kept"
     description: "workload-1 and workload-2 were not deleted and recreated."
 # etcd member surgery plus a GitOps reconciliation, through many sequential
-# kubectl round-trips, overruns the 600s harness default.
-timeout_sec: 1500
+# kubectl round-trips, overruns the 600s default agent budget. There is no
+# task-level timeout field in the schema (an unknown key would be silently
+# dropped); run this task with AGENT_TIMEOUT_SEC=1500 -- see the README.
 # kind only: on GKE the control plane is managed and inaccessible.
 infrastructure:
   deployer: "tofu"
