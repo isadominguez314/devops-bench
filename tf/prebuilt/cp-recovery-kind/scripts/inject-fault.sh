@@ -76,23 +76,45 @@ kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
   etcdctl "${ETCD_CERTS[@]}" snapshot save /var/lib/etcd/etcd-backup.db
 
 echo "==> Computing checksum and staging the backup onto ${WORKER_NODE}:/backup ..."
-docker exec "${SNAP_NODE}" sha256sum /var/lib/etcd/etcd-backup.db | awk '{print $1}' > /tmp/etcd-backup.sha256
-docker cp "${SNAP_NODE}:/var/lib/etcd/etcd-backup.db" /tmp/etcd-backup.db
+# Per-run staging dir: a fixed /tmp path would let two concurrent runs swap or
+# delete each other's snapshot between the checksum and the copy, staging a
+# sibling cluster's backup as this run's "verified" one. The trap also cleans
+# up when set -e aborts mid-block.
+STAGING_DIR="$(mktemp -d)"
+trap 'rm -rf "${STAGING_DIR}"' EXIT
+docker exec "${SNAP_NODE}" sha256sum /var/lib/etcd/etcd-backup.db | awk '{print $1}' > "${STAGING_DIR}/etcd-backup.sha256"
+docker cp "${SNAP_NODE}:/var/lib/etcd/etcd-backup.db" "${STAGING_DIR}/etcd-backup.db"
 docker exec "${WORKER_NODE}" mkdir -p /backup
-docker cp /tmp/etcd-backup.db "${WORKER_NODE}:/backup/etcd-backup.db"
-docker cp /tmp/etcd-backup.sha256 "${WORKER_NODE}:/backup/etcd-backup.sha256"
+docker cp "${STAGING_DIR}/etcd-backup.db" "${WORKER_NODE}:/backup/etcd-backup.db"
+docker cp "${STAGING_DIR}/etcd-backup.sha256" "${WORKER_NODE}:/backup/etcd-backup.sha256"
 
 docker exec "${SNAP_NODE}" rm -f /var/lib/etcd/etcd-backup.db
-rm -f /tmp/etcd-backup.db /tmp/etcd-backup.sha256
 echo "    backup staged: /backup/etcd-backup.db (+ .sha256)"
 
 echo "==> Corrupting the etcd member on ${TARGET_NODE} (minority; quorum preserved)..."
 # Overwrite the bbolt database pages so etcd cannot reopen the store.
 docker exec "${TARGET_NODE}" sh -c \
   'dd if=/dev/urandom of=/var/lib/etcd/member/snap/db bs=1M count=2 conv=notrunc'
-# Restart the static pod so the kubelet re-reads the corrupted data.
+# Restart the static pod so the kubelet re-reads the corrupted data. The
+# corruption only manifests when etcd reopens the store, so a silently failed
+# restart would hand the agent a healthy cluster while the rubric expects an
+# incident; fail loudly instead of swallowing errors.
 docker exec "${TARGET_NODE}" sh -c \
-  'crictl rm -f $(crictl ps -a -q --name etcd) 2>/dev/null || true'
+  'ids="$(crictl ps -a -q --name etcd)"; [ -n "$ids" ] || { echo "no etcd container found" >&2; exit 1; }; crictl rm -f $ids'
+
+echo "==> Verifying the fault took hold (expect exactly 2 healthy members)..."
+healthy=0
+for _ in $(seq 1 24); do
+  healthy="$(kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
+    etcdctl "${ETCD_CERTS[@]}" endpoint health --cluster 2>&1 \
+    | grep -c 'is healthy' || true)"
+  [ "${healthy}" -eq 2 ] && break
+  sleep 5
+done
+if [ "${healthy}" -ne 2 ]; then
+  echo "ERROR: fault injection did not take hold: ${healthy} healthy members (expected 2)" >&2
+  exit 1
+fi
 
 echo "==> Fault injection complete."
 echo "    One etcd member on ${TARGET_NODE} is now corrupted; the cluster should"
