@@ -80,7 +80,10 @@ def _read_db_tokens(db_path: pathlib.Path) -> dict | None:
 
 # agy names the reasoning tier separately from the model: every selection in its
 # catalogue is a base model plus one of these, and there is no untiered form --
-# a bare slug is refused with "requires --effort".
+# a bare slug is refused with "requires --effort". This is the union across
+# models, not a per-model list: in agy 1.2.0 the Flash models take all three but
+# Gemini 3.1 Pro only low and high. A per-model table would go stale with every
+# agy release, so a tier the chosen model lacks is left for agy to reject.
 _AGY_EFFORT_TIERS: tuple[str, ...] = ("low", "medium", "high")
 
 # Vertex publishes preview model ids with this suffix. agy's catalogue does not
@@ -90,7 +93,9 @@ _VERTEX_PREVIEW_SUFFIX: str = "-preview"
 # A display-name selection ("Gemini 3.1 Pro (Low)") already names its tier, and
 # agy errors if --effort is passed alongside one. Recognize it so it survives
 # untouched: it is the spelling ``agy --help`` steers operators towards.
-_DISPLAY_TIER_RE: re.Pattern[str] = re.compile(r"\((?:low|medium|high)\)\s*$", re.IGNORECASE)
+_DISPLAY_TIER_RE: re.Pattern[str] = re.compile(
+    rf"\((?:{'|'.join(map(re.escape, _AGY_EFFORT_TIERS))})\)\s*$", re.IGNORECASE
+)
 
 # The tier is a scoring variable, not a formatting detail -- `low` and `high`
 # are materially different agents. `high` is the least surprising default
@@ -108,10 +113,12 @@ def _default_effort() -> str:
         The tier from ``AGENT_MODEL_EFFORT``, or ``high``.
 
     Raises:
-        core.ConfigError: If ``AGENT_MODEL_EFFORT`` names an unknown tier.
-            Rejected here rather than passed through, so a typo fails on the
-            misconfiguration itself instead of surfacing seconds later as agy's
-            own startup error in the middle of a scored arm.
+        core.ConfigError: If ``AGENT_MODEL_EFFORT`` names a tier no agy model
+            offers. Rejected here rather than passed through, so a typo fails
+            on the misconfiguration itself instead of surfacing as agy's own
+            startup error. A real tier the chosen model lacks (``medium`` on
+            Gemini 3.1 Pro) is not caught here; agy rejects it at startup,
+            before the agent takes any action.
     """
     effort = os.environ.get(_EFFORT_ENV, "").strip()
     if not effort:
@@ -134,7 +141,8 @@ def _resolve_model_name(model: str) -> tuple[str, str | None]:
     the quirk to the one harness that has it; respelling ``AGENT_MODEL`` instead
     would desynchronize the agy arm's label from every other arm in the matrix.
 
-    e.g. ``"google/gemini-3.1-pro-preview"`` -> ``("gemini-3.1-pro", "high")``.
+    e.g. ``"google/gemini-3.1-pro-preview"`` -> ``("gemini-3.1-pro", "high")``,
+    and ``"gemini-3.1-pro-preview-low"`` -> ``("gemini-3.1-pro", "low")``.
 
     Args:
         model: The configured model id, optionally provider-qualified.
@@ -147,12 +155,16 @@ def _resolve_model_name(model: str) -> tuple[str, str | None]:
     name = model.split("/")[-1].strip()
     if _DISPLAY_TIER_RE.search(name):
         return name, None
-    if name.endswith(_VERTEX_PREVIEW_SUFFIX):
-        name = name[: -len(_VERTEX_PREVIEW_SUFFIX)]
+    # The tier comes off first: a tier suffix would otherwise hide -preview
+    # from the check below, and agy rejects any id that still carries it.
+    effort: str | None = None
     for tier in _AGY_EFFORT_TIERS:
         if name.lower().endswith(f"-{tier}"):
-            return name[: -len(tier) - 1], tier
-    return name, _default_effort()
+            name, effort = name[: -len(tier) - 1], tier
+            break
+    if name.endswith(_VERTEX_PREVIEW_SUFFIX):
+        name = name[: -len(_VERTEX_PREVIEW_SUFFIX)]
+    return name, effort or _default_effort()
 
 
 def _build_settings(
@@ -301,6 +313,14 @@ class AgyCliAgent(base.AgentHarness):
                     self.config.model,
                     model_name,
                     f" --effort {effort}" if effort else "",
+                )
+            elif effort:
+                # The tier changes the score, so it is surfaced even when the
+                # id itself needed no rewrite.
+                _log.info(
+                    "agy model %s names no reasoning tier; running --effort %s",
+                    model_name,
+                    effort,
                 )
 
         env_overlay = _build_env(self.config)

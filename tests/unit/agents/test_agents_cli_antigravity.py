@@ -369,6 +369,22 @@ class TestResolveModelName:
             "medium",
         )
 
+    def test_strips_preview_hidden_behind_a_tier_suffix(self) -> None:
+        # A Vertex id with a tier appended: the tier must come off first or
+        # -preview survives, and agy rejects any id that still carries it.
+        assert agy_mod._resolve_model_name("google/gemini-3.1-pro-preview-low") == (
+            "gemini-3.1-pro",
+            "low",
+        )
+
+    @pytest.mark.parametrize("tier", agy_mod._AGY_EFFORT_TIERS)
+    def test_every_known_tier_is_recognized_in_a_display_name(self, tier: str) -> None:
+        # A tier added to _AGY_EFFORT_TIERS but not recognized in a display
+        # name would get a second --effort, which agy rejects.
+        display = f"Gemini 3.8 Flash ({tier.title()})"
+
+        assert agy_mod._resolve_model_name(display) == (display, None)
+
     def test_display_name_keeps_its_own_tier_and_takes_no_effort_flag(self) -> None:
         # agy errors when --effort accompanies a parenthesised tier, so the
         # resolver must report None rather than the default.
@@ -406,9 +422,31 @@ class TestDefaultEffort:
             agy_mod._default_effort()
 
 
+@pytest.mark.parametrize(
+    ("model", "want_model_flag", "want_effort_flag"),
+    [
+        # Id needs no rewrite; only the default tier is added.
+        ("gemini-3.5-flash", "--model=gemini-3.5-flash", "--effort=high"),
+        # Vertex spelling with a tier suffix: both rewritten.
+        ("google/gemini-3.1-pro-preview-low", "--model=gemini-3.1-pro", "--effort=low"),
+        # Display name carries its own tier; a second --effort is rejected.
+        ("Gemini 3.1 Pro (Low)", "--model=Gemini 3.1 Pro (Low)", None),
+    ],
+)
+@mock.patch.object(agy_mod, "_log")
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
-def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
+def test_agy_cli_agent_execute_flow(
+    mock_run,
+    mock_home,
+    mock_log,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    want_model_flag: str,
+    want_effort_flag: str | None,
+) -> None:
+    monkeypatch.delenv(agy_mod._EFFORT_ENV, raising=False)
     # Mock Path.home() to return a temp directory to avoid polluting real HOME
     mock_home.return_value = tmp_path
 
@@ -437,7 +475,7 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
 
     config = agents_config.AgentConfig(
         target="/bin/agy",
-        model="gemini-3.5-flash",
+        model=model,
         capabilities=capabilities.AllCapabilities(),
     )
     agent = agy_mod.AgyCliAgent(config)
@@ -458,6 +496,20 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
     assert "--dangerously-skip-permissions" in args
     assert "--prompt=run task" in args
     assert any(a.startswith("--gemini_dir=") for a in args)
+    assert want_model_flag in args
+    effort_flags = [a for a in args if a.startswith("--effort")]
+    assert effort_flags == ([want_effort_flag] if want_effort_flag else [])
+
+    # The tier is a scoring variable, so whenever one is added it is logged,
+    # even when the id itself needed no rewrite.
+    logged = " ".join(
+        call.args[0] % call.args[1:]
+        for call in (*mock_log.warning.call_args_list, *mock_log.info.call_args_list)
+    )
+    if want_effort_flag:
+        assert want_effort_flag.replace("=", " ") in logged
+    else:
+        assert "--effort" not in logged
 
 
 def _write_sample_transcript(
