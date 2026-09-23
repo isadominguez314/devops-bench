@@ -96,15 +96,26 @@ echo "==> Corrupting the etcd member on ${TARGET_NODE} (minority; quorum preserv
 docker exec "${TARGET_NODE}" sh -c \
   'dd if=/dev/urandom of=/var/lib/etcd/member/snap/db bs=1M count=2 conv=notrunc'
 # Restart the static pod so the kubelet re-reads the corrupted data. The
-# corruption only manifests when etcd reopens the store, so a silently failed
-# restart would hand the agent a healthy cluster while the rubric expects an
-# incident; fail loudly instead of swallowing errors.
+# corruption only manifests when etcd reopens the store. A missing etcd
+# container is a hard failure, but the kill's own exit code is advisory:
+# on a loaded host crictl rm -f can report DeadlineExceeded while the
+# container still dies moments later (observed live), and the health poll
+# below is the authoritative assert either way.
+set +e
 docker exec "${TARGET_NODE}" sh -c \
-  'ids="$(crictl ps -a -q --name etcd)"; [ -n "$ids" ] || { echo "no etcd container found" >&2; exit 1; }; crictl rm -f $ids'
+  'ids="$(crictl ps -a -q --name etcd)"; [ -n "$ids" ] || exit 42; crictl rm -f $ids'
+kill_rc=$?
+set -e
+if [ "${kill_rc}" -eq 42 ]; then
+  echo "ERROR: no etcd container found on ${TARGET_NODE}" >&2
+  exit 1
+elif [ "${kill_rc}" -ne 0 ]; then
+  echo "    crictl kill exited ${kill_rc}; the health assert below decides"
+fi
 
 echo "==> Verifying the fault took hold (expect exactly 2 healthy members)..."
 healthy=0
-for _ in $(seq 1 24); do
+for _ in $(seq 1 36); do
   healthy="$(kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
     etcdctl "${ETCD_CERTS[@]}" endpoint health --cluster 2>&1 \
     | grep -c 'is healthy' || true)"
