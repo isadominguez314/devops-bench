@@ -21,14 +21,16 @@ import pytest
 from devops_bench.agents.shared.vertex_env import (
     DEFAULT_VERTEX_LOCATION,
     VERTEX_LOCATION_ENVS,
+    VERTEX_PROJECT_ENVS,
     vertex_location,
+    vertex_project,
 )
 
 
 @pytest.fixture(autouse=True)
-def _clear_location_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An operator's ambient location env must not decide these assertions.
-    for name in (*VERTEX_LOCATION_ENVS, "GCP_LOCATION"):
+def _clear_vertex_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An operator's ambient project/location env must not decide these assertions.
+    for name in (*VERTEX_LOCATION_ENVS, *VERTEX_PROJECT_ENVS, "GCP_LOCATION"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -72,30 +74,27 @@ def test_value_is_stripped(monkeypatch: pytest.MonkeyPatch) -> None:
     assert vertex_location() == "europe-west4"
 
 
-def test_fallback_runs_only_when_the_env_chain_is_empty(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-
-    def _lookup() -> str | None:
-        calls.append(1)
-        return "asia-northeast1"
-
-    monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west4")
-    assert vertex_location(fallback=_lookup) == "europe-west4"
-    # The antigravity caller's fallback shells out to gcloud; a configured host
-    # must not pay for that subprocess.
-    assert calls == []
-
-    monkeypatch.delenv("GCP_VERTEX_LOCATION")
-    assert vertex_location(fallback=_lookup) == "asia-northeast1"
-    assert calls == [1]
-
-
-@pytest.mark.parametrize("returned", [None, "", "  "])
-def test_empty_fallback_falls_through_to_the_default(returned: str | None) -> None:
-    assert vertex_location(fallback=lambda: returned) == DEFAULT_VERTEX_LOCATION
-
-
 def test_explicit_default_is_honored() -> None:
     assert vertex_location(default="us-east5") == "us-east5"
+
+
+def test_project_precedence_is_declaration_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    for index, name in enumerate(VERTEX_PROJECT_ENVS):
+        monkeypatch.setenv(name, f"proj-{index}")
+    for index, name in enumerate(VERTEX_PROJECT_ENVS):
+        assert vertex_project() == f"proj-{index}"
+        monkeypatch.delenv(name)
+    assert vertex_project() is None
+
+
+def test_project_reads_the_repo_wide_spelling(monkeypatch: pytest.MonkeyPatch) -> None:
+    # GCP_PROJECT_ID is what models/, providers/gcp.py and the claude_code
+    # harness read; an operator who set only that must not be ignored here.
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj-repo")
+    monkeypatch.setenv("GCP_PROJECT", "proj-legacy")
+    assert vertex_project() == "proj-repo"
+
+
+def test_whitespace_only_project_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "  ")
+    assert vertex_project() is None

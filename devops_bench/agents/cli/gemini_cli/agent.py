@@ -47,8 +47,12 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
-from devops_bench.agents.shared.vertex_env import vertex_location
-from devops_bench.core import SubprocessError, get_logger
+from devops_bench.agents.shared.vertex_env import (
+    VERTEX_PROJECT_ENVS,
+    vertex_location,
+    vertex_project,
+)
+from devops_bench.core import ConfigError, SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import run
 
@@ -158,7 +162,9 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     location comes from the shared
     :func:`~devops_bench.agents.shared.vertex_env.vertex_location` chain, which
     defaults to ``global`` — the only endpoint the ``-preview`` model ids are
-    published on.
+    published on. The project comes from
+    :func:`~devops_bench.agents.shared.vertex_env.vertex_project`; gemini-cli
+    rejects a Vertex run without one, so a missing project fails here instead.
 
     Args:
         config: Resolved :class:`AgentConfig` for this run.
@@ -167,7 +173,8 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         A mapping suitable for ``core.subprocess.run``'s ``extra_env``.
 
     Raises:
-        ConfigError: If ``config.provider`` is not a known provider.
+        ConfigError: If ``config.provider`` is not a known provider, or a Vertex
+            run has no project and no ``GOOGLE_API_KEY``.
     """
     # Resolve unconditionally so an unknown provider fails loud even on a keyless
     # (Vertex/ADC) run, not only when a key happens to be set.
@@ -186,18 +193,20 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         # Project/location env spellings follow the antigravity harness so an
         # operator configures both agents the same way.
         overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
-        project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+        project = vertex_project()
         if project:
             overlay["GOOGLE_CLOUD_PROJECT"] = project
+        elif not os.environ.get("GOOGLE_API_KEY"):
+            # gemini-cli refuses a Vertex run with neither a project nor an
+            # express-mode GOOGLE_API_KEY; fail here with the variables we read.
+            raise ConfigError(
+                "a Vertex run of the Gemini CLI needs a project: set one of "
+                f"{', '.join(VERTEX_PROJECT_ENVS)} (or GOOGLE_API_KEY for Vertex "
+                "express mode)"
+            )
         overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
     else:
-        # The overlay rides on top of the inherited environment, so *omitting*
-        # the switch cannot protect a non-Vertex run from an operator shell
-        # that exports GOOGLE_GENAI_USE_VERTEXAI=true (a Vertex arm's env
-        # sourced globally, say) — the ambient value would reroute the run at
-        # Vertex. Pin it off explicitly; an overlay value beats the ambient
-        # one. Project/location are left alone: without the switch the SDK
-        # does not read them for routing.
+        # Pin off explicitly so an ambient GOOGLE_GENAI_USE_VERTEXAI=true can't reroute the run.
         overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "false"
     if config.api_key:
         for var in spec.api_key_envs:

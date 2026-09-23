@@ -402,40 +402,45 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
     assert any(a.startswith("--gemini_dir=") for a in args)
 
 
-@mock.patch.object(agy_mod, "_get_gcloud_location", return_value=None)
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_execute_defaults_the_location_to_global(
     mock_run: mock.MagicMock,
     mock_home: mock.MagicMock,
-    _mock_gcloud_location: mock.MagicMock,
     tmp_path: pathlib.Path,
 ) -> None:
-    # Nothing in the env chain and no gcloud default: the run must land on
-    # "global", not a region — the -preview model ids 404 on regional endpoints.
+    # Nothing in the env chain: the run must land on "global", not a region —
+    # the -preview model ids 404 on regional endpoints. A gcloud compute/region
+    # is a Compute setting, so it must not be consulted even when one is set.
     mock_home.return_value = tmp_path
-    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
-    mock_run.side_effect = lambda *args, **kwargs: (
-        _write_sample_transcript(kwargs.get("cwd") or tmp_path),
-        mock_run.return_value,
-    )[1]
+    agy_done = SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[0] == "gcloud":
+            value = "us-central1" if "compute/region" in argv else "proj-gcloud"
+            return SimpleNamespace(args=argv, returncode=0, stdout=value, stderr="")
+        cwd = kwargs.get("cwd")
+        _write_sample_transcript(cwd if isinstance(cwd, pathlib.Path) else tmp_path)
+        return agy_done
+
+    mock_run.side_effect = fake_run
 
     config = agents_config.AgentConfig(target="/bin/agy", model="gemini-3.5-flash")
     with mock.patch.dict(os.environ, {}, clear=True):
         agy_mod.AgyCliAgent(config)._execute("run task")
 
+    argvs = [c.args[0] for c in mock_run.call_args_list]
+    assert not any("compute/region" in argv for argv in argvs)
     overlay = mock_run.call_args.kwargs["extra_env"]
     assert overlay["GOOGLE_CLOUD_LOCATION"] == "global"
     assert overlay["GCP_LOCATION"] == "global"
 
 
-@mock.patch.object(agy_mod, "_get_gcloud_location", return_value="us-west9")
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_execute_ignores_the_cluster_zone_for_routing(
     mock_run: mock.MagicMock,
     mock_home: mock.MagicMock,
-    mock_gcloud_location: mock.MagicMock,
     tmp_path: pathlib.Path,
 ) -> None:
     # GCP_LOCATION is the deployers' cluster *zone* and is not read for routing;
@@ -456,8 +461,6 @@ def test_agy_cli_agent_execute_ignores_the_cluster_zone_for_routing(
     overlay = mock_run.call_args.kwargs["extra_env"]
     assert overlay["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
     assert overlay["GCP_LOCATION"] == "europe-west4"
-    # A configured host must not pay for the gcloud subprocess at all.
-    mock_gcloud_location.assert_not_called()
 
 
 def _write_sample_transcript(

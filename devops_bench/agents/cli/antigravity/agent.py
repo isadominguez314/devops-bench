@@ -29,7 +29,7 @@ from devops_bench.agents import config as agents_config
 from devops_bench.agents import result as agents_result
 from devops_bench.agents.cli.antigravity import parsing
 from devops_bench.agents.shared import cli_capabilities
-from devops_bench.agents.shared.vertex_env import vertex_location
+from devops_bench.agents.shared.vertex_env import vertex_location, vertex_project
 from devops_bench.core import subprocess as devops_subprocess
 
 if TYPE_CHECKING:
@@ -158,22 +158,6 @@ def _get_gcloud_project() -> str | None:
     return result.stdout.strip() or None
 
 
-def _get_gcloud_location() -> str | None:
-    """Retrieve the default region from gcloud config if available."""
-    try:
-        result = devops_subprocess.run(
-            ["gcloud", "config", "get-value", "compute/region"],
-            check=False,
-            timeout=_GCLOUD_LOOKUP_TIMEOUT_SEC,
-        )
-    except (OSError, core.SubprocessError) as exc:
-        _log.debug("gcloud location lookup failed: %s", exc)
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
-
-
 @base.AGENTS.register("antigravity")
 class AgyCliAgent(base.AgentHarness):
     """Antigravity CLI agent harness driving the ``agy`` binary.
@@ -220,24 +204,13 @@ class AgyCliAgent(base.AgentHarness):
             agy_config_dir.mkdir(parents=True, exist_ok=True)
 
             # Resolve project and location
-            project = (
-                os.environ.get("GOOGLE_CLOUD_PROJECT")
-                or os.environ.get("GCP_PROJECT")
-                or _get_gcloud_project()
-            )
+            project = vertex_project() or _get_gcloud_project()
             if project:
                 env_overlay["GOOGLE_CLOUD_PROJECT"] = project
                 env_overlay["GCP_PROJECT"] = project
 
-            # Shared with the Gemini CLI harness so the two cannot drift; the
-            # gcloud lookup stays a lazy fallback, consulted only when the env
-            # chain is empty.
-            location = vertex_location(fallback=_get_gcloud_location)
+            location = vertex_location()
             env_overlay["GOOGLE_CLOUD_LOCATION"] = location
-            # Written but deliberately not *read* back (see vertex_env): agy's
-            # own GCP tooling has always been handed this spelling, and dropping
-            # it is a behavior change for the binary, not a routing fix. It only
-            # ever reaches the agy subprocess, never the deployers.
             env_overlay["GCP_LOCATION"] = location
 
             # Explicit gemini_dir keeps agy on the workspace settings, not real HOME.
