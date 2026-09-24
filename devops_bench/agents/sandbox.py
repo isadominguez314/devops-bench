@@ -14,48 +14,28 @@
 
 """Run the agent-under-test inside a container with a scoped view of the world.
 
-WHY THIS EXISTS. CLI agent harnesses invoke the agent binary as a plain
-subprocess inheriting the operator's filesystem and environment, so the agent
-can reach the benchmark's own material: ``tasks/**/task.yaml`` (the judge
-rubric and ``verification_spec`` — the answer key), scoring and detection
-code, prior results, the operator's cloud credentials and admin kubeconfig.
-The detection layer is a tripwire, not a boundary; this module is the
-boundary. Two observed incidents shaped it: an agent that used the admin
-kubeconfig to run a privileged pod and read the bench checkout through the
-node's host disk, and an agent that mined the harness VM's cloud identity
-from the link-local metadata endpoint when its model credential was missing.
+Ambient CLI agents inherit the operator's filesystem and environment — the
+benchmark's own answer material (task rubrics, scoring code, prior results)
+and the operator's cloud credentials and admin kubeconfig. Detection is a
+tripwire; this module is the boundary. The container sees exactly four
+things: the per-run workspace at ``/workspace`` (``HOME`` repointed under
+it), the task's seeded fixtures, a generated single-cluster kubeconfig
+read-only at ``/creds/kubeconfig``, and a deny-filtered env overlay passed
+as name-only ``-e`` flags so no secret ever sits in the argv. A sandbox that
+cannot be built raises :class:`~devops_bench.core.errors.SandboxError`
+instead of quietly running the agent on the host.
 
-The container sees exactly four things, and what is ABSENT matters more than
-what is present:
-
-* the per-run **workspace** at ``/workspace``, with ``HOME`` repointed to
-  ``/workspace/home`` so a bare ``~`` cannot resolve to the operator's profile
-* the task's own seeded **fixtures**, mounted read-write under the container
-  home (see :func:`discover_fixture_mounts`) — task input, not answer material
-* a generated single-cluster **kubeconfig**, read-only at ``/creds/kubeconfig``:
-  one cluster, one context, no ``exec:`` plugin blocks, never the operator's
-  own kubeconfig or Application Default Credentials
-* an explicit **env overlay** after a deny filter — never scraped from
-  ``os.environ``, and never inline in the argv: the flags are name-only
-  ``-e``, with values delivered through the docker client's environment so
-  a provider API key cannot surface in the world-readable command line, in
-  logs, or in a rendered error message
-
-Never in the container: the repo checkout, ``results/``, operator ``$HOME``,
-gcloud config, Terraform state, or the Docker socket (with the socket the
-boundary would be decorative, and it is tempting precisely because a kind
-cluster is Docker-hosted).
-
-Completeness is a security property: an under-provisioned agent improvises
-rather than giving up (observed: a missing fixture mount escalated to a
-privileged pod reading the bench checkout through the node's host disk), so
-refusal here is always loud — a sandbox that cannot be built raises
-:class:`~devops_bench.core.errors.SandboxError` instead of quietly running
-the agent on the host.
+Known limits of this seam, closed by follow-ups in the same stack: the
+kubeconfig still carries the operator's cluster-admin certificate (the
+credential-scoping follow-up replaces it with a namespace-scoped
+ServiceAccount token), and on a cloud VM the link-local metadata endpoint is
+still routable from the container (the metadata-credential follow-up removes
+the reason to reach it).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -83,35 +63,29 @@ __all__ = [
     "discover_fixture_mounts",
     "filter_boundary_env",
     "container_name_for_workspace",
+    "image_digest",
     "kill_container",
     "sweep_stray_containers",
 ]
 
 _log = get_logger("agents.sandbox")
 
-# Opt-in switch and image selector. Opt-in rather than default so sandboxed
-# runs can be A/B'd against the current ambient behaviour; with the switch
-# unset the harness must behave byte-for-byte as before this module existed.
+# Opt-in (not default) so sandboxed runs can be A/B'd against ambient ones;
+# unset must be byte-for-byte the pre-sandbox behavior.
 SANDBOX_ENV = "BENCH_AGENT_SANDBOX"
 IMAGE_ENV = "BENCH_SANDBOX_IMAGE"
 _SANDBOX_ENABLED_VALUES = frozenset({"docker", "1", "true"})
-# Values that mean "off" on purpose. Anything outside both sets raises: an
-# operator who typed ``yes`` believes the run is contained, and silently
-# running ambient is exactly the quiet degrade this module promises never to
-# do — the matrix runner also forwards the raw value to detached runners, so
-# one typo would otherwise become a whole unsandboxed matrix.
+# Explicit off-values; anything else raises rather than silently running
+# ambient under an operator who typed e.g. ``yes``.
 _SANDBOX_DISABLED_VALUES = frozenset({"", "0", "false", "no", "off"})
 
-# Env override naming this run's fixtures explicitly, as ``:``-separated host
-# paths. Set it for a stack whose fixture name does not carry the cluster
-# token that :func:`discover_fixture_mounts` keys off.
+# ``:``-separated host paths naming this run's fixtures explicitly, for
+# stacks whose fixture names don't carry the cluster token.
 FIXTURES_ENV = "BENCH_AGENT_FIXTURES"
 
-# Container-side geography. HOME lives *under* the workspace so everything the
-# agent writes lands in the one host directory the harness already diffs and
-# collects, while a prompt's ``~/<name>`` resolves somewhere the harness
-# controls. The kubeconfig lives outside the workspace mount so the read-only
-# bind is the only path to it.
+# HOME lives under the workspace so agent writes land in the one host
+# directory the harness diffs and collects; the kubeconfig lives outside it
+# so the read-only bind is the only path to the credential.
 CONTAINER_WORKSPACE = "/workspace"
 CONTAINER_HOME = f"{CONTAINER_WORKSPACE}/home"
 CONTAINER_KUBECONFIG = "/creds/kubeconfig"
@@ -141,22 +115,13 @@ _MAX_CONTAINER_ID = 2**31 - 1
 _REMAP_UID = 1000
 _REMAP_GID = 1000
 
-# Every sandboxed container this harness starts carries this name prefix,
-# followed by its run workspace's own directory name (see
-# ``container_name_for_workspace``). The prefix is what lets
-# ``sweep_stray_containers`` find and reap containers this harness itself
-# created, and only those: a name match is the entire authorization to kill
-# something, so it must never be able to match a container this harness did
-# not start.
+# A name match is the entire authorization to kill a container, so this
+# prefix must never match a container this harness did not start.
 _CONTAINER_NAME_PREFIX = "devops-bench-agent-"
 
-# Env vars that never cross the boundary, even when present in the caller's
-# resolved overlay. Exact names cover the operator's cloud identity plumbing
-# and the two variables the executor itself owns inside the container;
-# prefixes cover the benchmark's own configuration (``BENCH_*`` includes this
-# module's switches), Terraform state/credential plumbing, and every cloud's
-# credential env family — the boundary is vendor-neutral, so the deny list
-# must be too, not just the one cloud this benchmark happens to run on today.
+# Never cross the boundary even when present in the caller's overlay:
+# operator cloud identity by exact name, benchmark/Terraform/cloud-credential
+# families by prefix (vendor-neutral deny list for a vendor-neutral boundary).
 _DENIED_ENV_NAMES = frozenset(
     {
         "CLOUDSDK_CONFIG",
@@ -168,46 +133,30 @@ _DENIED_ENV_NAMES = frozenset(
 )
 _DENIED_ENV_PREFIXES = ("BENCH_", "TF_", "AWS_", "AZURE_", "ARM_")
 
-# Variables the executor itself owns inside the container. Unlike the deny
-# list above these are not even allowlistable: docker's last ``-e`` wins, so
-# an overlay value crossing for one of these would repoint HOME / KUBECONFIG /
-# PATH *inside* the boundary — redirecting the agent's home or credential
-# resolution is never a legitimate per-task need.
+# Executor-owned inside the container; not even allowlistable, since a
+# crossing value would repoint HOME/KUBECONFIG/PATH inside the boundary.
 _CONTAINER_OWNED_ENV = frozenset({"HOME", "KUBECONFIG", "PATH"})
 
-# Apiserver hostnames that mean "this machine" and therefore mean the wrong
-# machine once the agent is inside a container. ``0.0.0.0`` is a bind-any
-# address rather than a destination, but kubeconfigs in the wild carry it and
-# it is no more routable from the container than the others.
+# Apiserver hosts that resolve to the container itself once sandboxed;
+# ``0.0.0.0`` is a bind address, but real kubeconfigs carry it and it is
+# equally unroutable from the container.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
+# Bound on the module's own docker/kubectl housekeeping calls, so a wedged
+# daemon cannot hang a reap (and with it the whole batch).
+_HOUSEKEEPING_TIMEOUT_SEC = 30
 
 
 @dataclass(frozen=True)
 class SandboxSpec:
     """Everything the executor needs to wrap one run's agent in ``docker run``.
 
-    Built in two stages: :func:`spec_from_env` yields a skeletal spec (image
-    only) that records the operator's opt-in on the
-    :class:`~devops_bench.agents.config.AgentConfig`, and the eval harness
-    completes it per task — workspace, kubeconfig, network plan, fixture
-    mounts only exist after provisioning. :class:`SandboxExecutor` refuses an
-    incomplete spec rather than guessing.
-
-    Attributes:
-        image: Container image holding the agent CLI (``BENCH_SANDBOX_IMAGE``).
-        network: The run's :class:`NetworkPlan`.
-        workspace: Host path of the per-run workspace, mounted read-write at
-            ``/workspace``.
-        kubeconfig: Host path of the generated agent kubeconfig, mounted
-            read-only at ``/creds/kubeconfig``.
-        fixture_mounts: Host path -> container path of the task's seeded
-            fixtures, mounted READ-WRITE (see :func:`discover_fixture_mounts`).
-        env_allowlist: Variable names explicitly permitted to cross even when
-            they match a deny rule (e.g. a task that legitimately needs one
-            ``TF_VAR``). The container-owned ``HOME``/``KUBECONFIG``/``PATH``
-            are excepted — never crossable, allowlisted or not. Everything
-            else in the caller's overlay crosses unless denied; nothing
-            outside the overlay ever crosses.
+    :func:`spec_from_env` yields a skeletal spec (image only); the eval
+    harness completes it per task once the workspace and cluster exist.
+    ``fixture_mounts`` maps host path -> container path, mounted read-write.
+    ``env_allowlist`` names vars permitted to cross despite a deny rule
+    (container-owned ``HOME``/``KUBECONFIG``/``PATH`` excepted — never
+    crossable).
     """
 
     image: str = ""
@@ -219,22 +168,10 @@ class SandboxSpec:
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
-    """Read the sandbox opt-in from the environment.
+    """Read the sandbox opt-in; ``None`` when unset or explicitly off.
 
-    Args:
-        env: Optional mapping to read from (defaults to ``os.environ``),
-            matching :meth:`AgentConfig.from_env`'s injection seam.
-
-    Returns:
-        A skeletal :class:`SandboxSpec` when ``BENCH_AGENT_SANDBOX`` is one of
-        ``docker``/``1``/``true``; ``None`` when it is unset or an explicit
-        off value (``0``/``false``/``no``/``off``). The image may legitimately
-        still be empty here; the executor is where that fails loud.
-
-    Raises:
-        SandboxError: On any other value. An unrecognized spelling (``yes``,
-            ``podman``) must not silently run the agent ambient while the
-            operator believes it is contained.
+    Raises :class:`SandboxError` on an unrecognized value — a typo must not
+    silently run the agent ambient.
     """
     raw = (get_env(SANDBOX_ENV, env=env) or "").strip().lower()
     if raw in _SANDBOX_ENABLED_VALUES:
@@ -251,38 +188,19 @@ def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
 def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> NetworkPlan:
     """Build the :class:`NetworkPlan` for this run's cluster.
 
-    Two stages, and the split is what keeps per-provider knowledge out of this
-    module. First the provider answers
-    :meth:`~devops_bench.providers.base.Provider.sandbox_network_plan` with
-    whatever only it can know — a Docker network to join, an in-network
-    hostname, the name of the context it wrote. Then this function applies the
-    one rewrite that needs no provider knowledge at all: a server on host
-    loopback is meaningless from inside a container (it resolves to the
-    container), so it is remapped to ``host.docker.internal``, which
-    :meth:`SandboxExecutor.wrap_argv` always maps to the host gateway.
-
-    That generic step is why most providers need no override. A cloud endpoint
-    routes already and is left alone; a locally-published one is rewritten
-    whether it belongs to kind, a vcluster on a laptop, or something not
-    written yet.
+    The provider contributes what only it knows (network, hostname, context
+    pin); this module then applies the one provider-agnostic rewrite: a host
+    loopback server is remapped to ``host.docker.internal``, which is why
+    most providers need no override.
 
     Args:
-        provider: The run's provider, or ``None`` when the deployer has none
-            (the no-op deployer). ``None`` yields the default plan, built
-            against the ambient current-context — acceptable only because such
-            a run has no cluster identity of its own to pin to.
-        cluster_info: The provisioned cluster the container must reach.
-
-    Returns:
-        The plan for this run, with any loopback server already rewritten.
+        provider: ``None`` (no-op deployer) yields the default plan against
+            the ambient current-context.
 
     Raises:
-        SandboxError: When a provider-backed plan carries no context pin, when
-            the provider names a context kubectl does not know (a kubeconfig
-            that never saw this cluster), or when no server URL can be read
-            for a plan that does not supply its own. Refusing beats running
-            against a server the container cannot reach — or handing it
-            credentials for a different cluster entirely.
+        SandboxError: A provider-backed plan carries no context pin, the
+            provider named a context kubectl does not know, or no server URL
+            could be read for a plan without its own rewrite.
     """
     plan = provider.sandbox_network_plan(cluster_info) if provider is not None else NetworkPlan()
     if provider is not None and not plan.kubectl_context:
@@ -300,7 +218,12 @@ def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> 
         )
     if plan.kubectl_context:
         known = (
-            run(["kubectl", "config", "get-contexts", "-o", "name"], check=False).stdout or ""
+            run(
+                ["kubectl", "config", "get-contexts", "-o", "name"],
+                check=False,
+                timeout=_HOUSEKEEPING_TIMEOUT_SEC,
+            ).stdout
+            or ""
         ).split()
         if plan.kubectl_context not in known:
             raise SandboxError(
@@ -314,23 +237,11 @@ def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> 
 def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     """Remap a loopback apiserver URL to the host gateway, or pass the plan through.
 
-    ``127.0.0.1`` inside a container is the container, so a kubeconfig
-    published on loopback silently points the agent at nothing. Docker exposes
-    the host as ``host.docker.internal`` (natively on Docker Desktop, via the
-    ``--add-host`` :meth:`SandboxExecutor.wrap_argv` always passes on Linux),
-    so the port still reaches the same listener.
-
-    The apiserver certificate will not carry that name, so ``tls-server-name``
-    is redirected — to whatever the source kubeconfig already declared when it
-    declares one (a cluster that needed an override outside the sandbox needs
-    the same one inside), and otherwise to ``localhost``, the SAN a
-    loopback-published cluster does have. That keeps TLS verified rather than
-    disabled: the container still checks the certificate chain and the name,
-    just against the name the certificate was actually issued for.
-
-    A plan that already carries a ``rewrite_server`` is returned untouched: the
-    provider knew better (kind's in-network control-plane name verifies with
-    no override at all).
+    Loopback inside a container is the container; ``host.docker.internal``
+    reaches the same host listener. ``tls-server-name`` becomes the override
+    the source kubeconfig already declared, else ``localhost`` — the SAN a
+    loopback-published cluster does have — so TLS stays verified rather than
+    disabled. A plan already carrying ``rewrite_server`` is left untouched.
     """
     if plan.rewrite_server:
         return plan
@@ -363,37 +274,15 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
 def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
     """Find this run's seeded task fixtures and map them into the container.
 
-    A task's stack seeds its inputs next to the operator's home — a GitOps
-    repo (``~/opa-repo-<cluster>.git``), a delivered advisory, a rightsizing
-    report — and the prompt then points the agent at ``~/<name>``. The
-    container repoints ``HOME`` and mounts neither the real home nor the
-    repository, so without this the agent is told to read a file that cannot
-    exist for it. That is not containment, it is a broken task: the fixture is
-    task INPUT, not answer material.
-
-    It is also a containment problem in its own right (the first observed
-    incident in the proposal doc): agents hunt the filesystem for the missing
-    fixture, and the ones that hunt hardest escalate. Giving the agent the
-    input it was promised removes the reason to go looking.
-
-    Eligibility is deliberately narrow: only paths whose NAME carries the
-    run-unique ``cluster_name`` token match, and only at the top level of the
-    home directory. So this can surface artifacts this run's own stack created
-    and nothing else — not the operator's unrelated files, and not a
-    concurrent run's fixtures. ``BENCH_AGENT_FIXTURES`` overrides the search
-    for a stack that names its fixtures some other way.
-
-    Args:
-        cluster_name: The run's cluster name, used as the discriminating token.
-
-    Returns:
-        Host path -> container path (under ``/workspace/home``, so a prompt's
-        ``~/<name>`` resolves to exactly the mounted fixture). Empty when
-        nothing matches, the normal case for tasks that seed no files.
-
-    Raises:
-        SandboxError: When two declared fixtures share a basename and would
-            collide on one container mount point.
+    Task stacks seed inputs in the operator's home (``~/opa-repo-<cluster>.git``)
+    and the prompt points the agent at ``~/<name>``; the container mounts
+    neither the real home nor the repo, so without this the task is broken —
+    and an under-provisioned agent hunts the filesystem instead of giving up.
+    Only top-level entries whose name carries ``cluster_name`` as a
+    ``-``/``_``/``.``-delimited token match (dot-entries excluded), so a short
+    or reused name cannot sweep in the operator's unrelated files.
+    ``BENCH_AGENT_FIXTURES`` overrides the search. Raises
+    :class:`SandboxError` on a container-path collision.
     """
     explicit = (get_env(FIXTURES_ENV) or "").strip()
     if explicit:
@@ -404,9 +293,15 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
         home = Path.home()
         if not home.is_dir():
             return {}
-        # Top level only, and the name must carry the token. A recursive walk
-        # would widen this well past "artifacts of this run".
-        candidates = sorted(home.glob(f"*{cluster_name}*"))
+        # pathlib's glob matches dotfiles and substrings: bare *<name>* with
+        # cluster "dev" would RW-mount ~/devops-bench. Require a separator
+        # boundary and skip hidden entries.
+        token = re.compile(rf"(^|[-_.]){re.escape(cluster_name)}([-_.]|$)")
+        candidates = sorted(
+            p
+            for p in home.glob(f"*{cluster_name}*")
+            if not p.name.startswith(".") and token.search(p.name)
+        )
 
     mounts: dict[str, str] = {}
     dest_owner: dict[str, str] = {}
@@ -416,10 +311,8 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
             continue
         host_path = str(path.resolve())
         container_path = f"{CONTAINER_HOME}/{path.name}"
-        # Two host paths sharing a basename (only reachable through the
-        # explicit override; glob candidates share one directory) would emit
-        # two ``-v`` flags with the same destination, which docker aborts on
-        # with a cryptic "Duplicate mount point". Refuse with the actual paths.
+        # Same basename twice would emit two -v flags with one destination,
+        # which docker aborts on with a cryptic "Duplicate mount point".
         if container_path in dest_owner and dest_owner[container_path] != host_path:
             raise SandboxError(
                 f"fixture name collision: {dest_owner[container_path]} and {host_path} "
@@ -480,27 +373,11 @@ def filter_boundary_env(
 ) -> dict[str, str]:
     """Filter a resolved env overlay down to what may cross the boundary.
 
-    Only the caller's overlay is ever considered — this function is the single
-    place boundary env is decided, and it deliberately has no access to
-    ``os.environ``: scraping the process environment for well-known credential
-    names would reinstate "inherit whatever the operator happened to export",
-    the exact behaviour the sandbox removes. Within the overlay, names
-    matching the deny rules (operator cloud identity, ``BENCH_*``/``TF_*``)
-    are dropped with a warning unless explicitly allowlisted — except the
-    container-owned ``HOME``/``KUBECONFIG``/``PATH``, which never cross, not
-    even allowlisted: docker's last ``-e`` wins, so a crossing value would
-    override the executor's own inside the container.
-
-    Args:
-        overlay: The resolved per-run env overlay (provider-routed API key,
-            model selection, agent toggles), or ``None``.
-        allowlist: Names permitted to cross despite matching a deny rule
-            (container-owned names excepted).
-
-    Returns:
-        The filtered mapping that crosses the boundary: its names become the
-        name-only ``-e`` flags, its values ride the docker client's
-        environment (never the argv).
+    Only the caller's overlay is considered — never ``os.environ``, which
+    would reinstate credential inheritance. Denied names drop with a warning
+    unless allowlisted; container-owned names never cross. The returned
+    names become name-only ``-e`` flags, the values ride the docker client's
+    environment (never the argv).
     """
     kept: dict[str, str] = {}
     for name, value in (overlay or {}).items():
@@ -521,13 +398,10 @@ class SandboxExecutor:
     """Executes one run's agent commands inside ``docker run``.
 
     Signature-compatible with :func:`devops_bench.core.subprocess.run`, so a
-    harness swaps a direct subprocess call for
-    ``AgentHarness.run_agent_cmd(...)`` and everything else — return shape,
-    ``check`` semantics, timeout behaviour — stays the same.
-
-    One executor serves one run: the container name is derived from the
-    workspace directory name, so a reaper can find a stray container purely
-    from its name (see :func:`sweep_stray_containers`).
+    harness swaps a direct subprocess call for ``run_agent_cmd`` and the
+    return shape, ``check`` semantics, and timeout behavior stay the same.
+    One executor serves one run; the container name derives from the
+    workspace directory name so a reaper can find strays by name alone.
     """
 
     def __init__(self, spec: SandboxSpec) -> None:
@@ -547,7 +421,7 @@ class SandboxExecutor:
         self.container_name = container_name_for_workspace(self._workspace)
 
     def map_host_path(self, path: str | os.PathLike[str]) -> str:
-        """Map a host path under this executor's workspace to its container path."""
+        """Map a workspace-relative host path into the container; raise outside it."""
         return container_path(self._workspace, path)
 
     def _needs_id_remap(self) -> bool:
@@ -644,29 +518,17 @@ class SandboxExecutor:
     ) -> list[str]:
         """Wrap an agent command line in ``docker run``.
 
-        Boundary decisions encoded here, in order of appearance: ``--rm`` so a
-        cleanly-exiting container leaves nothing behind; a deterministic
-        ``--name`` so an unclean one can be reaped; ``--cap-drop=ALL`` with
-        ``no-new-privileges`` because nothing in the image needs a capability
-        (node, kubectl, helm, git are plain userland) and a setuid binary in
-        the base image must not re-escalate — this is also what contains the
-        macOS case, where no ``--user`` is emitted and the process runs as
-        root; the network plan;
-        ``host.docker.internal:host-gateway`` always, so loopback-published
-        endpoints resolve on Linux the way Docker Desktop resolves them
-        natively; ``--user`` on Linux only, so workspace files stay
-        operator-owned (Docker Desktop already remaps ownership on macOS); the
-        four-mount set (workspace RW, kubeconfig RO, fixtures RW — the write
-        bit is deliberate, several tasks ask the agent to commit its fix back
-        to the seeded repo); the filtered env overlay as **name-only** ``-e``
-        flags whose values travel through the docker client's environment,
-        never the argv (the argv is world-readable in ``/proc`` and rendered
-        into error messages, so an inline API key would leak on every
-        timeout); then the container-owned ``HOME``/``KUBECONFIG`` last —
-        inline, their values are non-secret constants — so they win any
-        duplicate ``-e``; and **no ``-i``** — keeping stdin open gives the
-        agent an open, non-TTY stdin to block on, and a headless prompt run
-        never reads it.
+        Flag by flag: ``--rm`` (clean exit leaves nothing) with a
+        deterministic ``--name`` (unclean exit is reap-able);
+        ``--cap-drop=ALL`` + ``no-new-privileges`` (nothing in the image
+        needs a capability; contains the root-running macOS case);
+        the network plan; ``host.docker.internal:host-gateway`` (loopback
+        endpoints resolve on Linux); ``--user`` on Linux (workspace files
+        stay operator-owned); workspace RW, kubeconfig RO, fixtures RW
+        (tasks commit fixes back); overlay env as name-only ``-e`` (values
+        ride the client env, never the world-readable argv); container-owned
+        ``HOME``/``KUBECONFIG`` inline and last (non-secret constants,
+        last ``-e`` wins); no ``-i`` (a headless run never reads stdin).
         """
         spec = self.spec
         argv: list[str] = ["docker", "run", "--rm", "--name", self.container_name]
@@ -685,18 +547,8 @@ class SandboxExecutor:
         argv += ["-v", f"{spec.kubeconfig}:{CONTAINER_KUBECONFIG}:ro"]
         for host_path, container_path in spec.fixture_mounts.items():
             argv += ["-v", f"{host_path}:{container_path}"]
-        # Name-only ``-e`` flags: docker reads each value from the docker
-        # *client's* environment (populated by ``run()``), so provider API
-        # keys never sit in the argv — which is world-readable in
-        # /proc/<pid>/cmdline for the whole run and rendered verbatim into
-        # SubprocessError messages and the harness log on timeout.
         for name in filter_boundary_env(extra_env, spec.env_allowlist):
             argv += ["-e", name]
-        # Container-owned env comes AFTER the overlay and stays inline: the
-        # values are non-secret constants, name-only would read the *host's*
-        # HOME/KUBECONFIG instead, and docker's last ``-e`` wins — so even a
-        # filter regression could not let an overlay value repoint HOME or
-        # the credential path inside the boundary.
         argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
         argv.append(spec.image)
@@ -718,25 +570,18 @@ class SandboxExecutor:
     ) -> CompletedProcess:
         """Run ``cmd`` in the sandbox container; mirrors ``core.subprocess.run``.
 
-        Two parameters are rejected rather than reinterpreted, because both
-        would silently widen the boundary or lie to the caller:
-
-        * ``env`` replaces the whole child environment in the host ``run``;
-          forwarding a full mapping (typically a copy of ``os.environ``) is
-          exactly the credential-inheritance channel the sandbox removes.
-        * ``input`` needs an open stdin, and the container deliberately runs
-          without ``-i``; accepting it would drop the data on the floor.
-
-        The container is reaped by name on every exit path. ``--rm`` only
-        removes a container once *the container's own process* exits; a
-        ``docker run`` client killed out from under it (exactly what happens
-        when the host-side timeout fires) leaves the container running in the
-        daemon, silently burning whatever quota the agent inside is still
-        spending. The ``finally`` closes that, and killing an already-gone
-        container is a harmless no-op.
+        ``env`` is rejected (a full environment is the credential-inheritance
+        channel the sandbox removes) and so is ``input`` (the container runs
+        without stdin). Docker's own failures — a missing binary, or the
+        daemon-reserved exit 125 (image or network absent) — raise
+        :class:`SandboxError` instead of masquerading as an agent exit code.
+        The container is reaped by name on every exit path, because ``--rm``
+        does not fire when the docker client is killed by the host-side
+        timeout.
 
         Raises:
-            SandboxError: On ``env``/``input``, or an unmappable ``cwd``.
+            SandboxError: On ``env``/``input``, an unmappable ``cwd``, or a
+                docker-level launch failure.
             SubprocessError: On timeout, or non-zero exit when ``check``.
         """
         if env is not None:
@@ -748,26 +593,34 @@ class SandboxExecutor:
             raise SandboxError(
                 "the sandboxed agent runs without stdin (no -i, by design); input= is unsupported"
             )
-        # Filter once: the crossing set is both the name-only ``-e`` flags in
-        # the argv (wrap_argv re-filters, a no-op on this pre-filtered
-        # mapping) and the values handed to the docker client process, which
-        # is where name-only ``-e`` reads them from. Values live in the
-        # client's /proc/<pid>/environ (same-uid/root-readable), never its
-        # world-readable cmdline.
+        # Filter once: the same mapping supplies the name-only -e flags and
+        # the values handed to the docker client process (its /proc environ
+        # is same-uid-readable, unlike its cmdline).
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
         remap = sys.platform.startswith("linux") and self._needs_id_remap()
         if remap:
             self._chown_before_remap()
         try:
-            return run(
-                wrapped,
-                extra_env=crossing,
-                check=check,
-                capture=capture,
-                text=text,
-                timeout=timeout,
-            )
+            try:
+                completed = run(
+                    wrapped,
+                    extra_env=crossing,
+                    check=check,
+                    capture=capture,
+                    text=text,
+                    timeout=timeout,
+                )
+            except OSError as exc:
+                raise SandboxError(f"docker is unavailable: {exc}") from exc
+            # 125 is the docker daemon's own failure code (missing image,
+            # missing network); with check=False it would otherwise be
+            # scored as the agent exiting 125.
+            if completed.returncode == 125:
+                raise SandboxError(
+                    f"docker could not start the sandbox container: {completed.stderr}"
+                )
+            return completed
         finally:
             try:
                 kill_container(self.container_name)
@@ -777,12 +630,10 @@ class SandboxExecutor:
 
 
 def container_name_for_workspace(workspace: Path) -> str:
-    """Deterministic ``docker run --name`` for one run's sandboxed agent.
+    """Deterministic container name tied 1:1 to the run's workspace directory.
 
-    Ties the container 1:1 to the run's own workspace directory name (already
-    unique per run: it comes from ``mint_dir(...)`` / ``TemporaryDirectory``),
-    so a reaper can find and kill a stray container purely from its name,
-    without threading a separate run id through the agent harness.
+    An optional ``BENCH_AGENT_SANDBOX_OWNER`` segment scopes the name to one
+    attempt so parallel harnesses can sweep only their own strays.
     """
     owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
     if owner and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
@@ -790,23 +641,63 @@ def container_name_for_workspace(workspace: Path) -> str:
     return f"{_CONTAINER_NAME_PREFIX}{owner + '-' if owner else ''}{workspace.name}"
 
 
-def kill_container(name: str) -> None:
-    """Best-effort ``docker kill`` by name. Never raises.
+def image_digest(image: str) -> str | None:
+    """Resolve ``image`` to a content digest for the run manifest. Never raises.
 
-    A container that is already gone (the common case, when the agent exited
-    cleanly and ``--rm`` already reaped it) fails harmlessly.
+    Prefers the first ``RepoDigests`` entry — the registry-anchored identity
+    that survives across hosts — and falls back to the local image ID (the
+    config hash) for an image that was only ever built locally and has no
+    repo digest. Both are content-addressed; either one turns "we ran
+    ``agent-sandbox:dev``" from a mutable-tag claim into evidence.
+
+    Best-effort by design: provenance must never sink a finished run, so a
+    missing docker binary, an unknown image, or malformed inspect output all
+    log and return ``None`` — and the manifest records the absence honestly.
+
+    Args:
+        image: The image reference the run used (tag or digest form).
+
+    Returns:
+        A ``repo@sha256:...`` or ``sha256:...`` string, or ``None``.
     """
-    result = run(["docker", "kill", name], check=False)
+    completed = run(["docker", "image", "inspect", image], check=False)
+    if completed.returncode != 0:
+        _log.warning(
+            "could not resolve a digest for sandbox image %s; the manifest will "
+            "carry the tag only (%s)",
+            image,
+            (completed.stderr or "").strip() or "docker image inspect failed",
+        )
+        return None
+    try:
+        inspected = json.loads(completed.stdout or "[]")
+        first = inspected[0]
+        repo_digests = first.get("RepoDigests") or []
+        digest = repo_digests[0] if repo_digests else first.get("Id")
+    except (json.JSONDecodeError, IndexError, AttributeError, TypeError):
+        _log.warning("unexpected docker inspect output for sandbox image %s", image)
+        return None
+    return digest or None
+
+
+def kill_container(name: str) -> None:
+    """Best-effort, time-bounded ``docker kill`` by name. Never raises."""
+    try:
+        result = run(["docker", "kill", name], check=False, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+    except (OSError, SubprocessError):
+        _log.warning("could not reap sandbox container %s", name, exc_info=True)
+        return
     if result.returncode == 0:
         _log.info("reaped sandbox container %s", name)
 
 
 def sweep_stray_containers() -> None:
-    """Reap only the explicitly selected attempt's leftovers.
+    """Reap only the current attempt's leftovers; best-effort against docker failures.
 
-    A shared name prefix is not proof that another process has exited. Legacy
-    unscoped containers require explicit operator recovery; never sweep them here.
-    The owner ID must be unique per attempt and must not be reused concurrently.
+    A shared name prefix is not proof another process has exited: without an
+    owner id (``BENCH_AGENT_SANDBOX_OWNER``) a stray cannot be told apart from
+    a parallel harness's live container, so unscoped containers are left for
+    explicit operator recovery rather than swept here.
     """
     owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
     if not owner:
@@ -814,7 +705,15 @@ def sweep_stray_containers() -> None:
     if not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
         raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
     prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-"
-    listed = run(["docker", "ps", "--format", "{{.Names}}"], check=False)
+    try:
+        listed = run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            check=False,
+            timeout=_HOUSEKEEPING_TIMEOUT_SEC,
+        )
+    except (OSError, SubprocessError):
+        _log.warning("could not list stray sandbox containers", exc_info=True)
+        return
     if listed.returncode != 0:
         return
     for name in (listed.stdout or "").splitlines():

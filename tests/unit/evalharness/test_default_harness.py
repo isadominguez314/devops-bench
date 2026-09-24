@@ -350,7 +350,7 @@ def test_run_one_returns_failed_record_when_get_deployer_raises(
     monkeypatch.setattr(harness_default, "get_deployer", _boom)
     task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
 
-    record = harness._run_one(task, tmp_path)  # noqa: SLF001
+    record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
     assert "unknown deployer type" in record["error"]
@@ -386,7 +386,7 @@ def test_run_one_collects_files_the_agent_writes_to_its_workspace(
         run_dir = tmp_path / "run_1"
         run_dir.mkdir()
 
-        record = harness._run_one(task, run_dir)  # noqa: SLF001
+        record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
 
         assert record["status"] == "success"
         generated = run_dir / "generated_files" / "output.txt"
@@ -394,6 +394,42 @@ def test_run_one_collects_files_the_agent_writes_to_its_workspace(
         assert generated.read_text() == "agent wrote this"
     finally:
         AGENTS._items.pop("fake-workspace-writer", None)  # noqa: SLF001
+
+
+class _HomeWritingAgent(AgentHarness):
+    """Stand-in agent that writes its deliverable under the sandbox home."""
+
+    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        assert workspace_path is not None
+        home = workspace_path / "home"
+        home.mkdir(exist_ok=True)
+        (home / "report.md").write_text("written to ~")
+        return AgentResult(output="done", trajectory=[])
+
+
+def test_run_one_collects_files_the_agent_writes_to_its_home(
+    isolated_env: None, tmp_path: Path
+) -> None:
+    """Regression test: the sandbox home pre-exists the run, so the top-level
+    workspace diff never saw inside it and ``~`` deliverables were silently
+    dropped from generated_files. The home is diffed separately now."""
+    AGENTS.register("fake-home-writer")(_HomeWritingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p", cluster_name="c", agent_type="fake-home-writer", no_infra=True
+        )
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+        run_dir = tmp_path / "run_1"
+        run_dir.mkdir()
+
+        record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
+
+        assert record["status"] == "success"
+        generated = run_dir / "generated_files" / "report.md"
+        assert generated.exists()
+        assert generated.read_text() == "written to ~"
+    finally:
+        AGENTS._items.pop("fake-home-writer", None)  # noqa: SLF001
 
 
 def test_run_one_warns_when_a_verification_entry_fails_to_parse(
@@ -440,7 +476,7 @@ def test_run_one_warns_when_a_verification_entry_fails_to_parse(
             caplog.at_level(logging.WARNING),
             patch("devops_bench.evalharness.default.VerifierAgent.run_entry", return_value=ok),
         ):
-            record = harness._run_one(task, run_dir)  # noqa: SLF001
+            record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
 
         assert record["status"] == "success"
         assert any("failed to parse" in message for message in caplog.messages)
@@ -487,7 +523,7 @@ def test_run_one_evaluates_verification_on_the_exception_path_when_infra_is_up(
         }
     )
 
-    record = harness._run_one(task, tmp_path)  # noqa: SLF001
+    record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
     assert record["verification_report"] == canned_report
@@ -518,7 +554,7 @@ def test_run_one_reports_evaluated_on_the_exception_path_with_no_entries_declare
         }
     )
 
-    record = harness._run_one(task, tmp_path)  # noqa: SLF001
+    record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
     assert record["verification_report"] == []
@@ -559,7 +595,7 @@ def test_run_one_skips_verification_entirely_under_no_infra(
         run_dir = tmp_path / "run_1"
         run_dir.mkdir()
 
-        record = harness._run_one(task, run_dir)  # noqa: SLF001
+        record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
 
         assert record["status"] == "success"
         assert record["verification_status"] == "skipped_no_infra"
@@ -711,6 +747,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "verification_status",
         "generation_only",
         "validated",
+        "sandboxed",
         "task_metadata",
     }
 )
@@ -1118,8 +1155,7 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     ) -> Path:
         assert got_plan is plan
         assert dest_dir == tmp_path / "creds"
-        # The agent's default 600s timeout plus the module's slack: the token
-        # must outlast the run it is minted for.
+        # Default 600s agent timeout plus slack: the token must outlast the run.
         assert token_ttl_sec == 1500
         assert pod_security == "baseline"
         return kubeconfig
@@ -1162,7 +1198,201 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     assert plan_requests == [(provider, "c1")]
 
 
-def test_build_agent_config_overlays_the_active_sandbox_spec(
+def test_prepare_sandbox_spec_tears_down_when_completion_fails(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provisioning wrote to the cluster, but the spec that would carry its
+    context to the run-end teardown never completes — so the failure path must
+    clean up itself, or a reused cluster keeps the policies with nothing
+    recording they exist."""
+    from devops_bench.core import ClusterInfo, NetworkPlan
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    plan = NetworkPlan(kubectl_context="kind-c1")
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "build_network_plan", lambda provider, cluster: plan
+    )
+    monkeypatch.setattr(
+        harness_default.agent_credentials,
+        "provision_agent_credentials",
+        lambda *args, **kwargs: tmp_path / "creds" / "kubeconfig",
+    )
+
+    def explode(cluster: str) -> dict[str, str]:
+        raise ValueError("BENCH_AGENT_FIXTURES names a path that does not exist")
+
+    monkeypatch.setattr(harness_default.agent_sandbox, "discover_fixture_mounts", explode)
+    torn_down: list[str | None] = []
+    monkeypatch.setattr(
+        harness_default.agent_credentials,
+        "teardown_agent_credentials",
+        lambda context=None: torn_down.append(context) or True,
+    )
+
+    workspace = tmp_path / "workspace-x"
+    workspace.mkdir()
+    (tmp_path / "creds").mkdir()
+    with pytest.raises(ValueError):
+        harness._prepare_sandbox_spec(  # noqa: SLF001
+            workspace, tmp_path / "creds", ClusterInfo(name="c1"), None, "baseline"
+        )
+
+    assert torn_down == ["kind-c1"]
+
+
+def test_run_one_tears_down_sandbox_credentials_in_its_finally(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run-end teardown fires from ``_run_one``'s finally, pinned to the
+    run's own context. It is a correctness requirement on a reused cluster:
+    the pod-security policy is not username-scoped, so left behind it denies
+    the operator's next privileged workload too."""
+    from dataclasses import replace
+
+    from devops_bench.core import NetworkPlan
+
+    class _SandboxReadyAgent(_WorkspaceWritingAgent):
+        # Opt the fake onto the seam: base.run() refuses a sandboxed config on
+        # a harness that has not been migrated (supports_sandbox is False).
+        supports_sandbox = True
+
+    AGENTS.register("fake-sandbox-teardown")(_SandboxReadyAgent)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-sandbox-teardown", no_infra=True
+        )
+
+        def fake_prepare(
+            workspace_path: Path,
+            creds_dir: Path,
+            cluster_info: Any,
+            provider: Any,
+            pod_security: str,
+            *,
+            with_cluster: bool = True,
+        ) -> Any:
+            (workspace_path / "home").mkdir(parents=True, exist_ok=True)
+            return replace(
+                harness.build_agent_config().sandbox,
+                network=NetworkPlan(kubectl_context="kind-c1"),
+                workspace=workspace_path,
+                kubeconfig=creds_dir / "kubeconfig",
+            )
+
+        monkeypatch.setattr(harness, "_prepare_sandbox_spec", fake_prepare)
+        torn_down: list[str | None] = []
+        monkeypatch.setattr(
+            harness_default.agent_credentials,
+            "teardown_agent_credentials",
+            lambda context=None: torn_down.append(context) or True,
+        )
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+        run_dir = tmp_path / "run_1"
+        run_dir.mkdir()
+
+        record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
+
+        assert record["status"] == "success"
+        assert torn_down == ["kind-c1"]
+    finally:
+        AGENTS._items.pop("fake-sandbox-teardown", None)  # noqa: SLF001
+
+
+def test_write_run_artifacts_records_sandbox_provenance(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm's sandboxing lands in the setup id (A/B is a group-by), and the
+    image is pinned by digest — a mutable tag is not provenance."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "image_digest", lambda image: f"{image}@sha256:feed"
+    )
+    written: dict[str, Any] = {}
+    monkeypatch.setattr(
+        harness.reporter, "write_rows", lambda run_dir, rows: written.update(rows=rows)
+    )
+    monkeypatch.setattr(
+        harness.reporter, "write_manifest", lambda run_dir, m: written.update(manifest=m)
+    )
+
+    record = {"name": "t", "folder": "f", "status": "success", "sandboxed": True}
+    harness._write_run_artifacts(tmp_path, [record])  # noqa: SLF001
+
+    manifest = written["manifest"]
+    assert "sandboxed" in manifest["augmentation"]
+    assert "sandboxed" in manifest["setupId"]
+    assert manifest["sandboxImage"] == "agent-sandbox:test"
+    assert manifest["sandboxImageDigest"] == "agent-sandbox:test@sha256:feed"
+    assert written["rows"][0]["sandboxed"] is True
+
+
+def test_write_run_artifacts_stays_baseline_when_unsandboxed(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    harness = DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results")
+    )
+    written: dict[str, Any] = {}
+    monkeypatch.setattr(harness.reporter, "write_rows", lambda run_dir, rows: None)
+    monkeypatch.setattr(
+        harness.reporter, "write_manifest", lambda run_dir, m: written.update(manifest=m)
+    )
+
+    harness._write_run_artifacts(tmp_path, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001
+
+    manifest = written["manifest"]
+    assert "sandboxed" not in manifest["augmentation"]
+    assert manifest["sandboxImage"] is None
+    assert manifest["sandboxImageDigest"] is None
+
+
+def test_empty_record_carries_the_task_scoped_sandboxed_flag(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-record truth: an exempt task inside a sandboxed arm records False
+    while its siblings record True."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+
+    assert harness._empty_record(task)["sandboxed"] is False  # noqa: SLF001
+    assert harness._empty_record(task, sandboxed=True)["sandboxed"] is True  # noqa: SLF001
+
+
+def test_prepare_sandbox_spec_without_a_cluster_skips_the_plan_and_credential(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """no_infra / noop deployer: no network plan is built (a stale kind
+    context matching the configured name must not leak its admin cert) and
+    the mounted kubeconfig is a credential-free stub."""
+    from devops_bench.core import ClusterInfo
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not touch kubectl without a cluster")
+
+    monkeypatch.setattr(harness_default.agent_sandbox, "build_network_plan", boom)
+    monkeypatch.setattr(harness_default.agent_credentials, "provision_agent_credentials", boom)
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "discover_fixture_mounts", lambda cluster: {}
+    )
+
+    workspace = tmp_path / "workspace-n"
+    workspace.mkdir()
+    creds = tmp_path / "creds-n"
+    creds.mkdir()
+    spec = harness._prepare_sandbox_spec(  # noqa: SLF001
+        workspace, creds, ClusterInfo(name="c1"), None, "baseline", with_cluster=False
+    )
+
+    assert spec.network == harness_default.agent_sandbox.NetworkPlan()
+    assert spec.kubeconfig is not None and spec.kubeconfig.read_text() == (
+        "apiVersion: v1\nkind: Config\n"
+    )
+
+
+def test_build_agent_config_overlays_an_explicit_sandbox_spec(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from dataclasses import replace as dc_replace
@@ -1172,13 +1402,12 @@ def test_build_agent_config_overlays_the_active_sandbox_spec(
         harness.build_agent_config().sandbox, workspace=tmp_path, kubeconfig=tmp_path / "kc"
     )
 
-    harness._active_sandbox_spec = completed  # noqa: SLF001
-    overlaid = harness.build_agent_config()
+    overlaid = harness.build_agent_config(completed)
     assert overlaid.sandbox is completed
     # Everything else still reads from the one snapshot.
     assert overlaid.capabilities is harness._agent_config.capabilities  # noqa: SLF001
 
-    harness._active_sandbox_spec = None  # noqa: SLF001
+    # No spec passed: the untouched snapshot, not leftover per-task state.
     assert harness.build_agent_config() is harness._agent_config  # noqa: SLF001
 
 
@@ -1194,13 +1423,11 @@ def test_inventory_sandbox_home_records_rules_per_task(
     dirty_home = tmp_path / "ws-dirty" / "home"
     dirty_home.mkdir(parents=True)
     (dirty_home / "report.md").write_text("prior-run leftover fingerprint line\n" * 3)
-    harness._inventory_sandbox_home("dirty-task", dirty_home)  # noqa: SLF001
-    assert harness._sandbox_inventory_rules["dirty-task"]  # noqa: SLF001
+    assert harness._inventory_sandbox_home("dirty-task", dirty_home)  # noqa: SLF001
 
     fresh_home = tmp_path / "ws-fresh" / "home"
     fresh_home.mkdir(parents=True)
-    harness._inventory_sandbox_home("fresh-task", fresh_home)  # noqa: SLF001
-    assert harness._sandbox_inventory_rules["fresh-task"] == ()  # noqa: SLF001
+    assert harness._inventory_sandbox_home("fresh-task", fresh_home) == ()  # noqa: SLF001
 
 
 def test_inventory_covers_fixture_mounts_at_their_container_paths(
@@ -1218,7 +1445,7 @@ def test_inventory_covers_fixture_mounts_at_their_container_paths(
 
     home = tmp_path / "ws" / "home"
     home.mkdir(parents=True)
-    harness._inventory_sandbox_home(  # noqa: SLF001
+    rules = harness._inventory_sandbox_home(  # noqa: SLF001
         "t",
         home,
         {
@@ -1226,7 +1453,6 @@ def test_inventory_covers_fixture_mounts_at_their_container_paths(
             "/home/op/stale-notes-c1.md": "/workspace/home/stale-notes-c1.md",
         },
     )
-    rules = harness._sandbox_inventory_rules["t"]  # noqa: SLF001
     assert {r.source for r in rules} == {"opa-repo-c1.git", "stale-notes-c1.md"}
     # The rules match the container-side spellings the trajectory records.
     repo_rule = next(r for r in rules if r.source == "opa-repo-c1.git")
@@ -1456,10 +1682,7 @@ def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -
         sandbox=harness_default.agent_sandbox.SandboxSpec(image="img"),
     )
 
-    harness._sandbox_exempt_task = True  # noqa: SLF001
-    assert harness.build_agent_config().sandbox is None
-
-    harness._sandbox_exempt_task = False  # noqa: SLF001
+    assert harness.build_agent_config(sandbox_exempt=True).sandbox is None
     assert harness.build_agent_config().sandbox is not None
 
 
