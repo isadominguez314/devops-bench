@@ -24,23 +24,23 @@
 
 # Digest-pinned (multi-arch manifest list, amd64 + arm64) so the floating tag
 # cannot move the base under a rebuild.
-FROM node:22-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
 
 # The base digest and these ARGs pin what a Dockerfile can pin; APT contents
 # may still drift between rebuilds (Debian archives move), so the digest of
 # the *built* image — not this file — is the identity of what an A/B arm was
 # scored with. Bump the pins deliberately and re-baseline.
-ARG KUBECTL_VERSION=v1.31.0
-ARG HELM_VERSION=v3.16.3
-ARG GEMINI_CLI_VERSION=0.54.4
+ARG KUBECTL_VERSION=v1.35.9
+ARG HELM_VERSION=v3.22.0
+ARG GEMINI_CLI_VERSION=0.61.0
 
 # Checksums for the raw-download binaries nothing else (apt/npm) vouches for.
 # Pinned here, not fetched at build time — a checksum from the artifact's own
 # channel verifies nothing. Bumping a version without repinning fails the build.
-ARG KUBECTL_SHA256_AMD64=7c27adc64a84d1c0cc3dcf7bf4b6e916cc00f3f576a2dbac51b318d926032437
-ARG KUBECTL_SHA256_ARM64=f42832db7d77897514639c6df38214a6d8ae1262ee34943364ec1ffaee6c009c
-ARG HELM_SHA256_AMD64=f5355c79190951eed23c5432a3b920e071f4c00a64f75e077de0dd4cb7b294ea
-ARG HELM_SHA256_ARM64=5bd34ed774df6914b323ff84a0a156ea6ff2ba1eaf0113962fa773f3f9def798
+ARG KUBECTL_SHA256_AMD64=3cfeaf80be482b435b0aa214aff6e0b2c312ee23c0ff20810c75517b6004c6eb
+ARG KUBECTL_SHA256_ARM64=39c98bca82875d9a9ddfb6f3c5ab17c3f78ea0801230683e538a67d5c053308d
+ARG HELM_SHA256_AMD64=1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+ARG HELM_SHA256_ARM64=f14e804dfee240f55525b667488fe9adca349e63e00c9af634c0beb1421ac310
 
 # Modern Git comes from backports for reftable support; ripgrep and jq are
 # what the agent's own search and JSON handling reach for.
