@@ -1355,17 +1355,13 @@ class DefaultEvalHarness(Harness):
     ) -> agent_sandbox.SandboxSpec:
         """Complete the skeletal sandbox spec for one provisioned task.
 
-        Creates the sandbox home, asks the provider how a container reaches
-        this run's cluster, provisions the agent's scoped ServiceAccount
-        credential from that plan, and discovers the task's fixture mounts.
-        The plan carries a context pin, so a current-context switched after
-        provisioning can never hand the container another cluster's
-        credential. ``with_cluster=False`` (noop deployer / no_infra) skips
-        the plan and credential and mounts a credential-free stub kubeconfig:
-        there is no cluster to reach, and a stale context matching the
-        configured name must not leak in. Raises :class:`SandboxError` when a
-        plan or credential cannot be built; the caller records a failed task
-        rather than degrading.
+        Builds the provider's network plan (context-pinned, so a later
+        current-context switch cannot swap clusters), provisions the scoped
+        ServiceAccount credential, and discovers fixture mounts.
+        ``with_cluster=False`` (noop deployer / no_infra) skips both and
+        mounts a credential-free stub kubeconfig so a stale context cannot
+        leak in. Raises :class:`SandboxError` when a plan or credential
+        cannot be built; the caller records a failed task, never degrades.
         """
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
         if with_cluster:

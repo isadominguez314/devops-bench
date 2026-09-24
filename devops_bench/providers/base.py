@@ -106,32 +106,13 @@ class Provider(ABC):
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
         """Describe how a sandboxed agent container reaches this cluster.
 
-        The agent-under-test can be run inside a container (see
-        :mod:`devops_bench.agents.sandbox`), and from in there the operator's
-        kubeconfig server URL is not automatically meaningful: a local cluster
-        typically publishes its apiserver on host loopback, which resolves to
-        the container itself. Only the provider knows whether its endpoint
-        already routes and, if not, what to substitute.
-
-        Implementations must return a plan pinned to the kubectl context this
-        cluster wrote (``kubectl_context``); the sandbox refuses a
-        provider-backed plan without one, because an unpinned plan mints the
-        agent's credential on the ambient current-context — indistinguishable
-        from a run that has no provider at all, and covered by that case's
-        escape hatch. The inherited default returns an *unpinned* plan and so
-        always needs overriding, if only to add the pin. Network surgery
-        beyond that is rarely needed: a routable endpoint (every cloud
-        provider, a vcluster on a routable address) is left alone, and the
-        sandbox already rewrites a *loopback* server to
-        ``host.docker.internal``, so a provider adds more only when the
-        generic step cannot infer it — a Docker network to join, or an
-        in-network hostname.
-
-        Args:
-            cluster_info: The provisioned cluster to reach.
-
-        Returns:
-            The :class:`~devops_bench.core.NetworkPlan` for this cluster.
+        The sandbox refuses a provider-backed plan with no ``kubectl_context``
+        pin (unpinned would mint the agent's credential on the ambient
+        current-context), and this default returns an unpinned plan — so every
+        provider must override, if only to add the pin. Beyond that the
+        sandbox already rewrites a loopback server to ``host.docker.internal``;
+        add more only when that generic step cannot infer it: a Docker network
+        to join, or an in-network hostname.
         """
         del cluster_info
         return NetworkPlan()
