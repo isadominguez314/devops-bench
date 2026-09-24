@@ -332,6 +332,28 @@ def test_discover_fixture_mounts_matches_only_this_runs_cluster_token(
     ]
 
 
+def test_discover_fixture_mounts_requires_a_token_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A substring hit is not a fixture: cluster "dev" must not RW-mount
+    ~/devops-bench (the bench checkout) or any dot-entry like ~/.config."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "devops-bench").mkdir()
+    (home / ".devrc").write_text("x", encoding="utf-8")
+    (home / "opa-repo-dev.git").mkdir()
+    (home / "dev").mkdir()
+    monkeypatch.setattr(sandbox.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv(sandbox.FIXTURES_ENV, raising=False)
+
+    mounts = sandbox.discover_fixture_mounts("dev")
+
+    assert sorted(mounts.values()) == [
+        "/workspace/home/dev",
+        "/workspace/home/opa-repo-dev.git",
+    ]
+
+
 def test_discover_fixture_mounts_matches_top_level_entries_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -624,6 +646,72 @@ def test_executor_run_passes_through_check_and_timeout(
     assert seen["timeout"] == 15.5
 
 
+def test_executor_run_raises_sandbox_error_on_docker_exit_125(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """125 is docker's own failure (missing image/network), not the agent's
+    exit code; with check=False it must not be scored as an agent failure."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["docker", "run"]:
+            return SimpleNamespace(returncode=125, stdout="", stderr="No such image")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with pytest.raises(SandboxError, match="could not start the sandbox"):
+        executor.run(["gemini"], check=False)
+
+
+def test_executor_run_raises_sandbox_error_when_docker_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A missing docker binary is an infra failure, not "gemini unavailable" —
+    and the finally-reap must swallow its own OSError on the way out."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+
+    def fake_run(argv, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with pytest.raises(SandboxError, match="docker is unavailable"):
+        executor.run(["gemini"])
+
+
+def test_kill_container_never_raises_when_the_daemon_is_wedged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv, **kwargs):
+        raise SubprocessError(argv, returncode=-1)
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.kill_container("devops-bench-agent-stuck")  # must not raise
+
+
+def test_kill_container_is_time_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """docker kill gets a timeout so a wedged daemon cannot hang the
+    finally-reap and with it the whole batch."""
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.kill_container("devops-bench-agent-ws")
+    assert captured["timeout"] is not None
+
+
+def test_sweep_stray_containers_never_raises_when_docker_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers()  # must not raise
+
+
 def test_executor_run_keeps_secret_values_out_of_the_argv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -657,6 +745,26 @@ def test_executor_run_keeps_secret_values_out_of_the_argv(
 
 
 # -- the run_agent_cmd seam --------------------------------------------------------
+
+
+def test_run_agent_cmd_defaults_to_the_harness_modules_run_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without host_run=, the seam resolves the concrete harness module's own
+    ``run`` import — the symbol its unit tests patch — so forgetting the
+    parameter cannot silently bypass test patches and hit a real subprocess."""
+    import sys as _sys
+
+    called: dict = {}
+
+    def module_run(cmd, **kwargs):
+        called["cmd"] = list(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(_sys.modules[__name__], "run", module_run, raising=False)
+    agent = _DummyAgent(AgentConfig())
+    agent.run_agent_cmd(["echo", "hi"])
+    assert called["cmd"] == ["echo", "hi"]
 
 
 def test_run_agent_cmd_flag_off_is_a_verbatim_passthrough() -> None:
