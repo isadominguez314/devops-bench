@@ -34,6 +34,14 @@ ARG KUBECTL_VERSION=v1.31.0
 ARG HELM_VERSION=v3.16.3
 ARG GEMINI_CLI_VERSION=0.54.4
 
+# Checksums for the raw-download binaries nothing else (apt/npm) vouches for.
+# Pinned here, not fetched at build time — a checksum from the artifact's own
+# channel verifies nothing. Bumping a version without repinning fails the build.
+ARG KUBECTL_SHA256_AMD64=7c27adc64a84d1c0cc3dcf7bf4b6e916cc00f3f576a2dbac51b318d926032437
+ARG KUBECTL_SHA256_ARM64=f42832db7d77897514639c6df38214a6d8ae1262ee34943364ec1ffaee6c009c
+ARG HELM_SHA256_AMD64=f5355c79190951eed23c5432a3b920e071f4c00a64f75e077de0dd4cb7b294ea
+ARG HELM_SHA256_ARM64=5bd34ed774df6914b323ff84a0a156ea6ff2ba1eaf0113962fa773f3f9def798
+
 # Modern Git comes from backports for reftable support; ripgrep and jq are
 # what the agent's own search and JSON handling reach for.
 RUN echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
@@ -47,15 +55,22 @@ RUN echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/s
 
 # kubectl and helm: resolve the arch from the build platform rather than
 # hardcoding amd64, so the image builds on an arm64 laptop as well as the
-# x86 bastion.
+# x86 bastion. Checksum-verified per arch; an arch with no pin fails the build.
 RUN arch="$(dpkg --print-architecture)" \
+    && case "${arch}" in \
+        amd64) kubectl_sha="${KUBECTL_SHA256_AMD64}"; helm_sha="${HELM_SHA256_AMD64}" ;; \
+        arm64) kubectl_sha="${KUBECTL_SHA256_ARM64}"; helm_sha="${HELM_SHA256_ARM64}" ;; \
+        *) echo "no checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac \
     && curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" \
+    && echo "${kubectl_sha}  kubectl" | sha256sum -c - \
     && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl \
     && rm kubectl \
-    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
-        | tar -xz -C /tmp \
+    && curl -fsSLo helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
+    && echo "${helm_sha}  helm.tar.gz" | sha256sum -c - \
+    && tar -xzf helm.tar.gz -C /tmp \
     && install -o root -g root -m 0755 "/tmp/linux-${arch}/helm" /usr/local/bin/helm \
-    && rm -rf "/tmp/linux-${arch}"
+    && rm -rf helm.tar.gz "/tmp/linux-${arch}"
 
 RUN npm install -g "@google/gemini-cli@${GEMINI_CLI_VERSION}"
 

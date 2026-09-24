@@ -39,21 +39,25 @@ import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
-from devops_bench.core import get_env, get_logger
+from devops_bench.core import ClusterInfo, NetworkPlan, get_env, get_logger
 from devops_bench.core.errors import SandboxError, SubprocessError
 from devops_bench.core.subprocess import CompletedProcess, run
+from devops_bench.k8s import kubectl
+
+if TYPE_CHECKING:
+    from devops_bench.providers.base import Provider
 
 __all__ = [
     "NetworkPlan",
     "SandboxSpec",
     "SandboxExecutor",
     "spec_from_env",
-    "current_cluster_name",
     "build_network_plan",
-    "build_agent_kubeconfig",
     "discover_fixture_mounts",
     "filter_boundary_env",
     "container_name_for_workspace",
@@ -105,32 +109,14 @@ _DENIED_ENV_PREFIXES = ("BENCH_", "TF_", "AWS_", "AZURE_", "ARM_")
 # crossing value would repoint HOME/KUBECONFIG/PATH inside the boundary.
 _CONTAINER_OWNED_ENV = frozenset({"HOME", "KUBECONFIG", "PATH"})
 
+# Apiserver hosts that resolve to the container itself once sandboxed;
+# ``0.0.0.0`` is a bind address, but real kubeconfigs carry it and it is
+# equally unroutable from the container.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
+
 # Bound on the module's own docker/kubectl housekeeping calls, so a wedged
 # daemon cannot hang a reap (and with it the whole batch).
 _HOUSEKEEPING_TIMEOUT_SEC = 30
-
-
-@dataclass(frozen=True)
-class NetworkPlan:
-    """How the container reaches this run's cluster apiserver.
-
-    Attributes:
-        docker_network: Docker network to join; ``None`` = default bridge.
-        extra_hosts: Additional ``--add-host`` entries (``host:ip``).
-        rewrite_server: Replacement apiserver URL for the generated
-            kubeconfig; ``None`` keeps the context's own server.
-        tls_server_name: ``tls-server-name`` for a rewritten endpoint whose
-            certificate carries a different SAN.
-        kubectl_context: Context every credential read is pinned to, so an
-            ambient current-context switch cannot hand the container another
-            cluster's credential. ``None`` = ambient current-context.
-    """
-
-    docker_network: str | None = None
-    extra_hosts: tuple[str, ...] = ()
-    rewrite_server: str | None = None
-    tls_server_name: str | None = None
-    kubectl_context: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,123 +157,72 @@ def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
     )
 
 
-def current_cluster_name() -> str | None:
-    """Cluster name from the active ``kind-<cluster>`` context, else ``None``."""
-    ctx = (
-        run(
-            ["kubectl", "config", "current-context"],
-            check=False,
-            timeout=_HOUSEKEEPING_TIMEOUT_SEC,
-        ).stdout
-        or ""
-    )
-    ctx = ctx.strip()
-    if not ctx.startswith("kind-"):
-        return None
-    return ctx[len("kind-") :]
+def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> NetworkPlan:
+    """Build the :class:`NetworkPlan` for this run's cluster.
 
+    The provider contributes what only it knows (network, hostname, context
+    pin); this module then applies the one provider-agnostic rewrite: a host
+    loopback server is remapped to ``host.docker.internal``, which is why
+    most providers need no override.
 
-def build_network_plan(cluster_name: str | None = None) -> NetworkPlan:
-    """Build the plan for this run's cluster. kind only, for now.
+    Args:
+        provider: ``None`` (no-op deployer) yields the default plan against
+            the ambient current-context.
 
-    kind writes ``https://127.0.0.1:<port>`` as the server, meaningless
-    in-container; joining the ``kind`` docker network reaches the apiserver
-    at ``https://<cluster>-control-plane:6443`` (TLS verifies via the
-    node-name SAN). The plan is pinned to ``kind-<cluster_name>``, never the
-    ambient current-context. Raises :class:`SandboxError` when no name
-    resolves or kubectl knows no such context.
+    Raises:
+        SandboxError: The provider named a context kubectl does not know, or
+            no server URL could be read for a plan without its own rewrite.
     """
-    cluster = cluster_name or current_cluster_name()
-    if cluster is None:
-        raise SandboxError(
-            "the active kubectl context is not a kind context; the sandbox currently "
-            "only knows how to reach kind clusters (the per-provider network plan "
-            "hook arrives with the credential-scoping follow-up)"
-        )
-    context = f"kind-{cluster}"
-    known = (
-        run(
-            ["kubectl", "config", "get-contexts", "-o", "name"],
-            check=False,
-            timeout=_HOUSEKEEPING_TIMEOUT_SEC,
-        ).stdout
-        or ""
-    ).split()
-    if context not in known:
-        raise SandboxError(
-            f"kubectl has no {context!r} context for this run's cluster {cluster!r}; "
-            "either the cluster is not a kind cluster (the per-provider plan hook "
-            "arrives with the credential-scoping follow-up) or this kubeconfig "
-            "never saw it — refusing to build a plan from the ambient context"
-        )
-    return NetworkPlan(
-        docker_network="kind",
-        rewrite_server=f"https://{cluster}-control-plane:6443",
-        kubectl_context=context,
-    )
+    plan = provider.sandbox_network_plan(cluster_info) if provider is not None else NetworkPlan()
+    if plan.kubectl_context:
+        known = (
+            run(
+                ["kubectl", "config", "get-contexts", "-o", "name"],
+                check=False,
+                timeout=_HOUSEKEEPING_TIMEOUT_SEC,
+            ).stdout
+            or ""
+        ).split()
+        if plan.kubectl_context not in known:
+            raise SandboxError(
+                f"kubectl has no {plan.kubectl_context!r} context for this run's cluster "
+                f"{cluster_info.name!r}; this kubeconfig never saw the cluster the "
+                "provider named — refusing to build a plan from the ambient context"
+            )
+    return _rewrite_loopback_server(plan)
 
 
-def _kubectl_config_value(jsonpath: str, context: str | None = None) -> str:
-    """One kubectl config value, pinned to ``context`` when given; empty if absent."""
-    argv = ["kubectl", "config", "view", "--raw", "--minify"]
-    if context:
-        argv += ["--context", context]
-    argv += ["-o", f"jsonpath={jsonpath}"]
-    completed = run(argv, check=False, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
-    return (completed.stdout or "").strip()
+def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
+    """Remap a loopback apiserver URL to the host gateway, or pass the plan through.
 
-
-def build_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path:
-    """Write the single-cluster kubeconfig the container gets; return its path.
-
-    One cluster, one user, one context, no ``exec:`` plugin blocks. The
-    credential is the operator's client certificate — cluster-admin, a
-    loudly-logged interim until the credential-scoping follow-up ships
-    ServiceAccount tokens. ``dest_dir`` must stay outside the workspace so
-    the read-only bind is the only path to the file. Raises
-    :class:`SandboxError` when the context carries no CA or no static client
-    certificate.
+    Loopback inside a container is the container; ``host.docker.internal``
+    reaches the same host listener. ``tls-server-name`` becomes ``localhost``
+    — the SAN such a cluster does have — so TLS stays verified rather than
+    disabled. A plan already carrying ``rewrite_server`` is left untouched.
     """
-    ctx = plan.kubectl_context
-    ca = _kubectl_config_value("{.clusters[0].cluster.certificate-authority-data}", context=ctx)
-    if not ca:
-        raise SandboxError("could not read the cluster CA from the run's kubectl context")
-
-    server = plan.rewrite_server or _kubectl_config_value(
-        "{.clusters[0].cluster.server}", context=ctx
-    )
+    if plan.rewrite_server:
+        return plan
+    server = kubectl.config_value("{.clusters[0].cluster.server}", context=plan.kubectl_context)
     if not server:
-        raise SandboxError("could not read the cluster server URL from the run's kubectl context")
-
-    cert = _kubectl_config_value("{.users[0].user.client-certificate-data}", context=ctx)
-    key = _kubectl_config_value("{.users[0].user.client-key-data}", context=ctx)
-    if not (cert and key):
         raise SandboxError(
-            "the run's kubectl context carries no static client certificate; "
-            "exec-credential-plugin contexts are handled by the credential-scoping "
-            "follow-up, not by reusing the operator's plugin inside the container"
+            "could not read the cluster server URL from the run's kubectl context; "
+            "refusing to build a sandbox network plan from an unknown endpoint"
         )
-    _log.warning(
-        "sandbox kubeconfig reuses the operator's admin client certificate: the "
-        "container boundary is doing all the work and the RBAC boundary none. "
-        "Scoped ServiceAccount credentials arrive with the credential-scoping "
-        "follow-up."
+    parsed = urlsplit(server)
+    if parsed.hostname not in _LOOPBACK_HOSTS:
+        return plan
+    port = f":{parsed.port}" if parsed.port else ""
+    _log.info(
+        "cluster apiserver is published on loopback (%s); the container will reach it "
+        "at host.docker.internal%s",
+        server,
+        port,
     )
-
-    cluster_fields = f"server: {server}, certificate-authority-data: {ca}"
-    if plan.tls_server_name:
-        cluster_fields += f", tls-server-name: {plan.tls_server_name}"
-    path = dest_dir / "kubeconfig"
-    path.write_text(
-        "apiVersion: v1\n"
-        "kind: Config\n"
-        f"clusters: [{{name: c, cluster: {{{cluster_fields}}}}}]\n"
-        f"users: [{{name: u, user: {{client-certificate-data: {cert}, client-key-data: {key}}}}}]\n"
-        "contexts: [{name: ctx, context: {cluster: c, user: u}}]\n"
-        "current-context: ctx\n"
+    return replace(
+        plan,
+        rewrite_server=f"https://host.docker.internal{port}",
+        tls_server_name=plan.tls_server_name or "localhost",
     )
-    path.chmod(0o600)
-    return path
 
 
 def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
