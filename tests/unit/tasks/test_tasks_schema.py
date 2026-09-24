@@ -296,8 +296,7 @@ def test_safety_checklists_empty_block_coalesces_to_empty_list():
 
 
 def test_agent_pod_security_defaults_to_baseline() -> None:
-    """Pod security is on unless a task says otherwise, so an author who never
-    heard of the key still gets the control."""
+    """An author who never heard of the key still gets the control."""
     assert Task.from_dict({"name": "n"}).agent_pod_security == "baseline"
 
 
@@ -311,16 +310,13 @@ def test_agent_pod_security_round_trips_an_opt_out() -> None:
 
 @pytest.mark.parametrize("value", ["Privileged", "privleged", "restricted", "none"])
 def test_unknown_agent_pod_security_is_rejected_at_load_time(value: str) -> None:
-    """An unrecognised level falls through to enforcement, so accepting it would
-    silently ignore the author's opt-out and fail the task somewhere far from
-    the cause."""
+    """A typo'd level must fail at load time, not silently ignore the opt-out."""
     with pytest.raises(ValidationError):
         Task.from_dict({"name": "n", "agent_pod_security": value})
 
 
 def test_empty_agent_pod_security_coalesces_to_the_default() -> None:
-    """``agent_pod_security:`` with no value parses to None; that must mean the
-    default rather than silently disabling enforcement."""
+    """A bare ``agent_pod_security:`` (None) must mean the default, not opt out."""
     assert Task.from_dict({"name": "n", "agent_pod_security": None}).agent_pod_security == (
         "baseline"
     )

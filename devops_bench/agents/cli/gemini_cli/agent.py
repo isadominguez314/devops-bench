@@ -198,10 +198,9 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         "OTEL_SDK_DISABLED": "true",
     }
     if spec.backend == "vertex":
-        # The google-genai SDK the CLI embeds reads these three; without the
-        # switch it defaults to the Gemini API and ignores the Vertex routing.
-        # Project/location env spellings follow the antigravity harness so an
-        # operator configures both agents the same way.
+        # Without these the embedded google-genai SDK defaults to the Gemini
+        # API and ignores the Vertex routing. GCP_* fallbacks match what the
+        # bastion exports (GCP_LOCATION is a zone, not a Vertex region).
         overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
         project = vertex_project()
         if project:
@@ -252,9 +251,6 @@ class GeminiCliAgent(AgentHarness):
     from disk.
     """
 
-    # Every agent-owned subprocess here goes through run_agent_cmd, so a
-    # sandboxed run is actually contained. Unmigrated harnesses keep the base
-    # False and are refused by AgentHarness.run when the sandbox flag is on.
     supports_sandbox = True
 
     def __init__(self, config: AgentConfig | None = None) -> None:
@@ -301,13 +297,6 @@ class GeminiCliAgent(AgentHarness):
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
             try:
-                # Through the sandbox seam: containerised when
-                # ``config.sandbox`` is set, byte-identical to a direct
-                # ``run(...)`` call otherwise. The module-level ``run`` rides
-                # along as the host-path executor. The overlay is the RESOLVED
-                # configuration (provider-routed api key, GEMINI_MODEL, the
-                # OTLP disables), so it is exactly what should cross a sandbox
-                # boundary — by value, never as inherited process env.
                 completed = self.run_agent_cmd(
                     argv,
                     extra_env=env_overlay,

@@ -83,50 +83,22 @@ else
     || echo "    WARN: gemini CLI install failed; gcli agent runs will not work until it's installed."
 fi
 
-# Link-local metadata endpoint — blocked for containers only.
+# Block the link-local metadata endpoint (169.254.169.254) for containers
+# only: it would hand a sandboxed agent this VM's cloud-platform-scoped
+# service account token, voiding the scoped credentials. DOCKER-USER applies
+# to *forwarded* traffic only, so host processes — ambient (unsandboxed)
+# runs and the matrix — keep authenticating through the metadata server.
 #
-# A sandboxed agent gets a deliberately narrow set of credentials. That is
-# worth nothing while the container can still curl 169.254.169.254 and be
-# handed this VM's service account token, which carries cloud-platform scope
-# and is not scoped to anything the run needs. This is the proposal's second
-# observed incident, and it is the reason the scoped-credential work has to
-# ship with a rule here rather than after it.
+# Port 53 must stay open: on a GCP VM the metadata address is also the
+# resolver dockerd copies into default-bridge containers, so a blanket REJECT
+# breaks all container DNS (kind hides this — its embedded DNS at 127.0.0.11
+# forwards from the host namespace, where DOCKER-USER does not apply). The
+# token endpoints are HTTP on port 80, so they stay rejected, and a DNS
+# answer cannot carry a credential. -I inserts at the head of the chain, so
+# the ACCEPT rules go in *after* the REJECT to end up above it.
 #
-# DOCKER-USER is the chain Docker leaves for exactly this: it is consulted
-# before Docker's own FORWARD rules, and it applies to *forwarded* traffic
-# only. Host processes are unaffected, so ambient (unsandboxed) harness runs
-# and the matrix keep authenticating through the metadata server as before.
-#
-# Port 53 has to stay open, or the block takes DNS down with it. On a GCP VM
-# the metadata address is also the resolver: /etc/resolv.conf is the
-# systemd-resolved stub, dockerd follows it to /run/systemd/resolve/resolv.conf,
-# finds 169.254.169.254 there, and copies that into every container on the
-# default bridge. A blanket REJECT then leaves the container unable to resolve
-# anything at all -- the agent CLI fails with a transport error that names no
-# name server, so it reads as a network outage rather than as this rule.
-#
-# kind hides the bug, which is why it took a GKE run to find: containers on a
-# user-defined network resolve through Docker's embedded server at 127.0.0.11,
-# and dockerd forwards those queries from the host namespace, where DOCKER-USER
-# does not apply. Only the default bridge -- what every non-kind provider gets
-# -- queries the metadata address directly.
-#
-# Narrowing to protocol and port keeps the boundary: the token endpoints are
-# HTTP on port 80, so they stay rejected, and a DNS answer cannot carry a
-# credential. Order matters. -I inserts at the head of the chain, so the ACCEPT
-# rules go in *after* the REJECT to end up above it.
-#
-# Known limitation: iptables rules do not survive a reboot, and DOCKER-USER
-# itself is created by dockerd. Re-run this script after a reboot rather than
-# pulling in iptables-persistent for these rules. See docs/components/infra.md.
-#
-# Failure here is fatal, not a warning: a host that cannot install the block
-# hands every sandboxed container the VM service account's token (the
-# proposal's second observed incident), and a setup that exits 0 anyway reads
-# as "boundary in place". The one non-fatal path is the missing DOCKER-USER
-# chain — dockerd creates it, so on a fresh VM this script legitimately runs
-# before it exists. That path stays a warn-and-rerun; do not start sandboxed
-# runs until a re-run reports the block installed.
+# iptables rules do not survive a reboot and DOCKER-USER is created by
+# dockerd: re-run this script after a reboot. See docs/components/infra.md.
 echo "==> metadata endpoint block (container egress)"
 if ! command -v iptables >/dev/null 2>&1; then
   echo "    ERROR: iptables not found; containers could reach the metadata server." >&2

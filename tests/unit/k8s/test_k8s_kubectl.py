@@ -127,8 +127,7 @@ def test_get_resource_lists_across_every_namespace(mocker: MockerFixture) -> Non
 
 
 def test_get_resource_prefers_an_explicit_namespace_over_all(mocker: MockerFixture) -> None:
-    """``-n`` and ``-A`` together are an error, and the caller who named a
-    namespace meant it."""
+    """``-n`` and ``-A`` together are a kubectl error; ``-n`` wins."""
     mock_run = mocker.patch(
         "devops_bench.k8s.kubectl.run",
         return_value=_completed(stdout='{"items": []}'),
@@ -171,6 +170,65 @@ def test_apply_builds_argv(mocker: MockerFixture) -> None:
 
     argv = mock_run.call_args.args[0]
     assert argv == ["kubectl", "apply", "-f", "/manifests/app.yaml", "-n", "staging"]
+
+
+def test_delete_builds_argv_and_ignores_not_found_by_default(mocker: MockerFixture) -> None:
+    # Not-found tolerance is the default because the callers are teardown
+    # paths, where "already gone" is success.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("clusterrolebinding", "a", "b", context="kind-bench")
+
+    argv = mock_run.call_args.args[0]
+    assert argv == [
+        "kubectl",
+        "delete",
+        "clusterrolebinding",
+        "a",
+        "b",
+        "--ignore-not-found",
+        "--context",
+        "kind-bench",
+    ]
+
+
+def test_delete_can_skip_waiting_and_surface_not_found(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("pod", "web-0", namespace="prod", ignore_not_found=False, wait=False)
+
+    argv = mock_run.call_args.args[0]
+    assert argv == ["kubectl", "delete", "pod", "web-0", "--wait=false", "-n", "prod"]
+
+
+def test_delete_threads_the_subprocess_timeout(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("namespace", "bench-system", timeout=300)
+
+    assert mock_run.call_args.kwargs["timeout"] == 300
+
+
+def test_delete_refuses_an_empty_name_list(mocker: MockerFixture) -> None:
+    # ``kubectl delete <kind>`` with no name is a no-op kubectl rejects; a
+    # caller who wants --all should have to spell that out, not fall into it.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    with pytest.raises(ValueError):
+        kubectl.delete("pod")
+
+    mock_run.assert_not_called()
+
+
+def test_label_renders_a_none_value_as_removal(mocker: MockerFixture) -> None:
+    # ``key-`` is kubectl's spelling for "remove this label"; a mapping mixing
+    # sets and removals renders each element in its own form.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.label("namespace", "default", {"keep": "1", "drop": None})
+
+    argv = mock_run.call_args.args[0]
+    assert argv == ["kubectl", "label", "namespace", "default", "keep=1", "drop-"]
 
 
 def test_rollout_status_with_timeout(mocker: MockerFixture) -> None:
@@ -483,8 +541,6 @@ def test_is_not_found_tolerates_an_exception_without_stderr() -> None:
 
 
 def test_apply_threads_context_into_argv(mocker: MockerFixture) -> None:
-    # Applying a cluster-scoped object against whichever cluster the ambient
-    # current-context happens to name is the failure the pin exists to stop.
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 
     kubectl.apply("/tmp/manifest.yaml", namespace="prod", context="kind-bench")
@@ -502,8 +558,7 @@ def test_apply_threads_context_into_argv(mocker: MockerFixture) -> None:
 
 
 def test_get_resource_pins_context_alongside_kubeconfig(mocker: MockerFixture) -> None:
-    # The kubeconfig overlay alone is not a pin: one file routinely holds
-    # several contexts, so the read still needs to say which.
+    # One kubeconfig can hold several contexts, so the file alone is not a pin.
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed("{}"))
 
     kubectl.get_resource("pods", kubeconfig="/tmp/kc", context="gke_p_us_c")
@@ -522,8 +577,7 @@ def test_apply_and_get_resource_omit_the_flag_without_a_context(mocker: MockerFi
         assert "--context" not in call.args[0]
 
 
-# --context pinning. The flags have to land before a bare "--" separator:
-# everything after it belongs to the container command, not to kubectl.
+# --context must precede a bare "--"; later args belong to the container command.
 
 
 def test_context_lands_before_a_bare_separator() -> None:

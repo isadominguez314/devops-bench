@@ -242,7 +242,7 @@ def test_build_env_vertex_ignores_the_deployers_cluster_zone(
 
 def test_build_env_vertex_prefers_google_cloud_spellings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-google")
-    monkeypatch.setenv("GCP_PROJECT", "proj-gcp")
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj-gcp")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "asia-northeast1")
     monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west1")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
