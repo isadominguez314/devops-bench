@@ -1154,8 +1154,7 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     ) -> Path:
         assert got_plan is plan
         assert dest_dir == tmp_path / "creds"
-        # The agent's default 600s timeout plus the module's slack: the token
-        # must outlast the run it is minted for.
+        # Default 600s agent timeout plus slack: the token must outlast the run.
         assert token_ttl_sec == 1500
         assert pod_security == "baseline"
         return kubeconfig

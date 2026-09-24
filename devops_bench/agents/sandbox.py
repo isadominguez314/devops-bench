@@ -109,10 +109,9 @@ _DENIED_ENV_PREFIXES = ("BENCH_", "TF_", "AWS_", "AZURE_", "ARM_")
 # crossing value would repoint HOME/KUBECONFIG/PATH inside the boundary.
 _CONTAINER_OWNED_ENV = frozenset({"HOME", "KUBECONFIG", "PATH"})
 
-# Apiserver hostnames that mean "this machine" and therefore mean the wrong
-# machine once the agent is inside a container. ``0.0.0.0`` is a bind-any
-# address rather than a destination, but kubeconfigs in the wild carry it and
-# it is no more routable from the container than the others.
+# Apiserver hosts that resolve to the container itself once sandboxed;
+# ``0.0.0.0`` is a bind address, but real kubeconfigs carry it and it is
+# equally unroutable from the container.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 
 # Bound on the module's own docker/kubectl housekeeping calls, so a wedged
@@ -161,37 +160,18 @@ def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
 def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> NetworkPlan:
     """Build the :class:`NetworkPlan` for this run's cluster.
 
-    Two stages, and the split is what keeps per-provider knowledge out of this
-    module. First the provider answers
-    :meth:`~devops_bench.providers.base.Provider.sandbox_network_plan` with
-    whatever only it can know — a Docker network to join, an in-network
-    hostname, the name of the context it wrote. Then this function applies the
-    one rewrite that needs no provider knowledge at all: a server on host
-    loopback is meaningless from inside a container (it resolves to the
-    container), so it is remapped to ``host.docker.internal``, which
-    :meth:`SandboxExecutor.wrap_argv` always maps to the host gateway.
-
-    That generic step is why most providers need no override. A cloud endpoint
-    routes already and is left alone; a locally-published one is rewritten
-    whether it belongs to kind, a vcluster on a laptop, or something not
-    written yet.
+    The provider contributes what only it knows (network, hostname, context
+    pin); this module then applies the one provider-agnostic rewrite: a host
+    loopback server is remapped to ``host.docker.internal``, which is why
+    most providers need no override.
 
     Args:
-        provider: The run's provider, or ``None`` when the deployer has none
-            (the no-op deployer). ``None`` yields the default plan, built
-            against the ambient current-context — acceptable only because such
-            a run has no cluster identity of its own to pin to.
-        cluster_info: The provisioned cluster the container must reach.
-
-    Returns:
-        The plan for this run, with any loopback server already rewritten.
+        provider: ``None`` (no-op deployer) yields the default plan against
+            the ambient current-context.
 
     Raises:
-        SandboxError: When the provider names a context kubectl does not know
-            (a kubeconfig that never saw this cluster), or when no server URL
-            can be read for a plan that does not supply its own. Refusing
-            beats running against a server the container cannot reach — or
-            handing it credentials for a different cluster entirely.
+        SandboxError: The provider named a context kubectl does not know, or
+            no server URL could be read for a plan without its own rewrite.
     """
     plan = provider.sandbox_network_plan(cluster_info) if provider is not None else NetworkPlan()
     if plan.kubectl_context:
@@ -215,21 +195,10 @@ def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> 
 def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     """Remap a loopback apiserver URL to the host gateway, or pass the plan through.
 
-    ``127.0.0.1`` inside a container is the container, so a kubeconfig
-    published on loopback silently points the agent at nothing. Docker exposes
-    the host as ``host.docker.internal`` (natively on Docker Desktop, via the
-    ``--add-host`` :meth:`SandboxExecutor.wrap_argv` always passes on Linux),
-    so the port still reaches the same listener.
-
-    The apiserver certificate will not carry that name, so ``tls-server-name``
-    is set to ``localhost`` — the SAN a loopback-published cluster does have.
-    That keeps TLS verified rather than disabled: the container still checks
-    the certificate chain and the name, just against the name the certificate
-    was actually issued for.
-
-    A plan that already carries a ``rewrite_server`` is returned untouched: the
-    provider knew better (kind's in-network control-plane name verifies with
-    no override at all).
+    Loopback inside a container is the container; ``host.docker.internal``
+    reaches the same host listener. ``tls-server-name`` becomes ``localhost``
+    — the SAN such a cluster does have — so TLS stays verified rather than
+    disabled. A plan already carrying ``rewrite_server`` is left untouched.
     """
     if plan.rewrite_server:
         return plan

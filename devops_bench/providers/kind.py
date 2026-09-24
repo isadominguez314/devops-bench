@@ -65,21 +65,11 @@ class KindProvider(Provider):
         )
 
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
-        """Reach a KinD apiserver from inside a container over KinD's own network.
+        """Join KinD's ``kind`` Docker network and target the control-plane node.
 
-        KinD writes ``https://127.0.0.1:<port>`` as the server, which from a
-        container means the container itself. KinD also creates a Docker
-        network named ``kind``, and a container joined to it reaches the
-        apiserver directly at ``https://<cluster>-control-plane:6443``. That
-        beats the generic loopback rewrite because the apiserver certificate
-        already covers the control-plane node name, so TLS verifies with no
-        ``tls-server-name`` override.
-
-        Args:
-            cluster_info: The provisioned cluster to reach.
-
-        Returns:
-            The KinD plan, pinned to this cluster's ``kind-<name>`` context.
+        KinD's kubeconfig server is loopback, meaningless inside a container.
+        The apiserver certificate already covers the control-plane node name,
+        so TLS verifies without a ``tls-server-name`` override.
         """
         return NetworkPlan(
             docker_network="kind",

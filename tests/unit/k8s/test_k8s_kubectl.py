@@ -127,8 +127,7 @@ def test_get_resource_lists_across_every_namespace(mocker: MockerFixture) -> Non
 
 
 def test_get_resource_prefers_an_explicit_namespace_over_all(mocker: MockerFixture) -> None:
-    """``-n`` and ``-A`` together are an error, and the caller who named a
-    namespace meant it."""
+    """``-n`` and ``-A`` together are a kubectl error; ``-n`` wins."""
     mock_run = mocker.patch(
         "devops_bench.k8s.kubectl.run",
         return_value=_completed(stdout='{"items": []}'),
@@ -483,8 +482,6 @@ def test_is_not_found_tolerates_an_exception_without_stderr() -> None:
 
 
 def test_apply_threads_context_into_argv(mocker: MockerFixture) -> None:
-    # Applying a cluster-scoped object against whichever cluster the ambient
-    # current-context happens to name is the failure the pin exists to stop.
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 
     kubectl.apply("/tmp/manifest.yaml", namespace="prod", context="kind-bench")
@@ -502,8 +499,7 @@ def test_apply_threads_context_into_argv(mocker: MockerFixture) -> None:
 
 
 def test_get_resource_pins_context_alongside_kubeconfig(mocker: MockerFixture) -> None:
-    # The kubeconfig overlay alone is not a pin: one file routinely holds
-    # several contexts, so the read still needs to say which.
+    # One kubeconfig can hold several contexts, so the file alone is not a pin.
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed("{}"))
 
     kubectl.get_resource("pods", kubeconfig="/tmp/kc", context="gke_p_us_c")
@@ -522,8 +518,7 @@ def test_apply_and_get_resource_omit_the_flag_without_a_context(mocker: MockerFi
         assert "--context" not in call.args[0]
 
 
-# --context pinning. The flags have to land before a bare "--" separator:
-# everything after it belongs to the container command, not to kubectl.
+# --context must precede a bare "--"; later args belong to the container command.
 
 
 def test_context_lands_before_a_bare_separator() -> None:

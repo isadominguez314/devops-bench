@@ -106,26 +106,11 @@ class Provider(ABC):
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
         """Describe how a sandboxed agent container reaches this cluster.
 
-        The agent-under-test can be run inside a container (see
-        :mod:`devops_bench.agents.sandbox`), and from in there the operator's
-        kubeconfig server URL is not automatically meaningful: a local cluster
-        typically publishes its apiserver on host loopback, which resolves to
-        the container itself. Only the provider knows whether its endpoint
-        already routes and, if not, what to substitute.
-
-        The default suits any cluster whose endpoint is reachable from an
-        ordinary bridge-networked container — every cloud provider, and a
-        vcluster exposed on a routable address. The sandbox additionally
-        rewrites a *loopback* server to ``host.docker.internal`` on top of
-        whatever is returned here, so a provider only overrides this when it
-        needs something that generic step cannot infer: a Docker network to
-        join, an in-network hostname, or a context pin.
-
-        Args:
-            cluster_info: The provisioned cluster to reach.
-
-        Returns:
-            The :class:`~devops_bench.core.NetworkPlan` for this cluster.
+        The default suits any endpoint reachable from a bridge-networked
+        container; the sandbox also rewrites a loopback server to
+        ``host.docker.internal`` on top of whatever is returned. Override
+        only when that generic step cannot infer what is needed: a Docker
+        network to join, an in-network hostname, or a context pin.
         """
         del cluster_info
         return NetworkPlan()

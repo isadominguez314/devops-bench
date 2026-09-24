@@ -196,18 +196,13 @@ def _cluster(name: str = "c1") -> ClusterInfo:
 def _patch_plan_reads(
     monkeypatch: pytest.MonkeyPatch, *, contexts: tuple[str, ...] = (), server: str = ""
 ) -> None:
-    """Answer the two kubectl reads a plan build makes.
-
-    Both modules are patched because the reads leave by different doors: the
-    context probe calls ``sandbox.run`` directly, while the server read goes
-    through ``k8s.kubectl.config_value``.
-    """
+    """Answer the two kubectl reads a plan build makes; the context probe
+    uses ``sandbox.run``, the server read ``k8s.kubectl``, so patch both."""
 
     def fake_run(argv, **kwargs):
         if argv[:3] == ["kubectl", "config", "get-contexts"]:
             return SimpleNamespace(returncode=0, stdout="\n".join(contexts) + "\n", stderr="")
-        # ``--context`` is pinned right after the binary, so match on the
-        # subcommand rather than a fixed offset.
+        # ``--context`` sits right after the binary, so match the subcommand.
         assert "view" in argv
         return SimpleNamespace(returncode=0, stdout=server, stderr="")
 
@@ -231,8 +226,7 @@ def test_build_network_plan_asks_the_provider_and_passes_the_cluster(
 
     assert [c.name for c in provider.seen] == ["c1"]
     assert plan.docker_network == "kind"
-    # A provider that supplied its own rewrite is left entirely alone: kind's
-    # in-network name verifies against the apiserver cert with no override.
+    # A provider-supplied rewrite is left alone: kind's in-network name verifies as-is.
     assert plan.rewrite_server == "https://c1-control-plane:6443"
     assert plan.tls_server_name is None
     assert plan.kubectl_context == "kind-c1"
@@ -250,8 +244,7 @@ def test_build_network_plan_asks_the_provider_and_passes_the_cluster(
 def test_build_network_plan_rewrites_a_loopback_server(
     monkeypatch: pytest.MonkeyPatch, server: str, expected: str
 ) -> None:
-    """Loopback inside a container is the container, so it must be remapped —
-    and the cert only carries ``localhost``, so TLS is redirected, not disabled."""
+    """Loopback is remapped; TLS is redirected to the ``localhost`` SAN, not disabled."""
     _patch_plan_reads(monkeypatch, server=server)
 
     plan = sandbox.build_network_plan(_FakeProvider(NetworkPlan()), _cluster())
@@ -263,8 +256,7 @@ def test_build_network_plan_rewrites_a_loopback_server(
 def test_build_network_plan_leaves_a_routable_server_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A GKE endpoint already means something from a bridge-networked
-    container; rewriting it would break the run this PR exists to enable."""
+    """A routable (e.g. GKE) endpoint must not be rewritten."""
     provider = _FakeProvider(NetworkPlan(kubectl_context="gke_p_us-central1_c1"))
     _patch_plan_reads(monkeypatch, contexts=("gke_p_us-central1_c1",), server="https://34.10.0.1")
 
@@ -278,8 +270,7 @@ def test_build_network_plan_leaves_a_routable_server_alone(
 def test_build_network_plan_accepts_a_deployer_without_a_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The no-op deployer has no provider; the run still gets a usable plan
-    from the ambient context rather than a refusal."""
+    """No provider (no-op deployer) yields the default ambient plan, not a refusal."""
     _patch_plan_reads(monkeypatch, server="https://34.10.0.1")
 
     assert sandbox.build_network_plan(None, _cluster()) == NetworkPlan()
@@ -288,8 +279,7 @@ def test_build_network_plan_accepts_a_deployer_without_a_provider(
 def test_build_network_plan_refuses_a_context_kubectl_does_not_know(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The provider names the run's own context. If this kubeconfig never saw
-    it, refuse rather than silently building against whatever is active."""
+    """Refuse when this kubeconfig never saw the provider-named context."""
     provider = _FakeProvider(NetworkPlan(kubectl_context="kind-c1"))
     _patch_plan_reads(monkeypatch, contexts=("kind-someone-elses-cluster",))
 
