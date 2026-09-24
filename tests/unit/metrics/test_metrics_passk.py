@@ -244,3 +244,31 @@ def test_cli_output_is_excluded_from_rescans(tmp_path: Path) -> None:
     first = (root / "passk_summary.json").read_text(encoding="utf-8")
     assert main([str(root)]) == 0
     assert (root / "passk_summary.json").read_text(encoding="utf-8") == first
+
+
+def _write(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+
+def test_cli_skips_aggregate_output_next_to_its_inputs(tmp_path: Path) -> None:
+    # Each run root holds per-task rows plus aggregate's combined rows.json/manifests.json.
+    for i, row in enumerate(_five_runs("task-a", [1.0, 1.0, 0.0])):
+        run_root = tmp_path / f"run{i}"
+        _write(run_root / "task-a" / "rows.json", [row])
+        _write(run_root / "rows.json", [dict(row, runId=f"batch{i}")])
+        _write(run_root / "manifests.json", [])
+
+    assert main([str(tmp_path)]) == 0
+    (setup,) = json.loads((tmp_path / "passk_summary.json").read_text())["setups"]
+    assert (setup["tasks"][0]["n"], setup["tasks"][0]["c"]) == (3, 2)
+
+
+def test_cli_keeps_standalone_aggregate_output(tmp_path: Path) -> None:
+    for i, row in enumerate(_five_runs("task-a", [1.0, 0.0])):
+        _write(tmp_path / f"run{i}" / "rows.json", [row])
+        _write(tmp_path / f"run{i}" / "manifests.json", [])
+
+    assert main([str(tmp_path)]) == 0
+    (setup,) = json.loads((tmp_path / "passk_summary.json").read_text())["setups"]
+    assert setup["tasks"][0]["n"] == 2

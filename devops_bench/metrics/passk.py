@@ -196,6 +196,18 @@ def summarize_rows(
 _OUT_FILENAME = "passk_summary.json"
 
 
+def _drop_combined(files: list[Path]) -> list[Path]:
+    """Drop aggregate outputs (``manifests.json`` sibling) whose per-task inputs are also present."""
+    return [
+        f
+        for f in files
+        if not (
+            (f.parent / "manifests.json").exists()
+            and any(f.parent in o.parents for o in files if o != f)
+        )
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI: write ``passk_summary.json`` for the ``rows.json`` files under a root."""
     # Lazy: keeps the estimators importable without pydantic.
@@ -225,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = (Path(args.out) if args.out else Path(args.root) / _OUT_FILENAME).resolve()
 
-    files = discover_row_files(args.root, exclude=(out_path,))
+    files = _drop_combined(discover_row_files(args.root, exclude=(out_path,)))
     if not files:
         parser.error(f"no rows.json files found under {args.root}")
 
