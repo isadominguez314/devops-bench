@@ -81,36 +81,22 @@ class ClusterInfo:
 class NetworkPlan:
     """How a sandboxed container reaches this run's cluster apiserver.
 
-    This is the de-kinding seam. kind needs special knowledge (its Docker
-    network, a rewritten server URL), while a cloud cluster's endpoint already
-    means something from a bridge-networked container. Providers answer with
-    this plan via
-    :meth:`~devops_bench.providers.base.Provider.sandbox_network_plan`, so the
-    sandbox itself carries no per-provider knowledge.
-
-    It lives beside :class:`ClusterInfo` rather than in
-    :mod:`devops_bench.agents.sandbox` because both the provider layer and the
-    credential minting in :mod:`devops_bench.k8s.agent_credentials` name the
-    type, and having ``providers`` import from ``agents`` would invert the
-    layering.
+    Answered per provider via
+    :meth:`~devops_bench.providers.base.Provider.sandbox_network_plan`; lives
+    here rather than in :mod:`devops_bench.agents.sandbox` so ``providers``
+    never imports from ``agents``.
 
     Attributes:
-        docker_network: Docker network to join, or ``None`` for the default
-            bridge.
-        extra_hosts: Additional ``--add-host`` entries (``host:ip`` strings).
-            ``host.docker.internal:host-gateway`` is always added regardless,
-            so loopback-published endpoints stay reachable on Linux too.
+        docker_network: Docker network to join, or ``None`` for the default bridge.
+        extra_hosts: Extra ``--add-host`` entries (``host:ip``);
+            ``host.docker.internal:host-gateway`` is always added regardless.
         rewrite_server: Replacement apiserver URL for the generated
             kubeconfig, or ``None`` to keep the context's own server.
-        tls_server_name: Value for the kubeconfig's ``tls-server-name`` when
-            the rewritten endpoint's certificate carries a different SAN.
-        kubectl_context: kubectl context every credential read for this plan
-            is pinned to (``--context``). ``None`` falls back to the ambient
-            current-context — only acceptable when the caller has no cluster
-            identity of its own; the eval harness always pins, so a
-            current-context switched under it (an operator, a parallel
-            harness) can never hand the container another cluster's
-            credential.
+        tls_server_name: kubeconfig ``tls-server-name`` when the rewritten
+            endpoint's certificate carries a different SAN.
+        kubectl_context: kubectl context every credential read is pinned to
+            (``--context``); ``None`` uses the ambient current-context, only
+            acceptable when the caller has no cluster identity of its own.
     """
 
     docker_network: str | None = None

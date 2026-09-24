@@ -31,14 +31,9 @@ class Deployer(ABC):
     """Provisions and tears down a cluster for a benchmark run.
 
     Attributes:
-        provider: Cloud provider backing the provisioned cluster, when there
-            is one. Declared here rather than only on the subclasses that set
-            it so callers needing provider-specific behaviour — the sandbox
-            asking for a
-            :meth:`~devops_bench.providers.base.Provider.sandbox_network_plan`
-            — can read it off any deployer by contract instead of probing for
-            the attribute. ``None`` means no provider is involved (the no-op
-            deployer), and callers fall back to generic behaviour.
+        provider: Cloud provider backing the cluster, or ``None`` when no
+            provider is involved (the no-op deployer). Declared on the base
+            so callers can read it by contract instead of probing subclasses.
     """
 
     provider: Provider | None = None

@@ -36,12 +36,7 @@ _log = get_logger("providers.gcp")
 
 
 def _context_name(project: str, location: str, cluster_name: str) -> str:
-    """Return the kubectl context name ``gcloud get-credentials`` writes.
-
-    gcloud derives it from the cluster's own coordinates rather than letting
-    the caller choose, so reconstructing it is the only way to name the
-    context without re-reading the kubeconfig.
-    """
+    """Reconstruct the kubectl context name ``gcloud get-credentials`` writes."""
     return f"gke_{project}_{location}_{cluster_name}"
 
 
@@ -126,28 +121,12 @@ class GcpProvider(Provider):
         )
 
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
-        """Reach a GKE apiserver from inside a container over ordinary routing.
-
-        A GKE endpoint is a real address — public, or VPC-routable from the
-        bastion — so a bridge-networked container reaches it with no network
-        or URL surgery. All this adds is the context pin, so the credential
-        the container is handed is definitely for *this* cluster and not
-        whichever GKE context the operator's kubeconfig last selected.
-
-        Args:
-            cluster_info: The provisioned cluster to reach.
-
-        Returns:
-            A default plan pinned to this cluster's context.
+        """Pin to this cluster's GKE context; the endpoint routes as-is.
 
         Raises:
-            SandboxError: When the cluster's project or location is unknown,
-                so its context name cannot be reconstructed. Degrading to an
-                unpinned plan would mint the agent's identity and token on the
-                ambient current-context — whatever cluster the operator's
-                kubeconfig last pointed at, not necessarily this one. Only
-                sandboxed runs reach this method, so failing here cannot
-                affect an ordinary run.
+            SandboxError: If project or location is unknown — an unpinned
+                plan would mint the agent's credential on the ambient
+                current-context, not necessarily this cluster.
         """
         if not (cluster_info.project and cluster_info.location):
             raise SandboxError(

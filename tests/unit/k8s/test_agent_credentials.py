@@ -14,8 +14,7 @@
 
 """Unit tests for devops_bench.k8s.agent_credentials.
 
-The kubectl argv and the rendered YAML are the boundary this module owns, so
-that is what the tests assert on — no cluster and no docker daemon needed.
+Asserts on kubectl argv and rendered YAML — no cluster and no docker daemon needed.
 """
 
 from __future__ import annotations
@@ -35,17 +34,12 @@ from devops_bench.k8s import kubectl
 _CA = "ZmFrZS1jYQ=="
 _TOKEN = "eyJhbGciOi.fake.token"
 
-# Provisioning refuses an unpinned plan (it would write cluster-scoped objects
-# onto the ambient current-context), so the provisioning tests carry a pin.
+# Provisioning refuses an unpinned plan, so the provisioning tests carry a pin.
 _PINNED = NetworkPlan(kubectl_context="kind-c1")
 
 
 def _applies(argv: list[str], manifest: str) -> bool:
-    """Report whether ``argv`` is a kubectl apply of ``manifest``.
-
-    The manifest is matched anywhere in argv rather than at the tail: a pinned
-    call appends ``--context <name>`` after the ``-f`` path.
-    """
+    """Report whether ``argv`` applies ``manifest`` (matched anywhere; pins append --context)."""
     return "apply" in argv and any(manifest in arg for arg in argv)
 
 
@@ -63,11 +57,7 @@ def _patch_kubectl(
     policy_api: bool = True,
     calls: list[list[str]] | None = None,
 ) -> list[list[str]]:
-    """Answer every kubectl call this module makes, recording the argv.
-
-    Returns the list the argvs land in, so a test can assert on the exact
-    command line the module would have run.
-    """
+    """Answer every kubectl call the module makes; returns the list the argvs land in."""
     seen = calls if calls is not None else []
     namespaces = namespaces if namespaces is not None else {"items": []}
     pods = pods if pods is not None else {"items": []}
@@ -81,8 +71,7 @@ def _patch_kubectl(
 
     def fake_run(argv, **kwargs):
         seen.append(argv)
-        # Matched anywhere in argv, not at the tail: a pinned call appends
-        # ``--context <name>`` after the jsonpath.
+        # Matched anywhere, not at the tail: a pinned call appends --context after the jsonpath.
         asked = next((arg for arg in argv if arg in answers), None)
         if asked is not None:
             return SimpleNamespace(returncode=0, stdout=answers[asked], stderr="")
@@ -95,8 +84,7 @@ def _patch_kubectl(
                 raise SubprocessError(argv, 1, stderr="forbidden: cannot create clusterroles")
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "get" in argv:
-            # Read off the verb rather than a fixed index: the context flags go
-            # in ahead of the resource on a pinned call, and ``-A`` after it.
+            # Read off the verb, not a fixed index: pinned calls put context flags before it.
             resource = argv[argv.index("get") + 1]
             if resource == "namespaces":
                 return SimpleNamespace(returncode=0, stdout=json.dumps(namespaces), stderr="")
@@ -136,8 +124,7 @@ def test_ensure_agent_identity_applies_the_rendered_manifest(
 def test_ensure_agent_identity_pins_the_apply_to_the_runs_context(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Under vcluster the host and virtual clusters share one kubeconfig, so an
-    unpinned apply could seed the agent identity in the wrong one."""
+    """Under vcluster both clusters share one kubeconfig; unpinned applies could hit the wrong one."""
     calls = _patch_kubectl(monkeypatch)
 
     creds.ensure_agent_identity(tmp_path, "vcluster-c1")
@@ -174,9 +161,7 @@ def test_rbac_binds_edit_to_the_agent_service_account(
 def test_rbac_supplements_edit_with_the_cluster_scoped_reads_tasks_need(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``edit`` omits cluster-scoped resources, and an agent that cannot create
-    a namespace or read nodes fails ordinary tasks — which is how the
-    proposal's first observed incident started."""
+    """``edit`` omits cluster-scoped resources; without them ordinary tasks fail."""
     docs = _rbac_docs(tmp_path, monkeypatch)
     role = next(
         d
@@ -199,8 +184,7 @@ def test_rbac_supplements_edit_with_the_cluster_scoped_reads_tasks_need(
 def test_rbac_never_grants_self_escalation_or_admission_control(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, forbidden_group: str
 ) -> None:
-    """Without these two omissions every other limit is advisory: the agent
-    could grant itself more, or delete the policy denying privileged pods."""
+    """Without these omissions the agent could grant itself more or delete the policy."""
     docs = _rbac_docs(tmp_path, monkeypatch)
     for role in (d for d in docs if d["kind"] == "ClusterRole"):
         for rule in role["rules"]:
@@ -260,9 +244,7 @@ def test_render_agent_kubeconfig_emits_one_cluster_and_no_exec_block(
     assert len(config["users"]) == 1
     assert len(config["contexts"]) == 1
     assert config["clusters"][0]["cluster"]["server"] == "https://c1-control-plane:6443"
-    # No exec-plugin block and no ADC anywhere: the container can never be
-    # asked to shell out to a cloud credential helper it does not have. This
-    # is also what makes a GKE kubeconfig usable in-container at all.
+    # No exec block or ADC: the container has no cloud credential helper to shell out to.
     assert "exec" not in config["users"][0]["user"]
     assert "exec:" not in text
     assert "application_default" not in text
@@ -300,8 +282,7 @@ def test_render_agent_kubeconfig_renders_tls_server_name_when_the_plan_sets_it(
 def test_render_agent_kubeconfig_pins_reads_to_the_plans_context(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The rendered CA and server must belong to the run's own cluster even if
-    the ambient current-context was switched after provisioning."""
+    """The rendered CA/server must survive the ambient context switching after provisioning."""
     calls = _patch_kubectl(monkeypatch)
     creds.render_agent_kubeconfig(
         NetworkPlan(kubectl_context="kind-c1"), tmp_path, user_fields="token: t"
@@ -333,8 +314,7 @@ def test_render_agent_kubeconfig_refuses_without_a_server(
 def test_provision_gives_the_agent_a_service_account_token_not_a_certificate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The point of the module: the credential in the container is a scoped,
-    short-lived SA token, so the RBAC boundary does real work."""
+    """The container gets a scoped, short-lived SA token, so the RBAC boundary does real work."""
     _patch_kubectl(monkeypatch)
 
     path = creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
@@ -347,9 +327,7 @@ def test_provision_gives_the_agent_a_service_account_token_not_a_certificate(
 def test_provision_refuses_before_writing_when_the_kubeconfig_cannot_render(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A context with no embedded CA fails the final render; by then the
-    policies and RBAC are already on the cluster with nothing recording them.
-    The preflight must surface that refusal before the first apply."""
+    """Render failures must surface before the first apply, or objects are stranded on the cluster."""
     calls = _patch_kubectl(monkeypatch, ca="")
 
     with pytest.raises(SandboxError, match="certificate-authority-data"):
@@ -362,8 +340,7 @@ def test_provision_refuses_before_writing_when_the_kubeconfig_cannot_render(
 def test_provision_refuses_to_fall_back_to_the_admin_credential(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A silent fallback would look identical in the results while having no
-    RBAC boundary at all, so failing to mint must fail the run."""
+    """A silent admin fallback would look identical in the results with no RBAC boundary."""
     monkeypatch.delenv(creds.ALLOW_ADMIN_ENV, raising=False)
     _patch_kubectl(monkeypatch, mint_fails=True)
 
@@ -389,8 +366,7 @@ def test_provision_falls_back_to_the_admin_cert_only_when_told_to(
 def test_provision_refuses_the_fallback_for_an_exec_plugin_context(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A GKE context has no static certificate to copy, and its exec plugin
-    could not run inside the container anyway."""
+    """An exec-plugin context has no static certificate, and the plugin cannot run in-container."""
     monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
     _patch_kubectl(monkeypatch, mint_fails=True, cert="", key="")
 
@@ -420,9 +396,7 @@ def _doc(docs: list[dict], kind: str, name: str) -> dict:
 def test_pod_security_policy_denies_the_observed_escape(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The proposal's first incident was a privileged pod with a hostPath mount
-    reading the bench checkout off the node's disk. Every ingredient of it must
-    have a validation that rejects it."""
+    """Every ingredient of the privileged-hostPath escape must have a validation rejecting it."""
     docs = _policy_docs(tmp_path, monkeypatch)
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
     expressions = " ".join(v["expression"] for v in policy["spec"]["validations"])
@@ -437,8 +411,7 @@ def test_pod_security_policy_denies_the_observed_escape(
 def test_pod_security_policy_denies_rather_than_warns(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Detection is a tripwire; this is meant to be a boundary. A binding in
-    Warn mode would let the escape through and merely mention it."""
+    """A binding in Warn mode would let the escape through and merely mention it."""
     docs = _policy_docs(tmp_path, monkeypatch)
     binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
@@ -450,9 +423,7 @@ def test_pod_security_policy_denies_rather_than_warns(
 def test_pod_security_policy_also_matches_the_ephemeral_container_subresource(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``pods/ephemeralcontainers`` is a distinct subresource, so a rule naming
-    only ``pods`` never sees ``kubectl debug --profile=sysadmin`` — and the
-    ephemeral-container validation below it would be dead code."""
+    """A rule naming only ``pods`` never sees ``kubectl debug --profile=sysadmin``."""
     docs = _policy_docs(tmp_path, monkeypatch)
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
     resources = policy["spec"]["matchConstraints"]["resourceRules"][0]["resources"]
@@ -464,8 +435,7 @@ def test_pod_security_policy_also_matches_the_ephemeral_container_subresource(
 def test_pod_security_policy_exempts_the_clusters_own_components(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Control-plane and storage components legitimately run privileged with
-    host mounts; enforcing on them would break the cluster, not the agent."""
+    """System components legitimately run privileged; enforcing on them breaks the cluster."""
     docs = _policy_docs(tmp_path, monkeypatch)
     binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
     expr = binding["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"][0]
@@ -478,10 +448,7 @@ def test_pod_security_policy_exempts_the_clusters_own_components(
 def test_pod_security_policy_does_not_exempt_the_harness_namespace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The agent holds ``edit`` cluster-wide, so it can create pods in
-    ``bench-system``. Exempting that namespace would leave it a namespace it
-    can reach and the policy cannot see — a privileged hostPath pod one
-    ``-n bench-system`` away."""
+    """The agent can create pods in ``bench-system``, so exempting it would be an open door."""
     docs = _policy_docs(tmp_path, monkeypatch)
     binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
     expr = binding["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"][0]
@@ -492,8 +459,7 @@ def test_pod_security_policy_does_not_exempt_the_harness_namespace(
 def test_namespace_guard_denies_claiming_an_exempt_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Exemptions are by name and the agent can create namespaces, so without
-    this it could ``create ns gmp-system`` (absent on kind) and deploy there."""
+    """The agent could otherwise claim an exempt name absent on this provider and deploy there."""
     docs = _policy_docs(tmp_path, monkeypatch)
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
     binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-namespace-guard")
@@ -505,18 +471,14 @@ def test_namespace_guard_denies_claiming_an_exempt_name(
     assert "'kube-system'" in expression
     assert "'gmp-system'" in expression
     assert binding["spec"]["validationActions"] == ["Deny"]
-    # No namespaceSelector: the pod policy's ``NotIn`` would otherwise exempt
-    # the very namespace creation being guarded.
+    # No namespaceSelector: the pod policy's NotIn would exempt the very creation being guarded.
     assert "namespaceSelector" not in binding["spec"].get("matchResources", {})
 
 
 def test_pod_security_policy_exempts_namespaces_the_cluster_manages(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A name list goes stale. A plain GKE run turned up four managed
-    namespaces this one had never heard of, all inside the deny scope, one of
-    them the home of the DRA driver's privileged DaemonSet on clusters that
-    use it. The addon manager's own label covers the ones we cannot name."""
+    """A name list goes stale; the addon manager's label covers managed namespaces we cannot name."""
     docs = _policy_docs(tmp_path, monkeypatch)
     binding = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
     exprs = binding["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"]
@@ -528,10 +490,7 @@ def test_pod_security_policy_exempts_namespaces_the_cluster_manages(
 def test_namespace_guard_denies_claiming_the_managed_label(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The label half of the exemption is mutable in a way the name half is
-    not: the agent holds ``patch`` on namespaces, so without a guard on UPDATE
-    it could label one it already owns and stop every pod in it being
-    checked."""
+    """The agent holds ``patch`` on namespaces, so the mutable label half needs a guard on UPDATE."""
     docs = _policy_docs(tmp_path, monkeypatch)
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
     rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
@@ -544,10 +503,7 @@ def test_namespace_guard_denies_claiming_the_managed_label(
 def test_namespace_guard_applies_only_to_the_agents_own_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A cluster add-on recreating its own namespace must not be denied by a
-    policy that fails closed. Safe to scope by user here — unlike a pod, a
-    namespace is always created by whoever asked, never by a controller acting
-    on the agent's behalf."""
+    """Username scoping is safe here: a namespace is always created by whoever asked."""
     docs = _policy_docs(tmp_path, monkeypatch)
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
     condition = policy["spec"]["matchConditions"][0]["expression"]
@@ -569,10 +525,7 @@ def _exempt_guard_resources(docs: list[dict], operation: str) -> set[str]:
 def test_exempt_namespaces_deny_the_agents_own_workloads(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The hole a probe found: the pod policy skips these namespaces, but
-    ``edit`` is bound cluster-wide, so ``kubectl run --privileged -n
-    kube-system`` was admitted on a cluster carrying the full policy set. The
-    exemption is only safe if the agent cannot write there at all."""
+    """``edit`` is cluster-wide, so the exemption is only safe if the agent cannot write there."""
     docs = _policy_docs(tmp_path, monkeypatch)
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-exempt-namespace-guard")
 
@@ -592,10 +545,7 @@ def test_exempt_namespaces_deny_the_agents_own_workloads(
 def test_exempt_namespace_guard_covers_every_kind_that_makes_a_pod(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Denying ``pods`` alone would be one ``create deployment`` from useless:
-    the ReplicaSet controller makes that pod under an identity of its own, so
-    a username-scoped rule never sees it. The workload object is where the
-    agent's own name is still on the request."""
+    """Controllers create pods under their own identity; only the workload object carries the agent's."""
     matched = _exempt_guard_resources(_policy_docs(tmp_path, monkeypatch), "CREATE")
 
     assert {
@@ -612,9 +562,7 @@ def test_exempt_namespace_guard_covers_every_kind_that_makes_a_pod(
 def test_exempt_namespace_guard_covers_exec_into_the_clusters_own_pods(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``edit`` grants exec, and these are the namespaces whose pods are
-    legitimately privileged. A shell in kube-proxy is the same escape by a
-    longer route, and exec arrives as CONNECT, not CREATE."""
+    """A shell in a privileged system pod is the same escape; exec arrives as CONNECT, not CREATE."""
     matched = _exempt_guard_resources(_policy_docs(tmp_path, monkeypatch), "CONNECT")
 
     assert {"/pods/exec", "/pods/attach", "/pods/portforward"} <= matched
@@ -623,9 +571,7 @@ def test_exempt_namespace_guard_covers_exec_into_the_clusters_own_pods(
 def test_exempt_namespace_guard_selects_exactly_what_the_pod_policy_skips(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The two must stay exact complements, or a namespace falls through both.
-    A ``namespaceSelector`` ANDs its expressions, so the inverse of "not by
-    name AND not by label" needs one binding per half."""
+    """The two must stay exact complements, or a namespace falls through both."""
     docs = _policy_docs(tmp_path, monkeypatch)
     skipped = _doc(docs, "ValidatingAdmissionPolicyBinding", "bench-agent-pod-security")
     skipped_exprs = skipped["spec"]["matchResources"]["namespaceSelector"]["matchExpressions"]
@@ -659,8 +605,7 @@ def test_enforce_pod_security_labels_ordinary_namespaces(
 def test_enforce_pod_security_leaves_a_declared_level_alone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """One task's verifier asserts ``enforce=restricted`` on its own namespace.
-    Overwriting it would fail the task this control exists to protect."""
+    """A task verifier may assert its own enforce level; overwriting it would fail the task."""
     calls = _patch_kubectl(
         monkeypatch,
         namespaces={
@@ -676,9 +621,7 @@ def test_enforce_pod_security_leaves_a_declared_level_alone(
 def test_enforce_pod_security_leaves_the_clusters_own_namespaces_alone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Measured on GKE: the labeller stamped ``enforce=baseline`` on exactly
-    the managed namespaces missing from the name list. The label is what the
-    cluster itself uses to say which namespaces are its to run."""
+    """Managed namespaces are identified by the addon manager's label, not just the name list."""
     calls = _patch_kubectl(
         monkeypatch,
         namespaces={
@@ -715,25 +658,20 @@ def test_enforce_pod_security_pins_every_call_to_the_runs_context(
 def test_enforce_pod_security_refuses_a_cluster_too_old_for_the_policy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``admissionregistration.k8s.io/v1`` reached GA in 1.30; a 1.29 apiserver
-    serves only ``v1beta1``. Left unchecked the apply dies with kubectl's ``no
-    matches for kind``, which reads like a typo in our own manifest."""
+    """Unchecked, the apply dies with ``no matches for kind``, which reads like a manifest typo."""
     calls = _patch_kubectl(monkeypatch, policy_api=False)
 
     with pytest.raises(SandboxError, match=creds._MIN_CLUSTER_VERSION):
         creds.enforce_pod_security(tmp_path)
 
-    # Named before anything is written, so the operator is not left wondering
-    # which half of the provisioning got applied.
+    # Refused before anything is applied, so nothing is half-provisioned.
     assert not any("apply" in c for c in calls)
 
 
 def test_the_version_refusal_is_not_the_admin_escape_hatch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The hatch exists for an operator whose credential cannot write
-    cluster-scoped objects. No credential makes a 1.29 apiserver serve a v1
-    policy, so letting the run continue would just skip the backstop."""
+    """No credential makes an old apiserver serve the policy API, so the hatch must not cover it."""
     monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
     _patch_kubectl(monkeypatch, policy_api=False)
 
@@ -772,11 +710,7 @@ def _guard_expression(docs: list[dict]) -> str:
 def test_the_shell_guard_names_pods_the_policy_arrived_too_late_for(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The deployer runs before credentials are provisioned, and fixtures like
-    ``opa-remediation`` deploy privileged pods on purpose — remediating them is
-    the task. Admission never saw those creates and cannot retract them, so the
-    agent holding cluster-wide ``pods/exec`` is node root by a route the
-    pod-security policy is blind to."""
+    """Fixtures may deploy privileged pods on purpose; admission cannot retract them, only deny exec."""
     docs = _shell_guard(
         tmp_path,
         monkeypatch,
@@ -796,8 +730,7 @@ def test_the_shell_guard_names_pods_the_policy_arrived_too_late_for(
 def test_the_shell_guard_covers_every_way_into_a_running_container(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``exec`` is the obvious one; ``attach`` reaches the same process and
-    ``port-forward`` reaches anything it is listening on."""
+    """``attach`` reaches the same process; ``port-forward`` reaches anything it listens on."""
     docs = _shell_guard(
         tmp_path, monkeypatch, pods={"items": [_pod("team-alpha", "cache", **_PRIVILEGED)]}
     )
@@ -814,9 +747,7 @@ def test_the_shell_guard_covers_every_way_into_a_running_container(
 def test_the_shell_guard_applies_only_to_the_agents_own_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Unlike the pod-security policy, this one is username-scoped: the pods it
-    names are the fixture's own, and the operator and the task's controllers
-    must keep being able to reach them."""
+    """Username-scoped: the operator and the task's controllers must keep reaching these pods."""
     docs = _shell_guard(
         tmp_path, monkeypatch, pods={"items": [_pod("team-alpha", "cache", **_PRIVILEGED)]}
     )
@@ -841,9 +772,7 @@ def test_the_shell_guard_applies_only_to_the_agents_own_identity(
 def test_the_shell_guard_reads_the_same_pod_spec_the_policy_would_have(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spec: dict
 ) -> None:
-    """The scan is kept in lockstep with the policy's CEL, not with PSA
-    ``baseline`` — a pod it skips must be one the policy would have admitted,
-    or the guard's coverage claim is a lie."""
+    """The scan mirrors the policy's CEL, not PSA baseline: it may skip only pods the policy admits."""
     docs = _shell_guard(
         tmp_path, monkeypatch, pods={"items": [_pod("team-alpha", "cache", **spec)]}
     )
@@ -854,10 +783,7 @@ def test_the_shell_guard_reads_the_same_pod_spec_the_policy_would_have(
 def test_the_shell_guard_ignores_pods_the_agent_already_cannot_reach(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Every namespace the exempt-namespace guard covers — by name or by the
-    addon manager's label — is already closed to the agent on all four verbs.
-    Naming ``kube-system``'s privileged pods here would bury the ones that
-    actually needed this."""
+    """Exempt namespaces (by name or label) are already closed to the agent on all four verbs."""
     docs = _shell_guard(
         tmp_path,
         monkeypatch,
@@ -881,11 +807,7 @@ def test_the_shell_guard_ignores_pods_the_agent_already_cannot_reach(
 def test_the_shell_guard_is_applied_even_with_nothing_to_deny(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Nothing here is torn down between runs, so a reused cluster would
-    otherwise keep the previous run's list and refuse a shell into a pod that is
-    long gone. An empty CEL list literal has no element type to infer either,
-    and a policy that fails to compile under ``failurePolicy: Fail`` denies
-    every exec the agent attempts — the opposite of inert."""
+    """A reused cluster must not keep the previous run's list; an empty CEL list would not compile."""
     calls = _patch_kubectl(monkeypatch)
 
     creds.enforce_pod_security(tmp_path)
@@ -899,8 +821,7 @@ def test_the_shell_guard_is_applied_even_with_nothing_to_deny(
 def test_the_nonconformant_scan_looks_at_every_namespace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Without ``-A`` the listing comes from the kubeconfig's current namespace,
-    which for a cluster-wide question is silently the wrong answer."""
+    """Without ``-A`` the listing is silently scoped to the kubeconfig's current namespace."""
     calls = _patch_kubectl(monkeypatch)
 
     creds.enforce_pod_security(tmp_path)
@@ -924,8 +845,7 @@ def test_provision_enforces_pod_security_by_default(
 def test_provision_honours_the_privileged_opt_out(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A task whose subject matter *is* privileged workloads can opt out, and
-    then nothing pod-security-related is applied at all."""
+    """The privileged opt-out applies nothing pod-security-related at all."""
     calls = _patch_kubectl(monkeypatch)
 
     creds.provision_agent_credentials(
@@ -942,10 +862,7 @@ def test_provision_honours_the_privileged_opt_out(
 def test_provision_refuses_a_cluster_no_provider_vouched_for(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An unpinned plan means the no-op deployer, so 'the cluster' is whatever
-    the operator's kubeconfig last pointed at. Provisioning writes a cluster-wide
-    Deny policy and ClusterRoleBindings; doing that unasked to someone's real
-    cluster is not acceptable."""
+    """Unpinned means the ambient current-context; cluster-wide writes there are unacceptable unasked."""
     monkeypatch.delenv(creds.ALLOW_AMBIENT_ENV, raising=False)
     calls = _patch_kubectl(monkeypatch)
 
@@ -969,9 +886,7 @@ def test_provision_uses_the_ambient_cluster_only_when_told_to(
 def test_provision_fails_loud_when_pod_security_cannot_be_applied(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The policy apply is the first cluster-scoped write, so it is what fails
-    for an operator who cannot create cluster-scoped objects. Running the agent
-    anyway would leave the observed escape undenied."""
+    """Running the agent without the policy would leave the privileged-pod escape undenied."""
     monkeypatch.delenv(creds.ALLOW_ADMIN_ENV, raising=False)
     calls: list[list[str]] = []
     _patch_kubectl(monkeypatch, calls=calls)
@@ -991,9 +906,7 @@ def test_provision_fails_loud_when_pod_security_cannot_be_applied(
 def test_the_admin_escape_hatch_also_covers_the_pod_security_apply(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """One switch, because both failures have one cause: an operator who cannot
-    create cluster roles cannot create an admission policy either. Before this,
-    the policy apply raised first and the hatch was unreachable."""
+    """One switch for both failures, or the policy apply raises first and the hatch is unreachable."""
     monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
     _patch_kubectl(monkeypatch)
     real = kubectl.run
