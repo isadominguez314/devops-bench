@@ -272,3 +272,15 @@ def test_cli_keeps_standalone_aggregate_output(tmp_path: Path) -> None:
     assert main([str(tmp_path)]) == 0
     (setup,) = json.loads((tmp_path / "passk_summary.json").read_text())["setups"]
     assert setup["tasks"][0]["n"] == 2
+
+
+def test_cli_skips_aggregate_output_in_a_separate_dir(tmp_path: Path) -> None:
+    rows = _five_runs("task-a", [1.0, 1.0, 0.0])
+    for i, row in enumerate(rows):
+        _write(tmp_path / f"run{i}" / "rows.json", [row])
+    _write(tmp_path / "batch" / "rows.json", [dict(r, runId="batch") for r in rows])
+    _write(tmp_path / "batch" / "manifests.json", [])
+
+    assert main([str(tmp_path)]) == 0
+    (setup,) = json.loads((tmp_path / "passk_summary.json").read_text())["setups"]
+    assert (setup["tasks"][0]["n"], setup["tasks"][0]["c"]) == (3, 2)

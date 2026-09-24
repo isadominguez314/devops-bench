@@ -197,15 +197,9 @@ _OUT_FILENAME = "passk_summary.json"
 
 
 def _drop_combined(files: list[Path]) -> list[Path]:
-    """Drop aggregate outputs (``manifests.json`` sibling) whose per-task inputs are also present."""
-    return [
-        f
-        for f in files
-        if not (
-            (f.parent / "manifests.json").exists()
-            and any(f.parent in o.parents for o in files if o != f)
-        )
-    ]
+    """Drop aggregate outputs (``manifests.json`` sibling) if any per-task rows are present."""
+    per_task = [f for f in files if not (f.parent / "manifests.json").exists()]
+    return per_task or files
 
 
 def main(argv: list[str] | None = None) -> int:
