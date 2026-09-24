@@ -76,10 +76,7 @@ kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
   etcdctl "${ETCD_CERTS[@]}" snapshot save /var/lib/etcd/etcd-backup.db
 
 echo "==> Computing checksum and staging the backup onto ${WORKER_NODE}:/backup ..."
-# Per-run staging dir: a fixed /tmp path would let two concurrent runs swap or
-# delete each other's snapshot between the checksum and the copy, staging a
-# sibling cluster's backup as this run's "verified" one. The trap also cleans
-# up when set -e aborts mid-block.
+# Per-run dir: a fixed /tmp path would have concurrent runs staging over each other.
 STAGING_DIR="$(mktemp -d)"
 trap 'rm -rf "${STAGING_DIR}"' EXIT
 docker exec "${SNAP_NODE}" sha256sum /var/lib/etcd/etcd-backup.db | awk '{print $1}' > "${STAGING_DIR}/etcd-backup.sha256"
@@ -113,17 +110,25 @@ elif [ "${kill_rc}" -ne 0 ]; then
   echo "    crictl kill exited ${kill_rc}; the health assert below decides"
 fi
 
-echo "==> Verifying the fault took hold (expect exactly 2 healthy members)..."
+echo "==> Verifying the fault took hold (expect a stable 2 healthy members)..."
+# One 2-healthy reading only proves the kill: during the kubelet restart gap the
+# count reads 2 even when the corruption failed and the member is about to rejoin.
 healthy=0
+stable=0
 for _ in $(seq 1 36); do
   healthy="$(kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
     etcdctl "${ETCD_CERTS[@]}" endpoint health --cluster 2>&1 \
     | grep -c 'is healthy' || true)"
-  [ "${healthy}" -eq 2 ] && break
+  if [ "${healthy}" -eq 2 ]; then
+    stable=$((stable + 1))
+    [ "${stable}" -ge 3 ] && break
+  else
+    stable=0
+  fi
   sleep 5
 done
-if [ "${healthy}" -ne 2 ]; then
-  echo "ERROR: fault injection did not take hold: ${healthy} healthy members (expected 2)" >&2
+if [ "${stable}" -lt 3 ]; then
+  echo "ERROR: fault injection did not take hold: ${healthy} healthy members (expected a stable 2)" >&2
   exit 1
 fi
 
