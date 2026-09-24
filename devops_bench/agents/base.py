@@ -34,6 +34,7 @@ devops_bench.agents`` pulls only this module.
 from __future__ import annotations
 
 import os
+import sys
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -109,13 +110,9 @@ class AgentHarness(ABC):
             ``AgentConfig()`` (use the agent's built-in defaults).
     """
 
-    #: Whether every agent-owned subprocess in this harness goes through
-    #: :meth:`run_agent_cmd`. :meth:`run` refuses a sandboxed config on a
-    #: harness that has not been migrated onto the seam: its direct
-    #: ``run(...)`` calls would execute on the host with the operator's
-    #: ambient credentials while the operator believes the run is contained.
-    #: A subclass flips this to ``True`` only once all its call sites are on
-    #: the seam.
+    #: Whether every agent-owned subprocess goes through :meth:`run_agent_cmd`.
+    #: :meth:`run` refuses a sandboxed config on an unmigrated harness — its
+    #: direct calls would run on the host while the operator believes otherwise.
     supports_sandbox: bool = False
 
     def __init__(self, config: AgentConfig | None = None) -> None:
@@ -140,12 +137,9 @@ class AgentHarness(ABC):
             subclass crash produces ``AgentResult.errored(msg)``.
 
         Raises:
-            SandboxError: When the run is sandboxed but this harness has not
-                been migrated onto the :meth:`run_agent_cmd` seam, or when
-                the executor itself refuses mid-run. Deliberately *not*
-                converted to an errored result: a containment failure is an
-                infrastructure failure, not an agent performance, and the
-                eval harness records it as a failed, unscored run.
+            SandboxError: Sandboxed config on an unmigrated harness, or the
+                executor refused mid-run. Not converted to an errored result:
+                a containment failure must not score as agent performance.
         """
         if self.config.sandbox is not None and not self.supports_sandbox:
             raise SandboxError(
@@ -164,9 +158,7 @@ class AgentHarness(ABC):
                 result.latency = elapsed
             return result
         except SandboxError:
-            # Never swallowed into an errored result: that would score a broken
-            # boundary as a badly-performing agent. Propagates to the eval
-            # harness's failed-record path instead.
+            # A broken boundary must not score as a badly-performing agent.
             raise
         except Exception as exc:  # noqa: BLE001 - safety net for the whole benchmark
             elapsed = time.monotonic() - start
@@ -199,12 +191,9 @@ class AgentHarness(ABC):
         off a call site swapped onto this method behaves byte-for-byte as its
         direct ``run(...)`` call did.
 
-        A sandbox that cannot run raises ``SandboxError`` rather than falling
-        back to the host: a containment control that quietly degrades is
-        worse than none. :meth:`run`'s safety net deliberately re-raises it
-        (instead of converting to an errored result) so the eval harness
-        records a failed, unscored run — a broken boundary must never read
-        as a badly-performing agent.
+        A sandbox that cannot run raises ``SandboxError`` (see its docstring
+        for why that is fatal rather than a fallback); :meth:`run` re-raises
+        it so the eval harness records a failed, unscored run.
 
         Args:
             cmd: Command and arguments, never a shell string.
@@ -219,10 +208,10 @@ class AgentHarness(ABC):
             check / capture / text / timeout / input: As in
                 ``core.subprocess.run``. ``input`` is rejected in the sandbox
                 (the container runs without stdin, by design).
-            host_run: Callable used on the unsandboxed path, defaulting to
-                ``core.subprocess.run``. Concrete agents pass their own
-                module-level ``run`` import so that symbol stays the seam
-                their unit tests already patch.
+            host_run: Callable used on the unsandboxed path. When omitted,
+                the concrete harness module's own ``run`` import is used (the
+                symbol its unit tests patch), falling back to
+                ``core.subprocess.run``.
 
         Returns:
             The completed process, in either mode.
@@ -244,8 +233,13 @@ class AgentHarness(ABC):
                 timeout=timeout,
                 input=input,
             )
-        runner = host_run if host_run is not None else _host_subprocess_run
-        return runner(
+        if host_run is None:
+            # Default to the harness module's own ``run`` import — the symbol
+            # its unit tests patch. A harness that forgot host_run= would
+            # otherwise bypass those patches and hit the real subprocess.
+            candidate = getattr(sys.modules.get(type(self).__module__), "run", None)
+            host_run = candidate if callable(candidate) else _host_subprocess_run
+        return host_run(
             cmd,
             cwd=cwd,
             env=env,
