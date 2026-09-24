@@ -200,15 +200,10 @@ def test_kind_ensure_account_credentials_is_noop() -> None:
 
 
 # -- sandbox network plans --------------------------------------------------
-#
-# Each provider answers how a sandboxed agent container reaches its cluster.
-# The default suits anything already routable; only providers whose endpoint
-# is meaningless from inside a container need to say more.
 
 
 def test_base_provider_defaults_to_a_plain_bridge() -> None:
-    """A provider that overrides nothing still gets a working sandbox: no
-    Docker network, no rewrite, no pin."""
+    """A provider that overrides nothing gets a plain-bridge plan."""
 
     class _BareProvider(Provider):
         def ensure_account_credentials(self) -> None: ...
@@ -241,8 +236,7 @@ def test_kind_plan_joins_the_kind_network_and_rewrites_the_server() -> None:
 
 
 def test_gcp_plan_pins_the_context_without_rewriting() -> None:
-    """A GKE endpoint routes from a bridge-networked container as-is; all the
-    plan adds is the pin naming this cluster's own context."""
+    """A GKE endpoint routes as-is; the plan only pins the context."""
     info = ClusterInfo(name="c1", location="us-central1-a", project="p")
 
     plan = GcpProvider().sandbox_network_plan(info)
@@ -251,16 +245,13 @@ def test_gcp_plan_pins_the_context_without_rewriting() -> None:
 
 
 def test_gcp_plan_refuses_when_the_cluster_is_underspecified() -> None:
-    """An unpinned plan here is not a degraded plan, it is an unidentified
-    cluster: the agent's identity and token would be minted against the
-    ambient current-context, which no provider vouched for."""
+    """Unpinned would mint the agent's credential on the ambient context."""
     with pytest.raises(SandboxError, match="project/location"):
         GcpProvider().sandbox_network_plan(ClusterInfo(name="c1"))
 
 
 def test_vcluster_plan_pins_the_virtual_clusters_own_context(tmp_path: Path) -> None:
-    """The pin is what keeps the agent's ServiceAccount created INSIDE the
-    virtual cluster rather than on the host cluster it exists to hide."""
+    """The pin keeps the agent's ServiceAccount inside the virtual cluster."""
     kubeconfig = tmp_path / "vcluster.yaml"
     kubeconfig.write_text("apiVersion: v1\nkind: Config\ncurrent-context: vcluster-c1\n")
 
@@ -272,10 +263,7 @@ def test_vcluster_plan_pins_the_virtual_clusters_own_context(tmp_path: Path) -> 
 
 
 def test_vcluster_plan_refuses_rather_than_dropping_the_pin(tmp_path: Path) -> None:
-    """An unpinned plan is not a degraded plan here, it is the wrong cluster:
-    the agent's identity and token would be minted against the ambient
-    context, which on a vcluster run is the HOST cluster the virtual one exists
-    to hide."""
+    """Unpinned would mint the agent's credential on the host cluster."""
     with pytest.raises(SandboxError, match="host cluster"):
         VClusterProvider().sandbox_network_plan(
             ClusterInfo(name="c1", kubeconfig_path=str(tmp_path / "missing.yaml"))
