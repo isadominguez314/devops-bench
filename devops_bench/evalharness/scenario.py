@@ -207,12 +207,7 @@ class ScenarioManager:
             return
 
         if not chaos_result.success:
-            # The planned disruption never landed, so there is nothing to
-            # verify. Running the check anyway measures an undisturbed cluster,
-            # which reads as a pass for a fault that did not happen — and the
-            # derived perf numbers would report 100% uptime under a load spike
-            # that never fired. Record the injection failure in the
-            # verification slot instead and leave ``perf_report`` empty.
+            # Nothing landed: verifying now would measure an undisturbed cluster.
             self._record_injection_failure(spec, chaos_result)
             return
 
@@ -255,16 +250,8 @@ class ScenarioManager:
     def _record_injection_failure(self, spec: ChaosSpec, result: ChaosResult) -> None:
         """Stamp an un-injected disruption into the report's verification slot.
 
-        Mirrors the typed :class:`~devops_bench.verification.VerificationResult`
-        dump shape used by the resolved-entry path, so downstream consumers need
-        no special-case parse — but with ``status: "error"``. The check was
-        never *observed*, which is not the same as observing it false. This is
-        the run record only; the scored report is handled separately, by the
-        harness reading ``chaos_report["status"]`` after the drain.
-
-        Args:
-            spec: The chaos spec whose injection failed.
-            result: The unsuccessful :class:`~devops_bench.chaos.ChaosResult`.
+        Mirrors the resolved-entry dump shape but with ``status: "error"``:
+        never observed, which is not the same as observed false.
         """
         detail = result.error or result.output or "no detail reported"
         reason = (

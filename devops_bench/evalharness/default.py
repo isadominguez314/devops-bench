@@ -126,31 +126,24 @@ _SCENARIO_JOIN_SEC = VERIFICATION_TIMEOUT_SEC + 60
 
 
 def _scenario_join_budget(chaos_specs: Sequence[ChaosSpec]) -> float:
-    """The drain budget, widened to cover a spike still running by design.
+    """Drain budget widened for a spike that deliberately outlives the agent's turn.
 
-    ``_SCENARIO_JOIN_SEC`` alone assumes the scenario thread is essentially
-    done by the time the agent's turn ends. A load spike breaks that
-    assumption deliberately: optimize-scale declares 300s precisely so the
-    surge is still live when verification starts, and the scenario thread
-    cannot finish until fortio does. Draining on the flat budget would join
-    for 180s against a spike with ~300s left, stamp ``"timed_out"``, and hand
-    :func:`chaos_invalidated_entries` a non-success status — discarding a run
-    whose fault fired exactly as intended.
-
-    This was unreachable while every command was capped at 40s. Deriving the
-    budget from the same declared duration the fault derives its own timeout
-    from keeps the two in step.
+    Joining on the flat budget against a still-running spike would stamp
+    ``"timed_out"`` and invalidate a run whose fault fired as intended, so the
+    budget derives from the same duration and ceiling the fault's timeout uses.
     """
     if not chaos_specs:
         return _SCENARIO_JOIN_SEC
-    # Duck-typed rather than imported: only some faults declare a duration,
-    # and the harness has no business knowing which concrete target model it
-    # is holding.
-    declared = getattr(getattr(chaos_specs[0].action, "target", None), "duration", None)
+    # Duck-typed: only some faults declare a duration on their target.
+    target = getattr(chaos_specs[0].action, "target", None)
+    if target is None or not hasattr(target, "duration"):
+        return _SCENARIO_JOIN_SEC
+    declared = target.duration
+    if declared is None:
+        # The model picks the spike length; budget for the longest the fault allows.
+        return _SCENARIO_JOIN_SEC + _LOAD_TIMEOUT_CEILING_SEC
     if not isinstance(declared, str):
         return _SCENARIO_JOIN_SEC
-    # Same parser and same ceiling the fault uses to size its own timeout, so
-    # the drain budget cannot drift away from what the spike is allowed to run.
     seconds = _go_duration_seconds(declared)
     if seconds is None:
         return _SCENARIO_JOIN_SEC
@@ -161,31 +154,11 @@ def chaos_invalidated_entries(
     chaos_specs: Sequence[ChaosSpec],
     chaos_report: Mapping[str, Any],
 ) -> dict[str, str]:
-    """Name the chaos-referenced entries that must not be scored, and why.
+    """Return ``{entry_name: reason}`` for chaos ``verify:`` entries that must not be scored.
 
-    A ``verify:`` entry only means something while the planned disruption is
-    live. The post-run pass evaluates every entry unconditionally, so when
-    injection failed it re-runs that entry against a cluster that was never
-    disrupted — which passes, and records a satisfied objective for a fault
-    that never happened. Naming the entry here makes the caller record it as
-    ``status: "error"`` instead: never observed, so it leaves the correctness
-    denominator and drops ``VerificationCoverage`` below 1.0 rather than
-    granting credit.
-
-    Only the scheduled spec is considered:
-    :meth:`DefaultEvalHarness.start_scenario` drives ``chaos_specs[0]`` and
-    warns about the rest, so it is the only reference that was ever meant to
-    be observed under load.
-
-    Args:
-        chaos_specs: The task's parsed chaos specs, in declaration order.
-        chaos_report: The drained chaos report for this run.
-
-    Returns:
-        ``{entry_name: reason}`` for each reference that must not be scored;
-        empty when the task declared no chaos, the report is empty (no
-        scenario ran), the scheduled spec opted out of verification, or the
-        injection succeeded.
+    When injection failed, evaluating the referenced entry would measure an
+    undisrupted cluster and grant credit for a fault that never happened.
+    Only ``chaos_specs[0]`` is considered — it is the only spec scheduled.
     """
     if not chaos_specs or not chaos_report:
         return {}
@@ -594,20 +567,7 @@ class DefaultEvalHarness(Harness):
 
     @staticmethod
     def _never_observed(entry: VerificationEntry, reason: str) -> dict[str, Any]:
-        """Shape an entry that was never evaluated, not one observed false.
-
-        ``status: "error"`` is what the rollup keys off to keep an entry out of
-        every signal's numerator *and* denominator while dropping
-        ``VerificationCoverage`` below 1.0 — the established way to say "this
-        was not observed" without scoring it either way.
-
-        Args:
-            entry: The entry that went unevaluated.
-            reason: Operator-facing explanation, recorded verbatim.
-
-        Returns:
-            One report mapping in the shape ``rollup`` consumes.
-        """
+        """Shape an entry that was never evaluated: ``status: "error"``, scored neither way."""
         return {
             "name": entry.name,
             **_entry_display_fields(entry),
@@ -700,9 +660,7 @@ class DefaultEvalHarness(Harness):
         objective_holds: list[int] = []
 
         for index, entry in enumerate(entries):
-            # Checked ahead of the mode/role split: an entry whose disruption
-            # never landed was not observed under *any* mode, so a hold entry
-            # named here is skipped exactly like a converging one.
+            # Ahead of the mode/role split: a hold entry named here is skipped too.
             chaos_reason = invalidated.get(entry.name)
             if chaos_reason is not None:
                 _log.warning("not scoring verification entry %r: %s", entry.name, chaos_reason)
@@ -1130,8 +1088,7 @@ class DefaultEvalHarness(Harness):
         workspace_path: Path | None = None
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
-        # Tracked from parse time so the exception path can also tell whether a
-        # chaos-referenced entry went un-injected before it scores anything.
+        # Parse-time copy so the exception path can also consult the chaos specs.
         chaos_specs: list[ChaosSpec] = []
         # Track the substituted prompt / expectation / safety checklists as they
         # are computed so a failed record can carry the same resolved strings a
@@ -1309,9 +1266,7 @@ class DefaultEvalHarness(Harness):
                 exception_verification_status = "skipped_no_infra"
             elif infra_up and entries:
                 try:
-                    # The success path drains the scenario before verifying; on
-                    # this path it may never have been drained, so snapshot it
-                    # here to apply the same chaos-invalidation rule.
+                    # Never drained on this path; snapshot for the same invalidation rule.
                     partial_chaos_report: dict[str, Any] = {}
                     if scenario_manager is not None:
                         partial_chaos_report, _ = scenario_manager.get_reports()

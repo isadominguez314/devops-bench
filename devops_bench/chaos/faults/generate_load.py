@@ -61,23 +61,13 @@ _LOAD_MARKER = "fortio load"
 # Wall-clock ceiling for a single chaos command that is not a load spike.
 _COMMAND_TIMEOUT = 40
 
-# A load spike has to outlive its own ``-t`` duration, so its ceiling is derived
-# from the command rather than fixed. The flat 40s ceiling silently killed every
-# spike a task declared for longer than that: optimize-scale asks for 300s
-# deliberately (so the spike is still running when verification starts), fortio
-# was SIGKILLed at 40s, the fault recorded exit -1, and the run was scored
-# ``chaos_invalidated`` with the reason "load did not reach the workload" — which
-# reads as unreachable rather than cut short.
+# A load spike must outlive its own ``-t`` duration: the flat 40s ceiling
+# silently SIGKILLed every spike declared for longer (optimize-scale asks for 300s).
 _LOAD_TIMEOUT_SLACK_SEC = 60
 _LOAD_TIMEOUT_CEILING_SEC = 900
 
-# Ceiling on the tool output handed back to the chaos model. fortio logs a line
-# per request, so a 300s spike at 300 qps returns on the order of 90k lines --
-# more than the model's whole context window, and the call fails with
-# "input token count exceeds the maximum". Nothing in the spike's own log is
-# load-bearing: the summary the model reasons about is the tail. This became
-# reachable only once spikes stopped being killed at 40s, which is why the
-# uncapped return went unnoticed.
+# Ceiling on tool output handed back to the chaos model; fortio logs per request,
+# so an unclamped 300s spike overflows the model's context window.
 _MAX_TOOL_OUTPUT_CHARS = 20_000
 _HEAD_CHARS = 4_000
 
@@ -107,12 +97,7 @@ _TARGET_READY_TIMEOUT_SEC = 120
 
 
 def _go_duration_seconds(value: str) -> float | None:
-    """Parse a Go-style duration (``300s``, ``5m``, ``1h30m``) into seconds.
-
-    fortio takes its ``-t`` in Go's format. Returns ``None`` for anything not
-    understood, so the caller falls back to the fixed ceiling rather than
-    inventing a budget from a value it misread.
-    """
+    """Parse a Go-style duration (``300s``, ``5m``, ``1h30m``); ``None`` if unparsable."""
     parts = re.findall(r"([0-9]*\.?[0-9]+)\s*(ms|h|m|s)", value.strip())
     if not parts:
         return None
@@ -124,20 +109,22 @@ def _go_duration_seconds(value: str) -> float | None:
 
 
 def _command_timeout(argv: list[str], *, is_load: bool) -> float:
-    """Wall-clock ceiling for this command.
-
-    A load spike gets its declared duration plus slack (bounded), so the
-    generator is never killed mid-spike. Everything else keeps the flat
-    ceiling.
-    """
+    """Wall-clock ceiling: a load spike gets its declared ``-t`` plus slack, bounded."""
     if not is_load:
         return _COMMAND_TIMEOUT
     for index, token in enumerate(argv):
-        if token == "-t" and index + 1 < len(argv):
-            declared = _go_duration_seconds(argv[index + 1])
-            if declared is None:
-                break
-            return min(declared + _LOAD_TIMEOUT_SLACK_SEC, _LOAD_TIMEOUT_CEILING_SEC)
+        # Go's flag package accepts -t 300s, -t=300s, --t 300s, and --t=300s.
+        value: str | None = None
+        if token in ("-t", "--t") and index + 1 < len(argv):
+            value = argv[index + 1]
+        elif token.startswith(("-t=", "--t=")):
+            value = token.split("=", 1)[1]
+        if value is None:
+            continue
+        declared = _go_duration_seconds(value)
+        if declared is None:
+            break
+        return min(declared + _LOAD_TIMEOUT_SLACK_SEC, _LOAD_TIMEOUT_CEILING_SEC)
     return _COMMAND_TIMEOUT
 
 
@@ -200,13 +187,7 @@ RUN_COMMAND_TOOL = SimpleNamespace(
 
 
 def _clamp_tool_output(text: str) -> str:
-    """Bound a tool's output so one chatty command cannot exhaust the context.
-
-    Keeps the head (the command's own echo of what it is doing) and, weighted
-    heavier, the tail (fortio's summary), with an explicit marker in between so
-    the model is told the middle was dropped rather than silently shown a
-    truncated log.
-    """
+    """Keep the head and (heavier) the tail, with a marker naming what was dropped."""
     if len(text) <= _MAX_TOOL_OUTPUT_CHARS:
         return text
     tail_chars = _MAX_TOOL_OUTPUT_CHARS - _HEAD_CHARS
@@ -291,7 +272,8 @@ def run_chaos_command(
             load_result["returncode"] = None
             load_result["ok"] = False
             load_result["error"] = f"{type(exc).__name__}: {exc}"
-        return f"Error: {exc}"
+        # A timeout's message embeds the captured stderr, so it needs the clamp too.
+        return _clamp_tool_output(f"Error: {exc}")
 
 
 class LoadTarget(BaseModel):

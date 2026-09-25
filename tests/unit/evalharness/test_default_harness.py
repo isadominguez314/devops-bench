@@ -1461,20 +1461,22 @@ class TestScenarioJoinBudget:
     def test_no_chaos_keeps_the_flat_budget(self) -> None:
         assert harness_default._scenario_join_budget(()) == harness_default._SCENARIO_JOIN_SEC  # noqa: SLF001
 
-    def test_a_spec_without_a_declared_duration_keeps_the_flat_budget(self) -> None:
+    def test_an_undeclared_duration_budgets_for_the_fault_ceiling(self) -> None:
+        # The model picks the spike length, so the drain must cover the longest
+        # spike the fault's own timeout allows or a valid run reads "timed_out".
         assert harness_default._scenario_join_budget([_spike_spec()]) == (  # noqa: SLF001
+            harness_default._SCENARIO_JOIN_SEC + gl._LOAD_TIMEOUT_CEILING_SEC  # noqa: SLF001
+        )
+
+    def test_a_target_without_a_duration_field_keeps_the_flat_budget(self) -> None:
+        spec = _spike_spec()
+        object.__setattr__(spec.action, "target", object())
+        assert harness_default._scenario_join_budget([spec]) == (  # noqa: SLF001
             harness_default._SCENARIO_JOIN_SEC  # noqa: SLF001
         )
 
     def test_the_budget_covers_the_declared_spike(self) -> None:
-        """The optimize-scale case: 300s of spike must not be cut off at 180s.
-
-        The task declares 300s precisely so the surge is still live when
-        verification starts, so the flat budget would join against a spike
-        with ~300s left, stamp "timed_out", and invalidate a run whose fault
-        fired exactly as designed. Unreachable while every command was capped
-        at 40s, which is why it never showed up before.
-        """
+        """The optimize-scale case: 300s of spike must not be cut off at 180s."""
         budget = harness_default._scenario_join_budget(  # noqa: SLF001
             [self._spec_with_duration("300s")]
         )

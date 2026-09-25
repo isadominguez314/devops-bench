@@ -467,25 +467,33 @@ def test_inject_port_forward_setup_failure_becomes_failed_result() -> None:
 class TestLoadCommandTimeout:
     """A spike must outlive its own ``-t``; everything else keeps the flat cap."""
 
-    def test_spike_timeout_covers_the_declared_duration(self):
-        # 300s is what optimize-scale declares. Under the old flat 40s ceiling
-        # fortio was killed mid-spike and the fault reported "load did not reach
-        # the workload", which reads as unreachable rather than cut short.
+    def test_spike_timeout_covers_the_declared_duration(self) -> None:
+        # 300s is what optimize-scale declares; the flat 40s ceiling killed it mid-spike.
         argv = ["fortio", "load", "-qps", "300", "-t", "300s", "-c", "2", "http://localhost:8080"]
         assert gl._command_timeout(argv, is_load=True) > 300
 
-    def test_spike_timeout_is_bounded(self):
+    def test_spike_timeout_is_bounded(self) -> None:
         argv = ["fortio", "load", "-t", "24h", "http://localhost:8080"]
         assert gl._command_timeout(argv, is_load=True) == gl._LOAD_TIMEOUT_CEILING_SEC
 
-    def test_non_load_command_keeps_the_flat_ceiling(self):
+    def test_non_load_command_keeps_the_flat_ceiling(self) -> None:
         assert gl._command_timeout(["kubectl", "get", "pods"], is_load=False) == gl._COMMAND_TIMEOUT
 
-    def test_unparsable_duration_falls_back_rather_than_guessing(self):
+    def test_unparsable_duration_falls_back_rather_than_guessing(self) -> None:
         argv = ["fortio", "load", "-t", "banana", "http://localhost:8080"]
         assert gl._command_timeout(argv, is_load=True) == gl._COMMAND_TIMEOUT
 
-    def test_load_without_a_duration_flag_keeps_the_flat_ceiling(self):
+    @pytest.mark.parametrize("flag", ["-t=300s", "--t=300s"])
+    def test_the_equals_flag_form_is_honored(self, flag: str) -> None:
+        # Go's flag package accepts -t=300s; missing it re-creates the 40s kill.
+        argv = ["fortio", "load", flag, "http://localhost:8080"]
+        assert gl._command_timeout(argv, is_load=True) > 300
+
+    def test_the_double_dash_flag_form_is_honored(self) -> None:
+        argv = ["fortio", "load", "--t", "300s", "http://localhost:8080"]
+        assert gl._command_timeout(argv, is_load=True) > 300
+
+    def test_load_without_a_duration_flag_keeps_the_flat_ceiling(self) -> None:
         assert gl._command_timeout(["fortio", "load", "http://x"], is_load=True) == (
             gl._COMMAND_TIMEOUT
         )
@@ -494,17 +502,17 @@ class TestLoadCommandTimeout:
         ("value", "expected"),
         [("300s", 300.0), ("5m", 300.0), ("1h30m", 5400.0), ("250ms", 0.25), ("nope", None)],
     )
-    def test_go_duration_parsing(self, value, expected):
+    def test_go_duration_parsing(self, value: str, expected: float | None) -> None:
         assert gl._go_duration_seconds(value) == expected
 
 
 class TestToolOutputClamp:
     """One chatty load run must not exhaust the model's context."""
 
-    def test_short_output_is_passed_through_untouched(self):
+    def test_short_output_is_passed_through_untouched(self) -> None:
         assert gl._clamp_tool_output("Stdout: done\n") == "Stdout: done\n"
 
-    def test_a_per_request_log_is_bounded_and_keeps_both_ends(self):
+    def test_a_per_request_log_is_bounded_and_keeps_both_ends(self) -> None:
         # fortio logs a line per request; a 300s spike at 300 QPS is what
         # overflowed a one-million-token context on the recorded runs.
         text = "HEAD-MARKER\n" + "".join(f"request {i} ok\n" for i in range(90_000))
@@ -520,11 +528,11 @@ class TestToolOutputClamp:
         # Told it was elided, rather than silently shown a truncated log.
         assert "elided by the harness" in clamped
 
-    def test_the_elision_marker_reports_how_much_went_missing(self):
+    def test_the_elision_marker_reports_how_much_went_missing(self) -> None:
         text = "x" * (gl._MAX_TOOL_OUTPUT_CHARS + 500)
         assert "[500 characters elided" in gl._clamp_tool_output(text)
 
-    def test_output_at_the_limit_is_not_clamped(self):
+    def test_output_at_the_limit_is_not_clamped(self) -> None:
         text = "y" * gl._MAX_TOOL_OUTPUT_CHARS
         assert gl._clamp_tool_output(text) == text
 
@@ -532,7 +540,7 @@ class TestToolOutputClamp:
 class TestLoadTimeoutFailsClosed:
     """A spike killed by its own timeout must not read as a spike that ran."""
 
-    def test_a_timed_out_spike_is_recorded_as_not_ok(self):
+    def test_a_timed_out_spike_is_recorded_as_not_ok(self) -> None:
         """The exact shape of the 8-of-8 failure, pinned.
 
         Under the old flat 40s ceiling a declared 300s spike was killed here
@@ -560,7 +568,7 @@ class TestLoadTimeoutFailsClosed:
         assert "-1" in load_result["error"]
         assert out.startswith("Error:")
 
-    def test_a_non_load_command_that_raises_leaves_the_spike_record_alone(self):
+    def test_a_non_load_command_that_raises_leaves_the_spike_record_alone(self) -> None:
         """Only a real spike may write the spike record."""
         load_result: dict[str, Any] = {}
         killed = SubprocessError(["kubectl"], returncode=-1, stdout="", stderr="")
@@ -570,7 +578,17 @@ class TestLoadTimeoutFailsClosed:
         assert load_result == {}
         assert out.startswith("Error:")
 
-    def test_the_declared_optimize_scale_spike_gets_its_full_duration_plus_slack(self):
+    def test_a_timeout_error_is_clamped_before_reaching_the_model(self) -> None:
+        # SubprocessError's message embeds the captured stderr, so an unclamped
+        # timeout could hand the model everything the clamp exists to drop.
+        err = SubprocessError(["fortio", "load"], returncode=-1, stderr="x" * 100_000)
+        with patch.object(gl, "run", side_effect=err):
+            out = run_chaos_command("fortio load -t 300s http://localhost:8080")
+        assert out.startswith("Error:")
+        assert len(out) <= gl._MAX_TOOL_OUTPUT_CHARS + 200
+        assert "elided by the harness" in out
+
+    def test_the_declared_optimize_scale_spike_gets_its_full_duration_plus_slack(self) -> None:
         """Exact value, not just "more than 300"; 300s + 60s slack."""
         argv = ["fortio", "load", "-qps", "300", "-t", "300s", "-c", "2", "http://localhost:8080"]
         assert gl._command_timeout(argv, is_load=True) == 360.0
@@ -590,18 +608,11 @@ def _fortio_shim(tmp_path: Path, body: str) -> Path:
 
 
 class TestLoadTimeoutAgainstARealSubprocess:
-    """The timeout is enforced by ``subprocess``, so prove it there too.
-
-    Everything else mocks ``gl.run``, which cannot catch a regression in the
-    argument actually handed to it. These drive a real child process through
-    the real code path. ``_COMMAND_TIMEOUT`` is shrunk so the two arms differ
-    in seconds rather than minutes; the ratio under test is the same one that
-    killed a 300s spike at 40s.
-    """
+    """Drive a real child process: mocks cannot catch a bad argument handed to run."""
 
     def test_a_declared_spike_outlives_the_flat_ceiling(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
+    ) -> None:
         monkeypatch.setattr(gl, "_COMMAND_TIMEOUT", 0.5)
         shim = _fortio_shim(tmp_path, "sleep 2\necho 'All done 100 calls'")
         load_result: dict[str, Any] = {}
@@ -618,7 +629,7 @@ class TestLoadTimeoutAgainstARealSubprocess:
 
     def test_a_command_with_no_declared_duration_still_hits_the_flat_ceiling(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
+    ) -> None:
         """The ceiling is not simply gone — an undeclared runaway is still cut off."""
         monkeypatch.setattr(gl, "_COMMAND_TIMEOUT", 0.5)
         shim = _fortio_shim(tmp_path, "sleep 5")
@@ -635,7 +646,7 @@ class TestLoadTimeoutAgainstARealSubprocess:
         assert out.startswith("Error:")
         assert elapsed < 5
 
-    def test_a_chatty_spike_comes_back_bounded(self, tmp_path: Path):
+    def test_a_chatty_spike_comes_back_bounded(self, tmp_path: Path) -> None:
         """The clamp applies to real captured output, not just to a string."""
         shim = _fortio_shim(
             tmp_path,
