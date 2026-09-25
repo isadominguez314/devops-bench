@@ -53,6 +53,7 @@ from devops_bench.core import (
     MissingDependencyError,
     NotRegisteredError,
     RunContext,
+    SandboxError,
     get_bool,
     get_env,
     get_logger,
@@ -874,6 +875,17 @@ class DefaultEvalHarness(Harness):
         """
         sandboxed = self._agent_config.sandbox is not None
         if sandboxed:
+            # Fail before any run dir or cluster exists: an unmigrated agent
+            # would otherwise provision a cluster per task only to fail each
+            # one with the per-task SandboxError (which stays as depth).
+            _ensure_builtin_agents_registered()
+            agent_cls = AGENTS.get(_canonical_agent_type(self.agent_type))
+            if agent_cls is not None and not getattr(agent_cls, "supports_sandbox", False):
+                raise SandboxError(
+                    f"agent harness {agent_cls.__name__} has not been migrated onto "
+                    "the sandbox seam; refusing the whole batch rather than "
+                    "provisioning a cluster per task just to fail each one"
+                )
             if self.parallel:
                 # The sweep matches on the shared name prefix and cannot tell a
                 # crashed run's stray from a sibling harness's *live* agent

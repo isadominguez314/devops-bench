@@ -686,6 +686,60 @@ def test_execute_cleans_up_temp_working_dir_after_run(monkeypatch: pytest.Monkey
 # ---------------------------------------------------------------------------
 
 
+def test_execute_seeds_container_home_folder_trust_when_sandboxed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The container HOME is fresh, so the user-level folder-trust disable the
+    bastion relies on does not exist there — without seeding it a sandboxed
+    MCP arm silently runs without MCP while still recording MCP as granted."""
+    import json as _json
+
+    from devops_bench.agents.capabilities import AllCapabilities, McpBinding
+    from devops_bench.agents.sandbox import SandboxSpec
+
+    caps = AllCapabilities(mcp_servers=(McpBinding(name="k8s", command=("/bin/mcp",)),))
+    agent = GeminiCliAgent(
+        AgentConfig(target="gemini", capabilities=caps, sandbox=SandboxSpec(image="img"))
+    )
+    monkeypatch.setattr(
+        GeminiCliAgent,
+        "run_agent_cmd",
+        lambda self, argv, **kwargs: SimpleNamespace(stdout="", stderr="", returncode=0),
+    )
+    agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
+
+    seeded = tmp_path / "home" / ".gemini" / "settings.json"
+    assert seeded.exists()
+    assert _json.loads(seeded.read_text()) == {"security": {"folderTrust": {"enabled": False}}}
+
+
+def test_execute_does_not_seed_folder_trust_when_unsandboxed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from devops_bench.agents.capabilities import AllCapabilities, McpBinding
+
+    caps = AllCapabilities(mcp_servers=(McpBinding(name="k8s", command=("/bin/mcp",)),))
+    agent = GeminiCliAgent(AgentConfig(target="gemini", capabilities=caps))
+    monkeypatch.setattr(
+        GeminiCliAgent,
+        "run_agent_cmd",
+        lambda self, argv, **kwargs: SimpleNamespace(stdout="", stderr="", returncode=0),
+    )
+    agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
+    assert not (tmp_path / "home" / ".gemini").exists()
+
+
+def test_execute_refuses_a_host_home_target_when_sandboxed(tmp_path: Path) -> None:
+    """expanduser resolves ~ against the HOST home; the resulting path cannot
+    exist in the image, so refuse loudly instead of a confusing exec failure."""
+    from devops_bench.agents.sandbox import SandboxSpec
+    from devops_bench.core import SandboxError
+
+    agent = GeminiCliAgent(AgentConfig(target="~/bin/gemini", sandbox=SandboxSpec(image="img")))
+    with pytest.raises(SandboxError, match="host home"):
+        agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
+
+
 def test_build_settings_combines_mcp_servers_and_skills_flag() -> None:
     """Both knobs render; skills flag is gated on ``skills_enabled``."""
     binding = McpBinding(name="gke", command=("gke-mcp",))
