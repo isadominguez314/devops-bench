@@ -771,6 +771,63 @@ def test_sweep_stray_containers_never_raises_when_docker_is_missing(
     sandbox.sweep_stray_containers()  # must not raise
 
 
+def test_executor_run_raises_sandbox_error_on_125_under_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With check=True the host run raises before the returncode test, so the
+    125 translation must also cover the exception path — otherwise the next
+    harness migrated with default check=True scores docker failures as its
+    agent's."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["docker", "run"]:
+            raise SubprocessError(argv, returncode=125, stderr="No such image")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with pytest.raises(SandboxError, match="could not start the sandbox"):
+        executor.run(["gemini"], check=True)
+
+
+def test_executor_run_propagates_non_docker_failures_under_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+
+    def fake_run(argv, **kwargs):
+        if argv[:2] == ["docker", "run"]:
+            raise SubprocessError(argv, returncode=7, stderr="agent failed")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with pytest.raises(SubprocessError):
+        executor.run(["gemini"], check=True)
+
+
+def test_discover_fixture_mounts_never_mounts_the_bench_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No token rule can exclude the checkout for a cluster named "bench" or
+    "dev" — the exclusion is by path: glob hits are skipped, an explicit
+    override is refused loudly."""
+    home = tmp_path / "home"
+    home.mkdir()
+    checkout = home / "devops-bench-dev"
+    (checkout / "tasks").mkdir(parents=True)
+    (home / "opa-repo-dev.git").mkdir()
+    monkeypatch.setattr(sandbox, "_BENCH_REPO_ROOT", checkout.resolve())
+    monkeypatch.setattr(sandbox.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv(sandbox.FIXTURES_ENV, raising=False)
+
+    mounts = sandbox.discover_fixture_mounts("dev")
+    assert sorted(mounts.values()) == ["/workspace/home/opa-repo-dev.git"]
+
+    monkeypatch.setenv(sandbox.FIXTURES_ENV, str(checkout))
+    with pytest.raises(SandboxError, match="overlaps the benchmark checkout"):
+        sandbox.discover_fixture_mounts("dev")
+
+
 def test_executor_run_keeps_secret_values_out_of_the_argv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
