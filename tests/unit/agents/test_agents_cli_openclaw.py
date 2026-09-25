@@ -420,14 +420,7 @@ def test_execute_falls_back_to_stdout_when_bundle_has_no_answer(
 def test_execute_keeps_the_export_bundle_in_a_harness_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The raw events.jsonl survives the run when the harness owns the workspace.
-
-    Exported into the run workdir (not a throwaway temp dir), the bundle's
-    lifetime follows the workspace's, and the harness's existing workspace
-    diff carries it into the run's generated_files. The first observed
-    oc-side redaction could not be root-caused because the bundle had died
-    with the temp dir this replaces.
-    """
+    """The raw events.jsonl lands in the run workspace and outlives the run."""
     _install_oc_run(
         monkeypatch,
         lambda *a, **k: _make_subprocess_result("OK\n", "", 0),

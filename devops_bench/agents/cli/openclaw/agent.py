@@ -510,15 +510,10 @@ class OpenClawAgent(AgentHarness):
         when MCP is configured) so the session commands read from the same
         isolated state the agent turn wrote to.
 
-        The bundle is exported into ``export_workspace`` (landing at
-        ``<export_workspace>/.openclaw/trajectory-exports/...``) rather than a
-        throwaway temp dir, so its lifetime follows the run workdir's: with a
-        harness-owned workspace the raw ``events.jsonl`` survives the run and
-        rides into ``<run_dir>/generated_files/`` through the existing
-        workspace diff — which is what makes an oc-side redaction or parse
-        surprise auditable after the fact instead of requiring a live
-        reproduction (the first observed redaction's bundle died with exactly
-        this temp dir).
+        The bundle lands under ``<export_workspace>/.openclaw/trajectory-exports/``
+        rather than a temp dir, so the raw ``events.jsonl`` outlives the run and
+        the workspace diff carries it into ``generated_files/`` — keeping oc-side
+        redaction or parse surprises auditable after the fact.
 
         Returns:
             A ``(trajectory, tokens, output_text, errors)`` tuple. ``output_text``
