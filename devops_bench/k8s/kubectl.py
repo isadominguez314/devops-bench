@@ -229,9 +229,7 @@ def get_resource(
         selector: Optional label selector (``-l``).
         namespace: Optional namespace (``-n``).
         kubeconfig: Kubeconfig path or context-like object.
-        context: Optional kubeconfig context to pin the call to
-            (``--context``); without it the call reads whichever cluster the
-            file's current-context points at.
+        context: Optional kubeconfig context to pin the call to (``--context``).
         timeout: Optional seconds before the subprocess is killed. ``None``
             (the default) blocks indefinitely, so pass one whenever the API
             server might accept a connection and never respond.

@@ -217,8 +217,7 @@ resource "google_compute_global_forwarding_rule" "lb" {
 }
 
 resource "null_resource" "setup" {
-  # project/namespace/zones are triggers only so the destroy-time provisioner
-  # can reach them through self.triggers.
+  # project/namespace/zones are triggers only for the destroy provisioner's self.triggers.
   triggers = {
     project_id      = var.project_id
     namespace       = var.namespace
@@ -257,12 +256,9 @@ resource "null_resource" "setup" {
   }
 
   # Destroy-time provisioners may only reference self, hence the triggers
-  # above. This one runs while both clusters still exist (destroy order is the
-  # reverse of the depends_on below): it deletes the frontend Services so the
-  # GKE cloud controller tears down the forwarding rules / target pools /
-  # k8s-fw-* rules it created outside this state, and waits for the reserved
-  # IPs to be released -- otherwise the google_compute_address destroys are
-  # rejected as in-use and the run leaks every network-LB resource.
+  # above. Runs while both clusters still exist: deletes the frontend Services
+  # so the GKE controller tears down its out-of-state NLB resources before the
+  # google_compute_address destroys, which are otherwise rejected as in-use.
   provisioner "local-exec" {
     when        = destroy
     on_failure  = continue
