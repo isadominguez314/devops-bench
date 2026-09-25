@@ -13,25 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Destroy-time companion to setup.sh. The frontend Services created there make
-# the GKE cloud controller provision regional forwarding rules, target pools
-# and k8s-fw-* firewall rules outside the Terraform state; deleting the
-# clusters does not delete them, and while a forwarding rule still holds a
-# reserved address the google_compute_address destroy is rejected ("resource
-# in use"), which leaks every network-LB resource and blocks a re-apply.
-# Delete the Services first so the controller cleans up after itself, wait for
-# the reserved IPs to be released, then sweep whatever is left. Every lookup
-# is filtered on this run's two reserved IP values, so a concurrent run's
-# resources cannot be selected. Runs under on_failure = continue: best effort,
-# never blocks the rest of the destroy.
+# Destroy-time companion to setup.sh. The frontend Services make the GKE
+# cloud controller create NLB resources outside the Terraform state; while a
+# forwarding rule holds a reserved IP, the google_compute_address destroy is
+# rejected as in-use. Delete the Services so the controller cleans up, wait
+# for the IPs to release, then sweep what's left. Lookups filter on this
+# run's reserved IPs, so a concurrent run's resources are never selected.
 set -uo pipefail # deliberately no -e: each step is best-effort
 
 : "${PROJECT_ID:?}" "${NAMESPACE:?}"
 : "${EAST_CLUSTER:?}" "${EAST_ZONE:?}" "${WEST_CLUSTER:?}" "${WEST_ZONE:?}"
 : "${EAST_IP:?}" "${WEST_IP:?}"
 
-# The provisioner-local kubeconfig may have been reshaped since setup (the
-# agent owns the run's ambient one); re-credential into a scratch file.
+# The agent owns the ambient kubeconfig; re-credential into a scratch file.
 SCRATCH_KUBECONFIG="$(mktemp)"
 trap 'rm -f "$SCRATCH_KUBECONFIG"' EXIT
 export KUBECONFIG="$SCRATCH_KUBECONFIG"
@@ -54,25 +48,24 @@ delete_frontend_svc "$WEST_CLUSTER" "$WEST_ZONE"
 list_rules() {
   gcloud compute forwarding-rules list --project "$PROJECT_ID" \
     --filter="IPAddress=(${EAST_IP} ${WEST_IP})" \
-    --format="$1" 2>/dev/null || true
+    --format="$1" 2>/dev/null
 }
 
-# The controller releases the reserved IPs only once its NLB teardown
-# finishes; google_compute_address can be destroyed after that.
+# The controller releases the reserved IPs only once its NLB teardown finishes.
 echo "==> [teardown] waiting for forwarding rules on ${EAST_IP} / ${WEST_IP} to clear"
 remaining=""
 for _ in $(seq 1 18); do
-  remaining="$(list_rules 'value(name)')"
-  if [[ -z "$remaining" ]]; then
+  # Only a successful empty lookup proves the IPs are released; a failed one
+  # must keep polling, not skip the sweep.
+  if remaining="$(list_rules 'value(name)')" && [[ -z "$remaining" ]]; then
     echo "==> [teardown] reserved IPs released"
     exit 0
   fi
   sleep 10
 done
 
-# The Service path did not converge (cluster already gone, controller wedged).
-# The controller names the forwarding rule, target pool and k8s-fw firewall
-# rule after the Service's UID, so the rule name selects its companions.
+# The controller names the target pool and k8s-fw firewall rules after the
+# forwarding rule, so the rule name selects its companions.
 echo "==> [teardown] sweeping leftover NLB resources: ${remaining}"
 while IFS=, read -r name region; do
   [[ -z "$name" ]] && continue
@@ -84,10 +77,10 @@ while IFS=, read -r name region; do
     [[ -z "$fw" ]] && continue
     gcloud compute firewall-rules delete "$fw" --project "$PROJECT_ID" --quiet || true
   done < <(gcloud compute firewall-rules list --project "$PROJECT_ID" \
-    --filter="name~^k8s-fw-${name}$" --format='value(name)' 2>/dev/null || true)
+    --filter="name~^k8s-fw-${name}(-deny)?$" --format='value(name)' 2>/dev/null || true)
 done < <(list_rules 'csv[no-heading](name,region.basename())')
 
-if [[ -n "$(list_rules 'value(name)')" ]]; then
-  echo "==> [teardown] WARNING: forwarding rules still present; the address destroy may fail" >&2
+if ! final="$(list_rules 'value(name)')" || [[ -n "$final" ]]; then
+  echo "==> [teardown] WARNING: forwarding rules may remain; the address destroy may fail" >&2
 fi
 exit 0
