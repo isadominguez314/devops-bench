@@ -120,6 +120,17 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 # daemon cannot hang a reap (and with it the whole batch).
 _HOUSEKEEPING_TIMEOUT_SEC = 30
 
+# The running benchmark's own tree (…/devops_bench/agents/sandbox.py -> repo
+# root). Mounting it would hand the agent the answer material no token rule
+# can reliably exclude (a cluster named "bench" makes ~/devops-bench a
+# legitimate token match), so fixture discovery refuses it by path, not name.
+_BENCH_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _overlaps_bench_checkout(path: Path) -> bool:
+    resolved = path.resolve()
+    return resolved.is_relative_to(_BENCH_REPO_ROOT) or _BENCH_REPO_ROOT.is_relative_to(resolved)
+
 
 @dataclass(frozen=True)
 class SandboxSpec:
@@ -255,8 +266,10 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
     Only top-level entries whose name carries ``cluster_name`` as a
     ``-``/``_``/``.``-delimited token match (dot-entries excluded), so a short
     or reused name cannot sweep in the operator's unrelated files.
-    ``BENCH_AGENT_FIXTURES`` overrides the search. Raises
-    :class:`SandboxError` on a container-path collision.
+    ``BENCH_AGENT_FIXTURES`` overrides the search. The benchmark's own
+    checkout is refused by path regardless of name. Raises
+    :class:`SandboxError` on a container-path collision or an explicit
+    fixture overlapping the checkout.
     """
     explicit = (get_env(FIXTURES_ENV) or "").strip()
     if explicit:
@@ -282,6 +295,18 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
     for path in candidates:
         if not path.exists():
             _log.warning("declared fixture %s does not exist; not mounting it", path)
+            continue
+        if _overlaps_bench_checkout(path):
+            if explicit:
+                raise SandboxError(
+                    f"fixture {path} overlaps the benchmark checkout at "
+                    f"{_BENCH_REPO_ROOT}; mounting it would hand the agent the "
+                    f"benchmark's own answer material — remove it from {FIXTURES_ENV}"
+                )
+            _log.warning(
+                "fixture candidate %s overlaps the benchmark checkout; not mounting it",
+                path,
+            )
             continue
         host_path = str(path.resolve())
         container_path = f"{CONTAINER_HOME}/{path.name}"
@@ -473,6 +498,13 @@ class SandboxExecutor:
                 )
             except OSError as exc:
                 raise SandboxError(f"docker is unavailable: {exc}") from exc
+            except SubprocessError as exc:
+                # check=True raises before the returncode test below runs.
+                if exc.returncode == 125:
+                    raise SandboxError(
+                        f"docker could not start the sandbox container: {exc.stderr}"
+                    ) from exc
+                raise
             # 125 is the docker daemon's own failure code (missing image,
             # missing network); with check=False it would otherwise be
             # scored as the agent exiting 125.

@@ -1121,6 +1121,18 @@ def _sandboxed_harness(
     )
 
 
+def test_run_fails_fast_on_an_unmigrated_agent_when_sandboxed(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One loud refusal at batch start, not a provisioned cluster per task
+    that each dies with the per-task SandboxError (which stays as depth)."""
+    from devops_bench.core import SandboxError
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path, agent_type="openclaw")
+    with pytest.raises(SandboxError, match="not been migrated"):
+        harness.run([])
+
+
 def test_agent_config_snapshot_carries_the_sandbox_opt_in(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
