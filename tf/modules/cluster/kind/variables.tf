@@ -25,7 +25,7 @@ variable "kubeconfig_path" {
 
 variable "node_image" {
   type        = string
-  description = "The kind node image (v1.30 or newer)"
+  description = "The kind node image (v1.30 through v1.35)"
   # 1.30 is the floor: ValidatingAdmissionPolicy is GA from 1.30 and the
   # pod-security backstop applies one. 1.35 is the ceiling: tehcyx/kind 0.11.0
   # embeds kind v0.31.0, whose kubeadm config can't bootstrap 1.36+.
