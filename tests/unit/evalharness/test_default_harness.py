@@ -1125,12 +1125,23 @@ def test_run_fails_fast_on_an_unmigrated_agent_when_sandboxed(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One loud refusal at batch start, not a provisioned cluster per task
-    that each dies with the per-task SandboxError (which stays as depth)."""
+    that each dies with the per-task SandboxError (which stays as depth).
+
+    Uses a purpose-built unmigrated fake rather than a real harness: which
+    builtins are migrated changes as the stack lands them."""
     from devops_bench.core import SandboxError
 
-    harness = _sandboxed_harness(monkeypatch, tmp_path, agent_type="openclaw")
-    with pytest.raises(SandboxError, match="not been migrated"):
-        harness.run([])
+    class _UnmigratedAgent(AgentHarness):
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            raise NotImplementedError
+
+    AGENTS.register("fake-unmigrated")(_UnmigratedAgent)
+    try:
+        harness = _sandboxed_harness(monkeypatch, tmp_path, agent_type="fake-unmigrated")
+        with pytest.raises(SandboxError, match="not been migrated"):
+            harness.run([])
+    finally:
+        AGENTS._items.pop("fake-unmigrated", None)  # noqa: SLF001
 
 
 def test_agent_config_snapshot_carries_the_sandbox_opt_in(
