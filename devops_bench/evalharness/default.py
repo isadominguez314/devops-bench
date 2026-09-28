@@ -1220,9 +1220,10 @@ class DefaultEvalHarness(Harness):
             before_files = snapshot_dir(workspace_path)
             # The sandbox home pre-exists the run, so the top-level workspace
             # diff never sees inside it; diff it separately or ~ writes are
-            # silently dropped from generated_files.
+            # silently dropped. Sandboxed only — on an ambient run an agent-
+            # created home/ is already collected (whole) by the workspace diff.
             home_dir = workspace_path / "home"
-            before_home = snapshot_dir(home_dir)
+            before_home = snapshot_dir(home_dir) if completed_spec is not None else set()
             agent_res = self.execute_agent(prompt, context, sandbox_spec=completed_spec)
             # The agent's turn just ended; stop sampling immediately so the
             # hold window is exactly "seed through the end of the agent's
@@ -1237,8 +1238,13 @@ class DefaultEvalHarness(Harness):
             # unscored record, so isolate it like the other non-critical steps.
             try:
                 collect_generated_files(before_files, run_dir, source_dir=workspace_path)
-                if home_dir.is_dir():
-                    collect_generated_files(before_home, run_dir, source_dir=home_dir)
+                if completed_spec is not None and home_dir.is_dir():
+                    # Dot-entries are agent runtime state (~/.gemini and the
+                    # harness's own folder-trust seed), not deliverables — and
+                    # a collected home .gemini would collide with the
+                    # workspace's own .gemini copy under generated_files/.
+                    hidden = {p.name for p in home_dir.iterdir() if p.name.startswith(".")}
+                    collect_generated_files(before_home | hidden, run_dir, source_dir=home_dir)
             except Exception:  # noqa: BLE001 - artifact collection must not sink a completed run
                 _log.exception("artifact collection failed for %s; continuing", task.name)
 
