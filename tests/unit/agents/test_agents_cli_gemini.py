@@ -713,6 +713,24 @@ def test_execute_seeds_container_home_folder_trust_when_sandboxed(
     assert _json.loads(seeded.read_text()) == {"security": {"folderTrust": {"enabled": False}}}
 
 
+def test_execute_seeds_folder_trust_even_without_mcp_or_skills(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A baseline or rules-only sandboxed arm needs the seed too: untrusted,
+    the CLI also drops GEMINI.md and downgrades --approval-mode, not just
+    the workspace MCP settings."""
+    from devops_bench.agents.sandbox import SandboxSpec
+
+    agent = GeminiCliAgent(AgentConfig(target="gemini", sandbox=SandboxSpec(image="img")))
+    monkeypatch.setattr(
+        GeminiCliAgent,
+        "run_agent_cmd",
+        lambda self, argv, **kwargs: SimpleNamespace(stdout="", stderr="", returncode=0),
+    )
+    agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
+    assert (tmp_path / "home" / ".gemini" / "settings.json").exists()
+
+
 def test_execute_does_not_seed_folder_trust_when_unsandboxed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

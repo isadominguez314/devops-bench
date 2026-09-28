@@ -397,26 +397,33 @@ def test_run_one_collects_files_the_agent_writes_to_its_workspace(
 
 
 class _HomeWritingAgent(AgentHarness):
-    """Stand-in agent that writes its deliverable under the sandbox home."""
+    """Stand-in agent that writes a deliverable and runtime state under home."""
+
+    supports_sandbox = True
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
         assert workspace_path is not None
         home = workspace_path / "home"
         home.mkdir(exist_ok=True)
         (home / "report.md").write_text("written to ~")
+        (home / ".gemini").mkdir(exist_ok=True)
+        (home / ".gemini" / "state.json").write_text("{}")
         return AgentResult(output="done", trajectory=[])
 
 
-def test_run_one_collects_files_the_agent_writes_to_its_home(
-    isolated_env: None, tmp_path: Path
+def test_run_one_collects_home_deliverables_but_not_agent_state(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression test: the sandbox home pre-exists the run, so the top-level
-    workspace diff never saw inside it and ``~`` deliverables were silently
-    dropped from generated_files. The home is diffed separately now."""
+    """Sandboxed: ~ deliverables land in generated_files, but dot-entries
+    (agent runtime state, the folder-trust seed) do not — a collected home
+    .gemini would collide with the workspace's own .gemini copy."""
     AGENTS.register("fake-home-writer")(_HomeWritingAgent)
     try:
-        harness = DefaultEvalHarness(
-            project_id="p", cluster_name="c", agent_type="fake-home-writer", no_infra=True
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-home-writer", no_infra=True
+        )
+        monkeypatch.setattr(
+            harness_default.agent_sandbox, "discover_fixture_mounts", lambda cluster: {}
         )
         task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
         run_dir = tmp_path / "run_1"
@@ -425,11 +432,34 @@ def test_run_one_collects_files_the_agent_writes_to_its_home(
         record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
 
         assert record["status"] == "success"
-        generated = run_dir / "generated_files" / "report.md"
-        assert generated.exists()
-        assert generated.read_text() == "written to ~"
+        assert (run_dir / "generated_files" / "report.md").read_text() == "written to ~"
+        assert not (run_dir / "generated_files" / ".gemini").exists()
     finally:
         AGENTS._items.pop("fake-home-writer", None)  # noqa: SLF001
+
+
+def test_run_one_ambient_home_writes_are_collected_once(isolated_env: None, tmp_path: Path) -> None:
+    """Unsandboxed, an agent-created home/ rides the workspace diff whole;
+    the separate home diff must not flatten a second copy on top."""
+    AGENTS.register("fake-ambient-home-writer")(_HomeWritingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p",
+            cluster_name="c",
+            agent_type="fake-ambient-home-writer",
+            no_infra=True,
+        )
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+        run_dir = tmp_path / "run_1"
+        run_dir.mkdir()
+
+        record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
+
+        assert record["status"] == "success"
+        assert (run_dir / "generated_files" / "home" / "report.md").exists()
+        assert not (run_dir / "generated_files" / "report.md").exists()
+    finally:
+        AGENTS._items.pop("fake-ambient-home-writer", None)  # noqa: SLF001
 
 
 def test_run_one_warns_when_a_verification_entry_fails_to_parse(

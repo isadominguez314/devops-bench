@@ -28,6 +28,7 @@ module — everything is plain Kubernetes API surface reached through ``kubectl`
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from devops_bench.core import NetworkPlan, SandboxError, SubprocessError, get_bool, get_logger
@@ -640,9 +641,12 @@ def render_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path, *, user_fields: s
     if not server:
         raise SandboxError("could not read the cluster server URL from the run's kubectl context")
 
-    cluster_fields = f"server: {server}, certificate-authority-data: {ca}"
+    # json.dumps-quoted scalars: a flow-indicator character (': ', ',', '{')
+    # in a value would otherwise break the flow-mapping parse.
+    q = json.dumps
+    cluster_fields = f"server: {q(server)}, certificate-authority-data: {q(ca)}"
     if plan.tls_server_name:
-        cluster_fields += f", tls-server-name: {plan.tls_server_name}"
+        cluster_fields += f", tls-server-name: {q(plan.tls_server_name)}"
     path = dest_dir / "kubeconfig"
     # 0600 from creation (no umask window with a live token); chmod covers the re-render case.
     path.touch(mode=0o600)
@@ -758,7 +762,7 @@ def provision_agent_credentials(
         token_ttl_sec,
     )
     try:
-        return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {token}")
+        return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {json.dumps(token)}")
     except SandboxError:
         # Belt-and-braces: the preflight makes a render failure here unlikely,
         # but this is the last raise site past the first cluster write, and a
@@ -921,5 +925,5 @@ def _render_admin_fallback_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path
     return render_agent_kubeconfig(
         plan,
         dest_dir,
-        user_fields=f"client-certificate-data: {cert}, client-key-data: {key}",
+        user_fields=f"client-certificate-data: {json.dumps(cert)}, client-key-data: {json.dumps(key)}",
     )
