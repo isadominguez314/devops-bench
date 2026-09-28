@@ -38,6 +38,7 @@ from devops_bench.agents.capabilities import (
 from devops_bench.chaos import ChaosSpec
 from devops_bench.chaos.faults.generate_load import (
     _LOAD_TIMEOUT_CEILING_SEC,
+    _LOAD_TIMEOUT_SLACK_SEC,
     _go_duration_seconds,
 )
 from devops_bench.cheat_detection import (
@@ -147,7 +148,7 @@ def _scenario_join_budget(chaos_specs: Sequence[ChaosSpec]) -> float:
     seconds = _go_duration_seconds(declared)
     if seconds is None:
         return _SCENARIO_JOIN_SEC
-    return _SCENARIO_JOIN_SEC + min(seconds, _LOAD_TIMEOUT_CEILING_SEC)
+    return _SCENARIO_JOIN_SEC + min(seconds + _LOAD_TIMEOUT_SLACK_SEC, _LOAD_TIMEOUT_CEILING_SEC)
 
 
 def chaos_invalidated_entries(
@@ -160,14 +161,18 @@ def chaos_invalidated_entries(
     undisrupted cluster and grant credit for a fault that never happened.
     Only ``chaos_specs[0]`` is considered — it is the only spec scheduled.
     """
-    if not chaos_specs or not chaos_report:
+    if not chaos_specs:
         return {}
-    if chaos_report.get("status") == "success":
+    # ``injected`` survives a later ``timed_out`` stamp; older reports only carry status.
+    if chaos_report.get("injected", chaos_report.get("status") == "success"):
         return {}
     spec = chaos_specs[0]
     if not spec.verify:
         return {}
-    detail = chaos_report.get("error") or f"chaos status {chaos_report.get('status')!r}"
+    status = chaos_report.get("status")
+    detail = chaos_report.get("error") or (
+        f"chaos status {status!r}" if status else "the scenario never started"
+    )
     return {
         spec.verify: (
             f"planned disruption {spec.name!r} was never injected ({detail}); "
@@ -1090,6 +1095,8 @@ class DefaultEvalHarness(Harness):
         entries: list[VerificationEntry] = []
         # Parse-time copy so the exception path can also consult the chaos specs.
         chaos_specs: list[ChaosSpec] = []
+        # Set once drained, so the exception path never joins the scenario twice.
+        chaos_report: dict[str, Any] | None = None
         # Track the substituted prompt / expectation / safety checklists as they
         # are computed so a failed record can carry the same resolved strings a
         # success record would, falling back to the raw task fields before
@@ -1261,19 +1268,19 @@ class DefaultEvalHarness(Harness):
             if safeguard_monitor is not None:
                 safeguard_monitor.stop()
                 hold_observations = safeguard_monitor.get_observations()
+            if chaos_report is None:
+                chaos_report, _ = self._drain_scenario(
+                    scenario_manager, scenario_thread, chaos_specs
+                )
             exception_verification_report: list[dict[str, Any]] = []
             if self.no_infra:
                 exception_verification_status = "skipped_no_infra"
             elif infra_up and entries:
                 try:
-                    # Never drained on this path; snapshot for the same invalidation rule.
-                    partial_chaos_report: dict[str, Any] = {}
-                    if scenario_manager is not None:
-                        partial_chaos_report, _ = scenario_manager.get_reports()
                     exception_verification_report = self._run_verification(
                         entries,
                         hold_observations=hold_observations,
-                        invalidated=chaos_invalidated_entries(chaos_specs, partial_chaos_report),
+                        invalidated=chaos_invalidated_entries(chaos_specs, chaos_report),
                     )
                     exception_verification_status = "evaluated"
                 except Exception:  # noqa: BLE001 - a crash here must not mask the original failure
@@ -1298,16 +1305,14 @@ class DefaultEvalHarness(Harness):
                 verification_parse_errors=verification_parse_errors,
                 verification_report=exception_verification_report,
                 verification_status=exception_verification_status,
+                chaos_report=chaos_report,
             )
         finally:
             if scenario_manager is not None:
                 scenario_manager.stop()
-                # stop() only signals the abort flag; join the daemon thread with
-                # a bounded timeout so teardown does not race a still-running
-                # background scenario (the success path joins via _drain_scenario,
-                # but the exception path reaches here without draining).
+                # stop() only signals abort; bound the join so teardown never races a live spike.
                 if scenario_thread is not None:
-                    scenario_thread.join(timeout=_SCENARIO_JOIN_SEC)
+                    scenario_thread.join(timeout=_scenario_join_budget(chaos_specs))
             if safeguard_monitor is not None:
                 # stop() is idempotent and never raises; this covers any path
                 # that skipped the two calls above.
@@ -1404,6 +1409,7 @@ class DefaultEvalHarness(Harness):
         verification_parse_errors: list[dict[str, str]] | None = None,
         verification_report: list[dict[str, Any]] | None = None,
         verification_status: str = "not_evaluated",
+        chaos_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build a failed-task record so the failure stays visible.
 
@@ -1430,6 +1436,8 @@ class DefaultEvalHarness(Harness):
             verification_status: "evaluated" when the report above is real,
                 "not_evaluated" when it could not run, "skipped_no_infra"
                 under ``no_infra``.
+            chaos_report: The drained chaos report, so an invalidated entry
+                keeps the reason on the record.
         """
         error_text = str(exc)
         record = self._empty_record(task)
@@ -1452,6 +1460,7 @@ class DefaultEvalHarness(Harness):
                 "verification_parse_errors": list(verification_parse_errors or []),
                 "verification_report": list(verification_report or []),
                 "verification_status": verification_status,
+                "chaos_report": dict(chaos_report or {}),
             }
         )
         return record

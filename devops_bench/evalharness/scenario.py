@@ -209,6 +209,8 @@ class ScenarioManager:
         if not chaos_result.success:
             # Nothing landed: verifying now would measure an undisturbed cluster.
             self._record_injection_failure(spec, chaos_result)
+            # A fault that fails before its load starts never sets the event itself.
+            self.chaos_active_event.set()
             return
 
         if self._aborted.is_set():
@@ -412,6 +414,7 @@ class ScenarioManager:
         report: dict[str, Any] = {
             "injected_fault": result.injected_fault,
             "name": spec.name,
+            "injected": result.success,
             "status": "success" if result.success else "failed",
             "output": dumped.get("output", ""),
             "elapsed_time": dumped.get("elapsed_time", 0.0),

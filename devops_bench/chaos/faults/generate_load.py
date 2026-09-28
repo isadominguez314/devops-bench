@@ -98,9 +98,10 @@ _TARGET_READY_TIMEOUT_SEC = 120
 
 def _go_duration_seconds(value: str) -> float | None:
     """Parse a Go-style duration (``300s``, ``5m``, ``1h30m``); ``None`` if unparsable."""
-    parts = re.findall(r"([0-9]*\.?[0-9]+)\s*(ms|h|m|s)", value.strip())
-    if not parts:
+    value = value.strip()
+    if not re.fullmatch(r"(?:[0-9]*\.?[0-9]+(?:ms|h|m|s))+", value):
         return None
+    parts = re.findall(r"([0-9]*\.?[0-9]+)(ms|h|m|s)", value)
     unit = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
     total = 0.0
     for amount, suffix in parts:

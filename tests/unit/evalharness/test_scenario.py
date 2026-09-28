@@ -100,6 +100,7 @@ def test_scenario_drives_trigger_wait_then_action_inject() -> None:
     assert order == ["trigger.wait", "action.inject"]
     chaos_report, perf_report = manager.get_reports()
     assert chaos_report["status"] == "success"
+    assert chaos_report["injected"] is True
     assert chaos_report["injected_fault"] == "generate_load"
     assert chaos_report["name"] == "Test Disruption"
     # No verification mapping resolution happened (verify_key was None).
@@ -388,7 +389,10 @@ def test_chaos_failure_lands_typed_error_into_report() -> None:
 
     chaos_report, _ = manager.get_reports()
     assert chaos_report["status"] == "failed"
+    assert chaos_report["injected"] is False
     assert chaos_report["error"] == "fortio not found"
+    # The fault failed before its load started, so only the manager can unblock the harness.
+    assert manager.chaos_active_event.is_set()
 
 
 def test_injection_exception_sets_chaos_active_event() -> None:

@@ -26,6 +26,8 @@ from __future__ import annotations
 import importlib
 import logging
 import threading
+import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -1283,6 +1285,7 @@ def test_chaos_invalidated_entries_empty_when_injection_succeeded() -> None:
         ({"status": "failed", "error": "fortio not found"}, "fortio not found"),
         ({"status": "timed_out"}, "chaos status 'timed_out'"),
         ({"status": "initiated"}, "chaos status 'initiated'"),
+        ({}, "the scenario never started"),
     ],
 )
 def test_chaos_invalidated_entries_names_the_entry_and_the_cause(
@@ -1296,19 +1299,15 @@ def test_chaos_invalidated_entries_names_the_entry_and_the_cause(
     assert "never injected" in reason
 
 
-@pytest.mark.parametrize(
-    ("chaos_specs", "chaos_report"),
-    [
-        ([], {"status": "failed"}),
-        ([_spike_spec()], {}),
-    ],
-    ids=["no-chaos-declared", "no-scenario-ran"],
-)
-def test_chaos_invalidated_entries_empty_without_a_scheduled_disruption(
-    chaos_specs: list[Any], chaos_report: dict[str, Any]
-) -> None:
-    """No chaos, or no scenario report, invalidates nothing — the legacy path."""
-    assert chaos_invalidated_entries(chaos_specs, chaos_report) == {}
+def test_chaos_invalidated_entries_empty_when_no_chaos_declared() -> None:
+    """No chaos declared invalidates nothing — the legacy path."""
+    assert chaos_invalidated_entries([], {"status": "failed"}) == {}
+
+
+def test_a_landed_injection_survives_a_later_timed_out_stamp() -> None:
+    """A drain timeout during post-spike verification must not discard a fired spike."""
+    report = {"injected": True, "status": "timed_out"}
+    assert chaos_invalidated_entries([_spike_spec()], report) == {}
 
 
 def test_chaos_invalidated_entries_empty_when_spec_opts_out_of_verification() -> None:
@@ -1476,12 +1475,14 @@ class TestScenarioJoinBudget:
         )
 
     def test_the_budget_covers_the_declared_spike(self) -> None:
-        """The optimize-scale case: 300s of spike must not be cut off at 180s."""
+        """The optimize-scale case: 300s of spike plus the fault's own slack."""
         budget = harness_default._scenario_join_budget(  # noqa: SLF001
             [self._spec_with_duration("300s")]
         )
 
-        assert budget == harness_default._SCENARIO_JOIN_SEC + 300  # noqa: SLF001
+        assert budget == (
+            harness_default._SCENARIO_JOIN_SEC + 300 + gl._LOAD_TIMEOUT_SLACK_SEC  # noqa: SLF001
+        )
         assert budget > 5 + 300
 
     def test_the_budget_is_bounded_like_the_fault_s_own_timeout(self) -> None:
@@ -1519,13 +1520,6 @@ class _QuietAgent(AgentHarness):
         return AgentResult(output="did the thing", trajectory=[])
 
 
-class _ExplodingAgent(AgentHarness):
-    """Stand-in operator agent that dies mid-turn."""
-
-    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
-        raise RuntimeError("agent died mid-turn")
-
-
 _CHAOS_TASK = {
     "task_id": "t",
     "name": "spike-demo",
@@ -1561,19 +1555,20 @@ def _run_chaos_task(
     tmp_path: Path,
     *,
     injection_succeeds: bool,
-    agent_cls: type[AgentHarness] = _QuietAgent,
+    agent_raises: bool = False,
     signal_active: bool = True,
+    inject_delay: float = 0.0,
 ) -> dict[str, Any]:
     """Drive run() over a chaos task with the fault and verifier stubbed out."""
     # Registry keys must be lowercase.
-    agent_key = f"chain-{injection_succeeds}-{agent_cls.__name__}-{signal_active}".lower().replace(
-        "_", "-"
-    )
-    AGENTS.register(agent_key)(agent_cls)
+    agent_key = f"chain-{injection_succeeds}-{agent_raises}-{signal_active}".lower()
+    AGENTS.register(agent_key)(_QuietAgent)
 
     def fake_inject(self: Any, ctx: Any, event: threading.Event | None) -> Any:
-        if event is not None and signal_active:
+        # Like the real fault: a failed injection never reaches the point that sets the event.
+        if event is not None and signal_active and injection_succeeds:
             event.set()
+        time.sleep(inject_delay)
         return ChaosResult(
             success=injection_succeeds,
             injected_fault=self.type,
@@ -1587,6 +1582,12 @@ def _run_chaos_task(
             patch.object(TimeTrigger, "wait", lambda self, ctx: None),
             patch.object(GenerateLoadFault, "inject", fake_inject),
             patch.object(harness_default.VerifierAgent, "run_entry", return_value=passing),
+            # AgentHarness turns an _execute exception into an errored result, so crash one seam up.
+            patch.object(
+                DefaultEvalHarness, "execute_agent", side_effect=RuntimeError("agent died mid-turn")
+            )
+            if agent_raises
+            else nullcontext(),
         ):
             harness = DefaultEvalHarness(
                 project_id="p",
@@ -1657,18 +1658,38 @@ def test_run_never_grades_the_spike_entry_when_the_fault_did_not_fire(
 def test_run_invalidates_the_spike_entry_even_when_the_agent_crashes(
     isolated_env: None, tmp_path: Path
 ) -> None:
-    """The exception path applies the same rule as the success path.
+    """The exception path applies the same rule as the success path."""
+    record = _run_chaos_task(tmp_path, injection_succeeds=False, agent_raises=True)
 
-    It reaches verification without having drained the scenario, so it has to
-    snapshot the chaos report itself. If it skipped that, a crashed run would
-    quietly grade the spike entry that the success path refuses to.
-    """
-    record = _run_chaos_task(tmp_path, injection_succeeds=False, agent_cls=_ExplodingAgent)
+    assert record["status"] == "failed"
+    assert record["chaos_report"]["status"] == "failed"
 
     report = record["verification_report"]
     spike = next(r for r in report if r["name"] == "Planned Load Spike Verification")
     assert spike["status"] == "error"
     assert "was never injected" in spike["reason"]
+
+
+def test_a_crash_mid_spike_drains_before_judging_the_injection(
+    isolated_env: None, tmp_path: Path
+) -> None:
+    """A spike still in flight when the agent crashes is not reported as never injected."""
+    record = _run_chaos_task(tmp_path, injection_succeeds=True, agent_raises=True, inject_delay=0.5)
+
+    assert record["chaos_report"]["status"] == "success"
+    report = record["verification_report"]
+    spike = next(r for r in report if r["name"] == "Planned Load Spike Verification")
+    assert spike["success"] is True
+
+
+def test_a_failed_injection_does_not_stall_for_the_active_wait(
+    isolated_env: None, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The scenario signals the event itself, so the 45s wait never expires."""
+    with caplog.at_level(logging.WARNING):
+        _run_chaos_task(tmp_path, injection_succeeds=False)
+
+    assert "did not signal active" not in caplog.text
 
 
 def test_run_proceeds_and_still_scores_when_chaos_never_signals_active(

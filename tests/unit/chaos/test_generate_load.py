@@ -500,7 +500,8 @@ class TestLoadCommandTimeout:
 
     @pytest.mark.parametrize(
         ("value", "expected"),
-        [("300s", 300.0), ("5m", 300.0), ("1h30m", 5400.0), ("250ms", 0.25), ("nope", None)],
+        [("300s", 300.0), ("5m", 300.0), ("1h30m", 5400.0), ("250ms", 0.25), ("nope", None)]
+        + [(bad, None) for bad in ("-300s", "300sec", "300 s", "foo10sbar")],
     )
     def test_go_duration_parsing(self, value: str, expected: float | None) -> None:
         assert gl._go_duration_seconds(value) == expected
