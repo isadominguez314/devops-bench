@@ -267,6 +267,19 @@ def test_render_agent_kubeconfig_keeps_the_context_server_without_a_rewrite(
     assert cluster["server"] == "https://34.1.2.3"
 
 
+def test_render_agent_kubeconfig_quotes_flow_indicator_characters(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Scalars are json.dumps-quoted: a value carrying flow indicators
+    (': ', ',', '{') must survive the flow-mapping render intact."""
+    _patch_kubectl(monkeypatch)
+    plan = NetworkPlan(rewrite_server="https://host:6443", tls_server_name="name: evil, {x}")
+    path = creds.render_agent_kubeconfig(plan, tmp_path, user_fields="token: t")
+    cluster = yaml.safe_load(path.read_text())["clusters"][0]["cluster"]
+    assert cluster["tls-server-name"] == "name: evil, {x}"
+    assert cluster["server"] == "https://host:6443"
+
+
 def test_render_agent_kubeconfig_renders_tls_server_name_when_the_plan_sets_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

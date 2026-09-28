@@ -286,18 +286,19 @@ class GeminiCliAgent(AgentHarness):
                 (gemini_dir / _GEMINI_SETTINGS_FILE).write_text(
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
-                if self.config.sandbox is not None:
-                    # The container HOME (<workspace>/home) is fresh, so the
-                    # user-level folder-trust disable the bastion relies on
-                    # (see _build_argv) does not exist there — without it the
-                    # CLI ignores the workspace settings and an MCP arm
-                    # silently runs without MCP.
-                    user_gemini_dir = workdir / "home" / _GEMINI_CONFIG_DIR
-                    user_gemini_dir.mkdir(parents=True, exist_ok=True)
-                    (user_gemini_dir / _GEMINI_SETTINGS_FILE).write_text(
-                        json.dumps({"security": {"folderTrust": {"enabled": False}}}, indent=2),
-                        encoding="utf-8",
-                    )
+            if self.config.sandbox is not None:
+                # The container HOME (<workspace>/home) is fresh, so the
+                # user-level folder-trust disable the bastion relies on (see
+                # _build_argv) does not exist there. Untrusted, the CLI drops
+                # the workspace settings (MCP), GEMINI.md (rules), and
+                # downgrades --approval-mode — so every sandboxed arm needs
+                # the seed, not just the ones that wrote settings.
+                user_gemini_dir = workdir / "home" / _GEMINI_CONFIG_DIR
+                user_gemini_dir.mkdir(parents=True, exist_ok=True)
+                (user_gemini_dir / _GEMINI_SETTINGS_FILE).write_text(
+                    json.dumps({"security": {"folderTrust": {"enabled": False}}}, indent=2),
+                    encoding="utf-8",
+                )
             try:
                 completed = self.run_agent_cmd(
                     argv,
