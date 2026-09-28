@@ -146,6 +146,11 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0.0.0.0"})
 # daemon cannot hang a reap (and with it the whole batch).
 _HOUSEKEEPING_TIMEOUT_SEC = 30
 
+# docker-run exit codes reserved for its own launch failures: 125 = daemon
+# error (missing image/network), 126/127 = the contained command cannot be
+# invoked / does not exist (e.g. an AGENT_TARGET path absent from the image).
+_DOCKER_LAUNCH_FAILURE_CODES = frozenset({125, 126, 127})
+
 # The running benchmark's own tree (…/devops_bench/agents/sandbox.py -> repo
 # root). Mounting it would hand the agent the answer material no token rule
 # can reliably exclude (a cluster named "bench" makes ~/devops-bench a
@@ -640,17 +645,18 @@ class SandboxExecutor:
                 raise SandboxError(f"docker is unavailable: {exc}") from exc
             except SubprocessError as exc:
                 # check=True raises before the returncode test below runs.
-                if exc.returncode == 125:
+                if exc.returncode in _DOCKER_LAUNCH_FAILURE_CODES:
                     raise SandboxError(
-                        f"docker could not start the sandbox container: {exc.stderr}"
+                        f"docker could not start the sandbox container "
+                        f"(exit {exc.returncode}): {exc.stderr}"
                     ) from exc
                 raise
-            # 125 is the docker daemon's own failure code (missing image,
-            # missing network); with check=False it would otherwise be
-            # scored as the agent exiting 125.
-            if completed.returncode == 125:
+            # Docker-reserved launch failures; with check=False they would
+            # otherwise be scored as the agent's own exit code.
+            if completed.returncode in _DOCKER_LAUNCH_FAILURE_CODES:
                 raise SandboxError(
-                    f"docker could not start the sandbox container: {completed.stderr}"
+                    f"docker could not start the sandbox container "
+                    f"(exit {completed.returncode}): {completed.stderr}"
                 )
             return completed
         finally:
