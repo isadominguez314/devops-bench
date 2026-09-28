@@ -35,6 +35,7 @@ the reason to reach it).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -108,6 +109,11 @@ _CONTAINER_OWNED_ENV = frozenset({"HOME", "KUBECONFIG", "PATH"})
 # Bound on the module's own docker/kubectl housekeeping calls, so a wedged
 # daemon cannot hang a reap (and with it the whole batch).
 _HOUSEKEEPING_TIMEOUT_SEC = 30
+
+# docker-run exit codes reserved for its own launch failures: 125 = daemon
+# error (missing image/network), 126/127 = the contained command cannot be
+# invoked / does not exist (e.g. an AGENT_TARGET path absent from the image).
+_DOCKER_LAUNCH_FAILURE_CODES = frozenset({125, 126, 127})
 
 # The running benchmark's own tree (…/devops_bench/agents/sandbox.py -> repo
 # root). Mounting it would hand the agent the answer material no token rule
@@ -285,15 +291,19 @@ def build_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path:
         "follow-up."
     )
 
-    cluster_fields = f"server: {server}, certificate-authority-data: {ca}"
+    # json.dumps-quoted scalars: a flow-indicator character (': ', ',', '{')
+    # in a value would otherwise break the flow-mapping parse.
+    q = json.dumps
+    cluster_fields = f"server: {q(server)}, certificate-authority-data: {q(ca)}"
     if plan.tls_server_name:
-        cluster_fields += f", tls-server-name: {plan.tls_server_name}"
+        cluster_fields += f", tls-server-name: {q(plan.tls_server_name)}"
     path = dest_dir / "kubeconfig"
     path.write_text(
         "apiVersion: v1\n"
         "kind: Config\n"
         f"clusters: [{{name: c, cluster: {{{cluster_fields}}}}}]\n"
-        f"users: [{{name: u, user: {{client-certificate-data: {cert}, client-key-data: {key}}}}}]\n"
+        f"users: [{{name: u, user: {{client-certificate-data: {q(cert)}, "
+        f"client-key-data: {q(key)}}}}}]\n"
         "contexts: [{name: ctx, context: {cluster: c, user: u}}]\n"
         "current-context: ctx\n"
     )
@@ -545,17 +555,18 @@ class SandboxExecutor:
                 raise SandboxError(f"docker is unavailable: {exc}") from exc
             except SubprocessError as exc:
                 # check=True raises before the returncode test below runs.
-                if exc.returncode == 125:
+                if exc.returncode in _DOCKER_LAUNCH_FAILURE_CODES:
                     raise SandboxError(
-                        f"docker could not start the sandbox container: {exc.stderr}"
+                        f"docker could not start the sandbox container "
+                        f"(exit {exc.returncode}): {exc.stderr}"
                     ) from exc
                 raise
-            # 125 is the docker daemon's own failure code (missing image,
-            # missing network); with check=False it would otherwise be
-            # scored as the agent exiting 125.
-            if completed.returncode == 125:
+            # Docker-reserved launch failures; with check=False they would
+            # otherwise be scored as the agent's own exit code.
+            if completed.returncode in _DOCKER_LAUNCH_FAILURE_CODES:
                 raise SandboxError(
-                    f"docker could not start the sandbox container: {completed.stderr}"
+                    f"docker could not start the sandbox container "
+                    f"(exit {completed.returncode}): {completed.stderr}"
                 )
             return completed
         finally:
