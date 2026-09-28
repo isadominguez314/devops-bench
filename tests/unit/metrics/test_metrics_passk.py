@@ -154,16 +154,17 @@ def test_unscored_attempts_are_missing_data_not_failures() -> None:
     assert setup["overall"] == {"passAt1": 1.0, "passAtK": None, "passPowK": None}
 
 
-def test_overall_is_the_mean_over_reporting_tasks() -> None:
-    # task-c has too few attempts and is excluded.
-    rows = (
-        _five_runs("task-a", [1.0] * 5)
-        + _five_runs("task-b", [0.5] * 5)
-        + [_row(task_folder="task-c", outcome_score=1.0)]
-    )
+def test_overall_is_the_mean_over_tasks() -> None:
+    rows = _five_runs("task-a", [1.0] * 5) + _five_runs("task-b", [0.5] * 5)
     (setup,) = summarize_rows(rows, k=5)["setups"]
-    assert setup["overall"]["passAtK"] == pytest.approx(0.5)
-    assert setup["overall"]["passPowK"] == pytest.approx(0.5)
+    assert setup["overall"] == {"passAt1": 0.5, "passAtK": 0.5, "passPowK": 0.5}
+
+
+def test_overall_passk_needs_k_attempts_on_every_task() -> None:
+    # task-b has too few attempts, so only passAt1 covers both tasks.
+    rows = _five_runs("task-a", [1.0] * 5) + _five_runs("task-b", [0.0] * 3)
+    (setup,) = summarize_rows(rows, k=5)["setups"]
+    assert setup["overall"] == {"passAt1": 0.5, "passAtK": None, "passPowK": None}
 
 
 def test_iterations_within_a_run_count_as_attempts() -> None:
