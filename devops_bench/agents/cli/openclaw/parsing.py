@@ -148,7 +148,7 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
             call_id = str(data.get("toolCallId") or data.get("id") or "")
             if call_id in seen_calls:
                 continue
-            args = data.get("arguments", data.get("args"))
+            args = data.get("arguments") or data.get("args")
             call = ToolCall(
                 name=data.get("name", ""),
                 args=args if isinstance(args, dict) else {},

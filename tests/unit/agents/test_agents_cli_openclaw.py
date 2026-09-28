@@ -940,7 +940,7 @@ def test_parse_trajectory_export_dedupes_dual_source_events() -> None:
         _runtime_call(nested, {"command": "kubectl get pods"}),
         _runtime_result(nested, "pod-a Running"),
         _runtime_result("call_1", "done"),
-        {**_tool_result("call_1", "done"), "source": "transcript"},
+        {**_tool_result("call_1", "stale duplicate"), "source": "transcript"},
         _runtime_call("call_2", {"code": "fail()"}),
         _runtime_result("call_2", "boom", success=False),
     )
