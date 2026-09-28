@@ -56,6 +56,7 @@ import json
 import os
 import shlex
 import shutil
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -510,10 +511,10 @@ class OpenClawAgent(AgentHarness):
         when MCP is configured) so the session commands read from the same
         isolated state the agent turn wrote to.
 
-        The bundle lands under ``<export_workspace>/.openclaw/trajectory-exports/``
-        rather than a temp dir, so the raw ``events.jsonl`` outlives the run and
-        the workspace diff carries it into ``generated_files/`` — keeping oc-side
-        redaction or parse surprises auditable after the fact.
+        The bundle lands in a fresh ``oc-export-*`` dir under ``export_workspace``
+        so the workspace diff carries the raw ``events.jsonl`` into
+        ``generated_files/``. The dir is created after the agent turn, so the
+        agent can't plant a bundle there.
 
         Returns:
             A ``(trajectory, tokens, output_text, errors)`` tuple. ``output_text``
@@ -551,6 +552,7 @@ class OpenClawAgent(AgentHarness):
             errors.append("oc sessions returned no session key")
             return [], {}, "", errors
 
+        export_dir = Path(tempfile.mkdtemp(dir=export_workspace, prefix="oc-export-"))
         try:
             export = run(
                 [
@@ -560,7 +562,7 @@ class OpenClawAgent(AgentHarness):
                     "--session-key",
                     key,
                     "--workspace",
-                    str(export_workspace),
+                    str(export_dir),
                     "--json",
                 ],
                 check=False,
@@ -581,7 +583,7 @@ class OpenClawAgent(AgentHarness):
             )
             return [], {}, "", errors
 
-        events_text, read_errors = _read_export_bundle(export_workspace)
+        events_text, read_errors = _read_export_bundle(export_dir)
         errors.extend(read_errors)
         if not events_text:
             return [], {}, "", errors
