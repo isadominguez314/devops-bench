@@ -30,20 +30,22 @@ SCRATCH_KUBECONFIG="$(mktemp)"
 trap 'rm -f "$SCRATCH_KUBECONFIG"' EXIT
 export KUBECONFIG="$SCRATCH_KUBECONFIG"
 
-delete_frontend_svc() {
+delete_services() {
   local cluster="$1" zone="$2"
-  echo "==> [teardown] deleting frontend Service on ${cluster}"
+  echo "==> [teardown] deleting Services on ${cluster}"
   if gcloud container clusters get-credentials "$cluster" --zone "$zone" \
     --project "$PROJECT_ID" >/dev/null 2>&1; then
+    # All of them, not just 'frontend': an agent may have recreated the LB
+    # Service under another name still holding the reserved IP.
     kubectl --context "gke_${PROJECT_ID}_${zone}_${cluster}" -n "$NAMESPACE" \
-      delete svc frontend --ignore-not-found --timeout=90s || true
+      delete svc --all --ignore-not-found --timeout=90s || true
   else
     echo "==> [teardown] ${cluster} unreachable; relying on the sweep below"
   fi
 }
 
-delete_frontend_svc "$EAST_CLUSTER" "$EAST_ZONE"
-delete_frontend_svc "$WEST_CLUSTER" "$WEST_ZONE"
+delete_services "$EAST_CLUSTER" "$EAST_ZONE"
+delete_services "$WEST_CLUSTER" "$WEST_ZONE"
 
 list_rules() {
   gcloud compute forwarding-rules list --project "$PROJECT_ID" \
