@@ -113,6 +113,11 @@ def _mean_or_none(values: list[float | None]) -> float | None:
     return round(sum(present) / len(present), _SCORE_DECIMALS) if present else None
 
 
+def _mean_if_all(values: list[float | None]) -> float | None:
+    """Mean of ``values``, or ``None`` if any is ``None`` (keeps one task set across metrics)."""
+    return None if not values or None in values else _mean_or_none(values)
+
+
 def summarize_rows(
     rows: Iterable[dict],
     *,
@@ -122,7 +127,8 @@ def summarize_rows(
     """Compute per-task and per-setup pass@1 / pass@k / pass^k.
 
     Attempts are distinct ``(runId, iteration)`` rows per ``(setupId, taskFolder)``;
-    unscored attempts are excluded. Setup values are the mean over tasks.
+    unscored attempts are excluded. Setup values are the mean over tasks; setup
+    pass@k / pass^k are ``None`` unless every task has ``k`` attempts.
 
     Args:
         rows: ``rows.json`` row dicts, spanning any number of runs.
@@ -184,8 +190,8 @@ def summarize_rows(
                 "tasks": tasks,
                 "overall": {
                     "passAt1": _mean_or_none([t["passAt1"] for t in tasks]),
-                    "passAtK": _mean_or_none([t["passAtK"] for t in tasks]),
-                    "passPowK": _mean_or_none([t["passPowK"] for t in tasks]),
+                    "passAtK": _mean_if_all([t["passAtK"] for t in tasks]),
+                    "passPowK": _mean_if_all([t["passPowK"] for t in tasks]),
                 },
             }
         )
