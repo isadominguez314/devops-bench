@@ -636,16 +636,19 @@ def test_executor_run_passes_through_check_and_timeout(
     assert seen["timeout"] == 15.5
 
 
-def test_executor_run_raises_sandbox_error_on_docker_exit_125(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("code", [125, 126, 127])
+def test_executor_run_raises_sandbox_error_on_docker_launch_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
-    """125 is docker's own failure (missing image/network), not the agent's
-    exit code; with check=False it must not be scored as an agent failure."""
+    """125/126/127 are docker's own launch failures (missing image/network,
+    binary not invocable / absent from the image — e.g. a pre-expanded
+    $HOME AGENT_TARGET); with check=False they must not be scored as the
+    agent's exit code."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
 
     def fake_run(argv, **kwargs):
         if argv[:2] == ["docker", "run"]:
-            return SimpleNamespace(returncode=125, stdout="", stderr="No such image")
+            return SimpleNamespace(returncode=code, stdout="", stderr="launch failed")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
@@ -702,18 +705,19 @@ def test_sweep_stray_containers_never_raises_when_docker_is_missing(
     sandbox.sweep_stray_containers()  # must not raise
 
 
-def test_executor_run_raises_sandbox_error_on_125_under_check(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("code", [125, 126, 127])
+def test_executor_run_raises_sandbox_error_on_launch_failures_under_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
     """With check=True the host run raises before the returncode test, so the
-    125 translation must also cover the exception path — otherwise the next
+    translation must also cover the exception path — otherwise the next
     harness migrated with default check=True scores docker failures as its
     agent's."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
 
     def fake_run(argv, **kwargs):
         if argv[:2] == ["docker", "run"]:
-            raise SubprocessError(argv, returncode=125, stderr="No such image")
+            raise SubprocessError(argv, returncode=code, stderr="launch failed")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
