@@ -1796,3 +1796,17 @@ def test_no_other_task_opts_out_of_the_sandbox() -> None:
         if (_yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("requires_unsandboxed")
     ]
     assert exempt == ["secret-rotation"]
+
+
+def test_only_readonly_quota_declines_quota_writes() -> None:
+    """Loaded through the real loader so a dropped key cannot pass as the default."""
+    import pathlib
+
+    from devops_bench.tasks.loader import FileSystemTaskLoader
+
+    declining = [
+        p.parent.name
+        for p in sorted(pathlib.Path("tasks").glob("*/*/task.yaml"))
+        if not all(t.agent_quota_writes for t in FileSystemTaskLoader().load_tasks(str(p)))
+    ]
+    assert declining == ["readonly-quota"]
