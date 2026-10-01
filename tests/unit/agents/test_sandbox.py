@@ -496,7 +496,12 @@ def test_filter_boundary_env_rejects_credential_and_benchmark_vars() -> None:
         "GEMINI_MODEL": "m",
         "OTEL_SDK_DISABLED": "true",
         "CLOUDSDK_CONFIG": "/home/op/.config/gcloud",
+        "CLOUDSDK_AUTH_ACCESS_TOKEN": "ya29.host",
         "GOOGLE_APPLICATION_CREDENTIALS": "/home/op/adc.json",
+        "GOOGLE_OAUTH_ACCESS_TOKEN": "ya29.host",
+        # Routing, not credentials: shares the GOOGLE_ prefix and must cross.
+        "GOOGLE_GENAI_USE_VERTEXAI": "true",
+        "GOOGLE_CLOUD_PROJECT": "proj",
         "BENCH_CHEAT_DETECT": "0",
         "TF_VAR_project": "p",
         "AWS_ACCESS_KEY_ID": "AKIA...",
@@ -506,7 +511,13 @@ def test_filter_boundary_env_rejects_credential_and_benchmark_vars() -> None:
         "KUBECONFIG": "/home/op/.kube/config",
     }
     kept = sandbox.filter_boundary_env(overlay)
-    assert kept == {"GEMINI_API_KEY": "k", "GEMINI_MODEL": "m", "OTEL_SDK_DISABLED": "true"}
+    assert kept == {
+        "GEMINI_API_KEY": "k",
+        "GEMINI_MODEL": "m",
+        "OTEL_SDK_DISABLED": "true",
+        "GOOGLE_GENAI_USE_VERTEXAI": "true",
+        "GOOGLE_CLOUD_PROJECT": "proj",
+    }
 
 
 def test_filter_boundary_env_allowlist_overrides_a_denial() -> None:
@@ -533,6 +544,15 @@ def test_filter_boundary_env_handles_none_overlay() -> None:
 def test_executor_refuses_a_spec_without_an_image(tmp_path: Path) -> None:
     with pytest.raises(SandboxError, match="BENCH_SANDBOX_IMAGE"):
         sandbox.SandboxExecutor(_complete_spec(tmp_path, image=""))
+
+
+def test_executor_refuses_a_spec_whose_paths_do_not_exist(tmp_path: Path) -> None:
+    """Set is not enough: a stale or misbuilt spec must fail here, not as a
+    cryptic docker bind-mount error mid-run."""
+    with pytest.raises(SandboxError, match="missing workspace or kubeconfig"):
+        sandbox.SandboxExecutor(_complete_spec(tmp_path, workspace=tmp_path / "nope"))
+    with pytest.raises(SandboxError, match="missing workspace or kubeconfig"):
+        sandbox.SandboxExecutor(_complete_spec(tmp_path, kubeconfig=tmp_path / "nope.kc"))
 
 
 def test_executor_refuses_an_incomplete_spec(tmp_path: Path) -> None:
@@ -652,6 +672,23 @@ def test_map_host_path_raises_outside_the_workspace(tmp_path: Path) -> None:
 
 
 # -- executor: run semantics -----------------------------------------------------
+
+
+def test_executor_run_refuses_an_outside_cwd_before_any_docker_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with pytest.raises(SandboxError, match="outside the sandbox workspace"):
+        executor.run(["gemini"], cwd=tmp_path / "elsewhere")
+    # Neither docker run nor the finally-reap's docker kill ever fired.
+    assert calls == []
 
 
 def test_executor_run_rejects_a_full_environment(tmp_path: Path) -> None:
