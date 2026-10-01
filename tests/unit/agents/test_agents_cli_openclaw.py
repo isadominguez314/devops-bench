@@ -695,6 +695,16 @@ def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
         _build_env(AgentConfig(provider="google-vertyx"))
 
 
+def test_model_override_anthropic_direct_pins_messages_transport() -> None:
+    """A Claude 5 id on the direct API gets the anthropic-messages transport."""
+    override = _build_model_override(AgentConfig(model="claude-fable-5-1", provider="anthropic"))
+    entry = override["models"]["providers"]["anthropic"]
+    assert entry["api"] == "anthropic-messages"
+    assert entry["baseUrl"] == "https://api.anthropic.com"
+    assert entry["models"] == [{"id": "claude-fable-5-1", "name": "claude-fable-5-1"}]
+    assert override["agents"]["defaults"]["models"] == {"anthropic/claude-fable-5-1": {}}
+
+
 def test_model_override_raises_for_unpinned_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     """An override without a transport pin fails loud; only reachable if the tables disagree."""
     monkeypatch.setitem(oc_mod._CATALOG_OVERRIDES, "mystery", frozenset({"gemini-3.5-flash"}))
@@ -702,7 +712,7 @@ def test_model_override_raises_for_unpinned_transport(monkeypatch: pytest.Monkey
         _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash"))
 
 
-@pytest.mark.parametrize("provider", ["anthropic", "anthropic-bedrock"])
+@pytest.mark.parametrize("provider", ["anthropic-bedrock"])
 def test_model_override_leaves_other_providers_catalog_alone(provider: str) -> None:
     """Unlisted providers resolve through oc's own catalog, as before the Claude ids."""
     assert _build_model_override(AgentConfig(model="claude-opus-5", provider=provider)) == {}

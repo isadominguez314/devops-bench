@@ -100,12 +100,14 @@ _OPENCLAW_CONFIG_FILE = "openclaw.json"
 # per-run by :func:`_build_model_override`. Other providers pass through to oc.
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
 _GEMINI_CATALOG_OVERRIDES = frozenset({"gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.8-flash"})
+_CLAUDE_CATALOG_OVERRIDES = frozenset(
+    {"claude-fable-5-1", "claude-sonnet-5", "claude-fable-5", "claude-opus-5"}
+)
 _CATALOG_OVERRIDES: dict[str, frozenset[str]] = {
     "google": _GEMINI_CATALOG_OVERRIDES,
     "google-vertex": _GEMINI_CATALOG_OVERRIDES,
-    "anthropic-vertex": frozenset(
-        {"claude-fable-5-1", "claude-sonnet-5", "claude-fable-5", "claude-opus-5"}
-    ),
+    "anthropic": _CLAUDE_CATALOG_OVERRIDES,
+    "anthropic-vertex": _CLAUDE_CATALOG_OVERRIDES,
 }
 
 # A per-run provider entry replaces oc's built-in one, so it must pin ``api`` or
@@ -122,6 +124,11 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
         "api": "anthropic-messages",
         "baseUrl": "https://aiplatform.googleapis.com",
         "apiKey": "gcp-vertex-credentials",
+    },
+    # Direct API; the key reaches oc as ANTHROPIC_API_KEY.
+    "anthropic": {
+        "api": "anthropic-messages",
+        "baseUrl": "https://api.anthropic.com",
     },
 }
 # node-fetch->native-fetch loader shim (see :func:`_write_node_fetch_shim`), under
