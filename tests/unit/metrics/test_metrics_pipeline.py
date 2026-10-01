@@ -182,6 +182,49 @@ def test_each_result_in_batch_is_scored(registry: Registry[Any]) -> None:
     assert all(r["scores"].get("stub_score") for r in results)
 
 
+class _CorrectEvaluator:
+    """Stub evaluator that scores the run as fully correct."""
+
+    name = "correct"
+
+    def applies(self, ctx: MetricContext) -> bool:
+        return True
+
+    def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+        yield MetricScore(name="VerificationCorrectness", score=1.0)
+
+
+def test_a_completed_run_gets_a_composite(registry: Registry[Any]) -> None:
+    """Baseline for the skip below: the same scores do compose for a finished run."""
+    registry.register("correct")(_CorrectEvaluator)
+    results = [{**_result(), "status": "success", "trajectory": [{"step": 1}]}]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    assert pipeline.OUTCOME_SCORE_KEY in results[0]["scores"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"status": "agent_error"},
+        {"status": "success", "errors": ["boom"], "trajectory": []},
+    ],
+    ids=["agent_error", "errored_without_trajectory"],
+)
+def test_an_unscoreable_run_gets_no_composite(
+    registry: Registry[Any], overrides: dict[str, Any]
+) -> None:
+    """A run the agent never completed keeps its sub-scores but publishes no composite."""
+    registry.register("correct")(_CorrectEvaluator)
+    results = [{**_result(), **overrides}]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    assert "VerificationCorrectness" in results[0]["scores"]
+    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+
+
 # --- extract_checklist_items (pure logic) -------------------------------------
 
 
