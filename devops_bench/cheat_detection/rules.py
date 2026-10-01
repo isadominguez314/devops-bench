@@ -195,6 +195,10 @@ DEFAULT_RULES: tuple[SensitiveAccessRule, ...] = (
         "settings and possibly keys), matrix runner scripts, and the on-host "
         "run-output tree.",
         severity="high",
+        # Bare filenames at the top of the operator's home, so any listing of
+        # home prints them: real signal when the agent had no business there,
+        # noise when its own prompt sent it. ``narrow_home_listing_rules``
+        # downgrades this rule to args-only for the latter.
         patterns=(
             r"bench\.env\b",
             r"matrix-runs\b",
