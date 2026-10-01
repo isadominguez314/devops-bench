@@ -376,6 +376,11 @@ class DefaultEvalHarness(Harness):
             # MCP gated off: drop the binding so the agent's tools-enabled gate
             # is False and metrics' ``use_mcp`` agrees with what ran.
             mcp_servers = ()
+            if env_caps.mcp_servers:
+                _log.warning(
+                    "AGENT_MCP_SERVER is set but BENCH_USE_MCP is off; "
+                    "running the baseline arm without MCP"
+                )
 
         return AllCapabilities(
             mcp_servers=mcp_servers,
