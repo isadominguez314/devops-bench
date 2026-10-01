@@ -34,6 +34,7 @@ across harnesses.
 | `anthropic-vertex` | `anthropic_vertex` | `claude` | Vertex AI | — | yes (ADC) |
 | `anthropic-bedrock` | `anthropic_bedrock` | `claude` | Amazon Bedrock | — | yes (AWS creds) |
 | `openai` | — | `openai` | OpenAI API, or any OpenAI-compatible server via `OPENAI_BASE_URL` | `OPENAI_API_KEY` | no |
+| `openai-codex` | `openai_codex`, `codex` | `openai` | OpenAI via a Codex subscription login (openclaw only) | — | yes (Codex login) |
 
 Default models: `gemini` → `gemini-3.1-pro-preview`; `claude` → backend-specific
 (`api` → `claude-sonnet-4-5`; Bedrock requires `AGENT_MODEL`); `openai` has no
@@ -47,6 +48,11 @@ A few things worth calling out:
   `anthropic` provider still infers its backend from the environment.
 - **`openai` works without a key against a self-hosted server.** It sends a
   placeholder when neither `AGENT_API_KEY` nor `OPENAI_API_KEY` is set.
+- **`openai-codex` uses a subscription login, not a key.** openclaw's `openai`
+  provider bootstraps an OAuth profile into the per-run store from the Codex CLI
+  login at `$CODEX_HOME/auth.json` (default `~/.codex`), so that login must exist
+  on the host running `oc`. Pin the reasoning effort with
+  `AGENT_EXTRA_FLAGS="--thinking high"`.
 - **Install extras are named by PyPI package, not by provider key.** The extras
   are `anthropic` and `openai` — a different axis from the provider keys above.
   `google-genai` needs no extra; it is a base dependency, so
