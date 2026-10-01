@@ -31,7 +31,9 @@ a per-run temp dir:
   ``oc models``/``configure-oc.sh`` step. The entry is written for whichever
   Google backend ``config.provider`` selects — ``google`` (google-genai) or
   ``google-vertex`` (Vertex AI). An ``openai`` model is registered against
-  ``OPENAI_BASE_URL`` when that is set, for self-hosted OpenAI-compatible servers.
+  ``OPENAI_BASE_URL`` when that is set, for self-hosted OpenAI-compatible servers;
+  ``AGENT_CONTEXT_WINDOW``, ``AGENT_MODEL_REASONING`` and ``AGENT_MAX_OUTPUT_TOKENS``
+  size that entry.
 * **Model auth** — ``config.api_key`` is threaded into the provider env var
   (``GEMINI_API_KEY``/``GOOGLE_CLOUD_API_KEY``/``ANTHROPIC_API_KEY``/...) that
   ``oc agent --local`` reads.
@@ -76,7 +78,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     materialize_skills,
 )
 from devops_bench.core import SubprocessError, get_logger
-from devops_bench.core.config import get_env
+from devops_bench.core.config import get_bool, get_env, get_int
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import run
@@ -190,6 +192,23 @@ def _oc_model_id(config: AgentConfig) -> str:
     return f"{resolve_provider(config.provider).oc_provider}/{model}"
 
 
+def _model_entry(bare: str) -> dict:
+    """A per-run catalog entry, sized by the ``AGENT_*`` model overrides when set."""
+    entry: dict = {"id": bare, "name": bare}
+    # Servers that don't advertise a context window leave oc guessing its history size.
+    context_window = get_int("AGENT_CONTEXT_WINDOW")
+    if context_window is not None:
+        entry["contextWindow"] = context_window
+    # oc only accepts a --thinking level for entries that declare reasoning.
+    if get_bool("AGENT_MODEL_REASONING"):
+        entry["reasoning"] = True
+    # oc's 8192-token default can go entirely to thinking, ending the turn with no tool call.
+    max_output = get_int("AGENT_MAX_OUTPUT_TOKENS")
+    if max_output is not None:
+        entry["maxTokens"] = max_output
+    return entry
+
+
 def _build_model_override(config: AgentConfig) -> dict:
     """Register a catalog entry for a model openclaw doesn't ship by default.
 
@@ -240,7 +259,9 @@ def _build_model_override(config: AgentConfig) -> dict:
     provider_entry: dict = dict(_PROVIDER_TRANSPORT[provider])
     if base_url:
         provider_entry["baseUrl"] = base_url.rstrip("/")
-    provider_entry["models"] = [{"id": bare, "name": bare}]
+        # oc's SSRF guard refuses loopback/VPC model endpoints unless the provider opts in.
+        provider_entry["request"] = {"allowPrivateNetwork": True}
+    provider_entry["models"] = [_model_entry(bare)]
     return {
         "models": {"providers": {provider: provider_entry}},
         # Allowlist ``provider/id`` for the agent's per-run ``--model`` override.
@@ -338,6 +359,13 @@ def _oc_model_flag(config: AgentConfig) -> str:
     return f"--model {shlex.quote(model_id)} "
 
 
+def _oc_timeout_flag(config: AgentConfig) -> str:
+    """Forward the agent budget as ``--timeout``; oc otherwise stops a turn at 600 s."""
+    if not config.timeout_sec:
+        return ""
+    return f"--timeout {int(config.timeout_sec)} "
+
+
 def _prepend_rules(rules_text: str, prompt: str) -> str:
     """Return ``prompt`` with ``rules_text`` prepended as an operator brief.
 
@@ -388,7 +416,7 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
         '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
         f"{quoted_oc} --log-level debug agent --local "
         f"--agent {shlex.quote(agent_name)} {_oc_model_flag(config)}"
-        f"{extra_flags_str}-m {shlex.quote(prompt)}"
+        f"{_oc_timeout_flag(config)}{extra_flags_str}-m {shlex.quote(prompt)}"
     )
 
 

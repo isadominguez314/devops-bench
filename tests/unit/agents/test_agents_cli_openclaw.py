@@ -734,6 +734,7 @@ def test_model_override_openai_base_url_registers_served_model(
     assert override["models"]["providers"]["openai"] == {
         "api": "openai-completions",
         "baseUrl": "http://localhost:8000/v1",
+        "request": {"allowPrivateNetwork": True},
         "models": [{"id": "qwen3.8-27b-fp8", "name": "qwen3.8-27b-fp8"}],
     }
     assert override["agents"]["defaults"]["models"] == {"openai/qwen3.8-27b-fp8": {}}
@@ -745,6 +746,53 @@ def test_model_override_base_url_ignored_for_other_providers(
     """``OPENAI_BASE_URL`` only applies to the ``openai`` provider."""
     monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
     assert _build_model_override(AgentConfig(model="gemini-3.1-pro-preview")) == {}
+
+
+_SIZING_ENVS = ("AGENT_CONTEXT_WINDOW", "AGENT_MODEL_REASONING", "AGENT_MAX_OUTPUT_TOKENS")
+
+
+@pytest.mark.parametrize(
+    ("env", "extra"),
+    [
+        ({"AGENT_CONTEXT_WINDOW": "262144"}, {"contextWindow": 262144}),
+        ({"AGENT_MODEL_REASONING": "true"}, {"reasoning": True}),
+        ({"AGENT_MAX_OUTPUT_TOKENS": "65536"}, {"maxTokens": 65536}),
+    ],
+)
+def test_model_override_custom_endpoint_sizing(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], extra: dict[str, Any]
+) -> None:
+    """The ``AGENT_*`` sizing overrides land on the per-run model entry."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    for name in _SIZING_ENVS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    override = _build_model_override(AgentConfig(model="qwen3.8-27b", provider="openai"))
+    assert override["models"]["providers"]["openai"]["models"] == [
+        {"id": "qwen3.8-27b", "name": "qwen3.8-27b", **extra}
+    ]
+
+
+@pytest.mark.parametrize("name", ["AGENT_CONTEXT_WINDOW", "AGENT_MAX_OUTPUT_TOKENS"])
+def test_model_override_rejects_non_integer_sizing(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """A non-integer token budget fails loud instead of shipping a broken entry."""
+    from devops_bench.core.errors import ConfigError
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv(name, "lots")
+    with pytest.raises(ConfigError):
+        _build_model_override(AgentConfig(model="qwen3.8-27b", provider="openai"))
+
+
+def test_oc_timeout_flag_follows_agent_budget() -> None:
+    """The harness budget reaches oc as ``--timeout``; no budget, no flag."""
+    from devops_bench.agents.cli.openclaw.agent import _oc_timeout_flag
+
+    assert _oc_timeout_flag(AgentConfig(timeout_sec=3600)) == "--timeout 3600 "
+    assert _oc_timeout_flag(AgentConfig(timeout_sec=None)) == ""
 
 
 def _empty_sessions_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
