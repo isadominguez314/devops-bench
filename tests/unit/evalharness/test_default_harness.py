@@ -333,6 +333,15 @@ def test_capabilities_granted_matches_agent_config_even_after_env_mutation(
     assert config.capabilities.mcp is not None
 
 
+def test_mcp_is_off_unless_requested(isolated_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An MCP server alone does not bind it: the default arm is the baseline."""
+    monkeypatch.setenv("AGENT_MCP_SERVER", "/path/to/mcp")
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    assert harness.use_mcp is False
+    assert harness.build_agent_config().capabilities.mcp is None
+
+
 def test_run_one_returns_failed_record_when_get_deployer_raises(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
