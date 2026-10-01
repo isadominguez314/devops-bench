@@ -23,9 +23,8 @@ import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentResult
@@ -43,7 +42,6 @@ from devops_bench.cheat_detection import (
     annotate_records,
     baseline_from_granted_paths,
     build_inventory_rules,
-    build_mount_rules,
     filter_rules_for_prompt,
     load_ruleset,
 )
@@ -1108,9 +1106,7 @@ class DefaultEvalHarness(Harness):
                     active_cluster_name,
                     with_cluster=infra_config.get("deployer") != "noop",
                 )
-                sandbox_rules = self._inventory_sandbox_home(
-                    task.name, workspace_path / "home", completed_spec.fixture_mounts
-                )
+                sandbox_rules = self._inventory_sandbox_home(task.name, workspace_path / "home")
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
@@ -1359,16 +1355,14 @@ class DefaultEvalHarness(Harness):
         self,
         task_name: str,
         home: Path,
-        fixture_mounts: Mapping[str, str] | None = None,
     ) -> tuple[SensitiveAccessRule, ...]:
         """Detection inventory rooted at the sandbox home; returns the rules.
 
         Same tripwire as the operator-home inventory, different root. A
         freshly-created home correctly yields the empty ruleset. Fixture
-        mounts only materialize inside the container, so each mounted name
-        additionally gets a container-path rule; the per-record prompt filter
-        authorizes the ones the task itself names. Best-effort: a scan
-        failure returns () rather than blocking the run.
+        mounts are this run's own input (keyed on the run-unique cluster
+        token), so they are not covered. Best-effort: a scan failure returns
+        () rather than blocking the run.
         """
         if not (self.cheat_detect and self.cheat_inventory):
             return ()
@@ -1378,12 +1372,6 @@ class DefaultEvalHarness(Harness):
                 baseline=DEFAULT_BASELINE
                 | baseline_from_granted_paths(home, self._granted_skill_paths),
             )
-            mounted_names = [
-                PurePosixPath(container_path).name
-                for container_path in (fixture_mounts or {}).values()
-            ]
-            if mounted_names:
-                rules += build_mount_rules(agent_sandbox.CONTAINER_HOME, mounted_names)
         except Exception:  # noqa: BLE001 - detection must never block execution
             _log.exception(
                 "sandbox-home inventory failed for %s; static cheat rules only", task_name
