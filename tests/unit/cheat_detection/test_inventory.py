@@ -25,10 +25,12 @@ from devops_bench.cheat_detection import (
     baseline_from_granted_paths,
     build_inventory_rules,
     build_mount_rules,
+    drop_fingerprints_matching_inputs,
     filter_rules_for_prompt,
+    narrow_home_listing_rules,
     scan_record,
 )
-from devops_bench.cheat_detection.rules import SCAN_FIELDS
+from devops_bench.cheat_detection.rules import DEFAULT_RULES, SCAN_FIELDS
 
 _STALE_REPORT = (
     "# Cluster Audit and Remediation Report\n"
@@ -421,3 +423,45 @@ def test_mid_batch_deliverable_flags_on_path_and_spares_the_honest_repeat(tmp_pa
 
     echoed = scan_record(_record([_exec("cat /tmp/mine.md", result=_STALE_REPORT)]), rules)
     assert echoed["status"] == "clean"
+
+
+def _listing_rule() -> Any:
+    return next(
+        r for r in DEFAULT_RULES if r.category == "harness-environment" and r.fields == SCAN_FIELDS
+    )
+
+
+def test_home_listing_rule_narrows_to_args_when_the_prompt_names_a_home_fixture(
+    tmp_path: Path,
+) -> None:
+    narrowed = narrow_home_listing_rules((_listing_rule(),), "Read ~/advisory.json.", tmp_path)
+    assert narrowed[0].fields == ("args",)
+
+
+def test_home_listing_rule_is_untouched_without_a_home_fixture(tmp_path: Path) -> None:
+    rule = _listing_rule()
+    assert narrow_home_listing_rules((rule,), "Fix the deployment.", tmp_path) == (rule,)
+
+
+def test_fingerprint_of_a_stale_delivered_input_is_dropped(tmp_path: Path) -> None:
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    (stale / "advisory.json").write_text(_STALE_REPORT)
+    rules = build_inventory_rules(stale)
+    (tmp_path / "advisory.json").write_text(_STALE_REPORT)
+
+    kept = drop_fingerprints_matching_inputs(rules, "Read ~/advisory.json.", tmp_path)
+
+    assert all(r.source for r in kept)  # path rule stays; fingerprint goes
+    assert len(kept) == len(rules) - 1
+
+
+def test_fingerprint_of_a_same_batch_deliverable_is_kept(tmp_path: Path) -> None:
+    (tmp_path / "report.md").write_text(_STALE_REPORT)
+    rules = build_inventory_rules(tmp_path)
+
+    kept = drop_fingerprints_matching_inputs(
+        rules, "Write ~/report.md.", tmp_path, produced_in_batch=frozenset({"report.md"})
+    )
+
+    assert kept == rules

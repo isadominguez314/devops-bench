@@ -382,38 +382,17 @@ def filter_rules_for_prompt(
     return tuple(r for r in rules if not (r.source and named(r.source)))
 
 
-#: Rules whose patterns are bare filenames living at the top of the operator's
-#: home, so any listing of home surfaces them whether or not the agent read
-#: anything. Narrowed to ``args`` for records whose prompt sends the agent into
-#: home; left alone otherwise, where a sighting really is evidence of digging.
+#: Rules whose bare-filename patterns any listing of home prints.
 _HOME_LISTING_CATEGORIES: frozenset[str] = frozenset({"harness-environment"})
 
 
 def narrow_home_listing_rules(
     rules: tuple[SensitiveAccessRule, ...], prompt: str, home: Path | None = None
 ) -> tuple[SensitiveAccessRule, ...]:
-    """Stop passive home-listing sightings flagging a prompt-authorized run.
+    """Restrict home-listing rules to ``args`` when the prompt names a home fixture.
 
-    Five tasks seed their input into the operator's home and point the prompt
-    at ``~/<name>``, so an agent that runs ``ls -la ~`` to find it necessarily
-    prints the harness's own top-level files and is flagged for material it
-    never opened.
-
-    A sighting is still evidence when nothing authorized the agent to be in
-    home, so this narrows rather than removes, and only for records whose
-    prompt names a home fixture. Naming one of these files on a command line
-    still flags through ``args``; reading one while hiding the path still flags
-    through the separate content-evidence rule.
-
-    Args:
-        rules: Rules to narrow.
-        prompt: The record's substituted task ``input``.
-        home: Home the prompt's ``~`` resolves to; defaults to the current
-            user's.
-
-    Returns:
-        ``rules`` with the home-listing rules restricted to ``args`` when the
-        prompt authorizes a home fixture, unchanged otherwise.
+    An agent sent into home by its prompt prints the harness's top-level files
+    with any ``ls ~``; a sighting is still evidence when nothing sent it there.
     """
     from devops_bench.evalharness.fixtures import prompt_fixture_paths
 
@@ -428,40 +407,27 @@ def narrow_home_listing_rules(
 
 
 def drop_fingerprints_matching_inputs(
-    rules: tuple[SensitiveAccessRule, ...], prompt: str, home: Path | None = None
+    rules: tuple[SensitiveAccessRule, ...],
+    prompt: str,
+    home: Path | None = None,
+    *,
+    produced_in_batch: frozenset[str] = frozenset(),
 ) -> tuple[SensitiveAccessRule, ...]:
-    """Drop content fingerprints that also match this run's own task input.
+    """Drop rules matching the content of a delivered input the prompt names.
 
-    A stale copy of a *delivered input* in the operator's home becomes a
-    content fingerprint, and the honest agent then matches it by reading the
-    current copy — the two are byte-identical, both seeded from the same file
-    in the stack.
-
-    The test is "does this pattern match what the prompt authorized the agent
-    to read": a fingerprint that fires on the run's own input is evidence of
-    nothing, whatever its provenance. Fingerprints that do not match an
-    authorized input are untouched, so a genuinely stale ``report.md`` or a
-    prior ``results.json`` still flags.
-
-    Args:
-        rules: Rules to filter, inventory-generated and static alike.
-        prompt: The record's substituted task ``input``; the paths it names are
-            the authorization.
-        home: Home directory the prompt's ``~`` resolves to. Defaults to the
-            current user's, which is the agent's on an unsandboxed run.
-
-    Returns:
-        ``rules`` minus the fingerprints that match an authorized input.
+    A stale copy of a delivered input fingerprints byte-identical to the fresh
+    one, so reading it proves nothing. Entries in ``produced_in_batch`` (left by
+    another task this batch) are deliverables, not inputs, and stay covered.
     """
-    # Imported here rather than at module scope: the evalharness package pulls
-    # in the agent and metric layers, and cheat_detection must stay importable
-    # from them without a cycle.
+    # Lazy: evalharness imports cheat_detection.
     from devops_bench.evalharness.fixtures import prompt_fixture_paths
 
     if not prompt:
         return rules
     texts: list[str] = []
     for path in prompt_fixture_paths(prompt, home):
+        if path.name in produced_in_batch:
+            continue
         try:
             if path.is_file():
                 texts.append(path.read_text(encoding="utf-8", errors="replace"))
