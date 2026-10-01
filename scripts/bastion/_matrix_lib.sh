@@ -20,7 +20,7 @@
 # Not run directly. A wrapper sources this, sets the MATRIX_* / run config, then
 # builds the global COMBOS array (each entry "run_id|task|kvs|arm", where kvs is
 # a ';'-joined KEY=VALUE list of per-combo env, e.g.
-# "AGENT_MODEL=gemini-3.1-pro;BENCH_AGENT_TYPE=openclaw;...") and calls
+# "AGENT_MODEL=gemini-3.1-pro-preview;BENCH_AGENT_TYPE=openclaw;...") and calls
 # `matrix_dispatch "<label>"`. Each combo runs as an isolated --parallel run on
 # the bastion (its own cluster); results are copied back to RESULTS_DIR.
 #
@@ -49,7 +49,7 @@ BASTION_PROJECT="${BASTION_PROJECT:-$(gcloud config get-value project 2>/dev/nul
 REMOTE_DIR="${REMOTE_DIR:-devops-bench}"
 
 MATRIX_TASKS="${MATRIX_TASKS:-tasks/common/opa-remediation/task.yaml}"
-MATRIX_MODELS="${MATRIX_MODELS:-gemini-3.1-pro}"
+MATRIX_MODELS="${MATRIX_MODELS:-gemini-3.1-pro-preview}"
 
 PROJECT_ID="${PROJECT_ID:-}"
 CLUSTER_NAME="${CLUSTER_NAME:-eval}"
@@ -57,9 +57,9 @@ GCP_LOCATION="${GCP_LOCATION:-us-central1-a}"
 AGENT_PROVIDER="${AGENT_PROVIDER:-google}"
 # Judge and chaos driver share one pinned model across arms; unset, each falls back to the arm's AGENT_MODEL.
 JUDGE_PROVIDER="${JUDGE_PROVIDER:-google}"
-JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.1-pro}"
+JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.1-pro-preview}"
 CHAOS_PROVIDER="${CHAOS_PROVIDER:-google}"
-CHAOS_MODEL="${CHAOS_MODEL:-gemini-3.1-pro}"
+CHAOS_MODEL="${CHAOS_MODEL:-gemini-3.1-pro-preview}"
 MAX_PARALLEL="${MAX_PARALLEL:-3}"
 # Per-subprocess agent timeout. The 600s harness default is too low for
 # infra-bearing tasks (e.g. deploy-hello-app timed out); give matrix runs more
