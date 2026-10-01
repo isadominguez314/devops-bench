@@ -312,6 +312,11 @@ matrix_dispatch() {
     echo "export PROJECT_ID='${PROJECT_ID}' CLUSTER_NAME='${CLUSTER_NAME}'"
     echo "export GCP_LOCATION='${GCP_LOCATION}'"
     echo "export AGENT_TIMEOUT_SEC='${AGENT_TIMEOUT_SEC}'"
+    # Per-arm knobs forwarded only when set locally, so one launch can differ
+    # from the bastion's secrets.env without editing it.
+    for v in BENCH_AGENT_SANDBOX BENCH_SANDBOX_IMAGE BENCH_VERIFY_TOTAL_BUDGET_SEC AGENT_MODEL_EFFORT AGENT_EXTRA_FLAGS; do
+      [ -n "${!v:-}" ] && echo "export ${v}='${!v}'"
+    done
     echo "export BENCH_PARALLEL=true"
     if [ -n "${BENCH_AGENT_SANDBOX:-}" ]; then
       # The runner's env is only what this script bakes in; a workstation-only export
