@@ -25,6 +25,11 @@ as name-only ``-e`` flags so no secret ever sits in the argv. A sandbox that
 cannot be built raises :class:`~devops_bench.core.errors.SandboxError`
 instead of quietly running the agent on the host.
 
+Network: the container is bridge-attached, so anything the host listens on
+is reachable by IP (``host.docker.internal`` only *names* that address); what
+it may reach is governed by host-side ``DOCKER-USER`` rules (bastion setup),
+not by this module.
+
 Known limits of this seam, closed by follow-ups in the same stack: the
 kubeconfig still carries the operator's cluster-admin certificate (the
 credential-scoping follow-up replaces it with a namespace-scoped
@@ -35,6 +40,7 @@ the reason to reach it).
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import sys
@@ -71,7 +77,8 @@ _log = get_logger("agents.sandbox")
 # unset must be byte-for-byte the pre-sandbox behavior.
 SANDBOX_ENV = "BENCH_AGENT_SANDBOX"
 IMAGE_ENV = "BENCH_SANDBOX_IMAGE"
-_SANDBOX_ENABLED_VALUES = frozenset({"docker", "1", "true"})
+CONTAINER_RUNTIME = "docker"
+_SANDBOX_ENABLED_VALUES = frozenset({CONTAINER_RUNTIME, "1", "true"})
 # Explicit off-values; anything else raises rather than silently running
 # ambient under an operator who typed e.g. ``yes``.
 _SANDBOX_DISABLED_VALUES = frozenset({"", "0", "false", "no", "off"})
@@ -93,17 +100,20 @@ _CONTAINER_NAME_PREFIX = "devops-bench-agent-"
 
 # Never cross the boundary even when present in the caller's overlay:
 # operator cloud identity by exact name, benchmark/Terraform/cloud-credential
-# families by prefix (vendor-neutral deny list for a vendor-neutral boundary).
+# families by prefix. No blanket GOOGLE_/GCP_ prefix: Google's model-routing
+# vars (GOOGLE_CLOUD_PROJECT, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_API_KEY) share
+# them with its credentials and must cross, so those are denied by name.
 _DENIED_ENV_NAMES = frozenset(
     {
-        "CLOUDSDK_CONFIG",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_OAUTH_ACCESS_TOKEN",
+        "GOOGLE_GHA_CREDS_PATH",
         "HOME",
         "KUBECONFIG",
         "PATH",
     }
 )
-_DENIED_ENV_PREFIXES = ("BENCH_", "TF_", "AWS_", "AZURE_", "ARM_")
+_DENIED_ENV_PREFIXES = ("BENCH_", "TF_", "AWS_", "AZURE_", "ARM_", "CLOUDSDK_")
 
 # Executor-owned inside the container; not even allowlistable, since a
 # crossing value would repoint HOME/KUBECONFIG/PATH inside the boundary.
@@ -289,7 +299,7 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
         token = re.compile(rf"(^|[-_.]){re.escape(cluster_name)}([-_.]|$)")
         candidates = sorted(
             p
-            for p in home.glob(f"*{cluster_name}*")
+            for p in home.glob(f"*{glob.escape(cluster_name)}*")
             if not p.name.startswith(".") and token.search(p.name)
         )
 
@@ -380,6 +390,11 @@ class SandboxExecutor:
                 "harness completes the spec after provisioning — refusing to run "
                 "the agent unsandboxed"
             )
+        if not Path(spec.workspace).is_dir() or not Path(spec.kubeconfig).is_file():
+            raise SandboxError(
+                f"sandbox spec points at a missing workspace or kubeconfig "
+                f"({spec.workspace}, {spec.kubeconfig}); refusing to run the agent unsandboxed"
+            )
         self.spec = spec
         self._workspace = Path(spec.workspace)
         self.container_name = container_name_for_workspace(self._workspace)
@@ -425,7 +440,7 @@ class SandboxExecutor:
         last ``-e`` wins); no ``-i`` (a headless run never reads stdin).
         """
         spec = self.spec
-        argv: list[str] = ["docker", "run", "--rm", "--name", self.container_name]
+        argv: list[str] = [CONTAINER_RUNTIME, "run", "--rm", "--name", self.container_name]
         argv += ["--cap-drop=ALL", "--security-opt=no-new-privileges=true"]
         if spec.network.docker_network:
             argv += ["--network", spec.network.docker_network]
@@ -484,9 +499,9 @@ class SandboxExecutor:
             raise SandboxError(
                 "the sandboxed agent runs without stdin (no -i, by design); input= is unsupported"
             )
-        # Filter once: the same mapping supplies the name-only -e flags and
-        # the values handed to the docker client process (its /proc environ
-        # is same-uid-readable, unlike its cmdline).
+        # Filter here so the values handed to the docker client match the
+        # names wrap_argv emits (its own filter is a no-op on this mapping);
+        # values live in the client's /proc environ, never its cmdline.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
         try:
@@ -529,7 +544,9 @@ def container_name_for_workspace(workspace: Path) -> str:
 def kill_container(name: str) -> None:
     """Best-effort, time-bounded ``docker kill`` by name. Never raises."""
     try:
-        result = run(["docker", "kill", name], check=False, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+        result = run(
+            [CONTAINER_RUNTIME, "kill", name], check=False, timeout=_HOUSEKEEPING_TIMEOUT_SEC
+        )
     except (OSError, SubprocessError):
         _log.warning("could not reap sandbox container %s", name, exc_info=True)
         return
@@ -546,7 +563,7 @@ def sweep_stray_containers() -> None:
     """
     try:
         listed = run(
-            ["docker", "ps", "-q", "--filter", f"name=^{_CONTAINER_NAME_PREFIX}"],
+            [CONTAINER_RUNTIME, "ps", "-q", "--filter", f"name=^{_CONTAINER_NAME_PREFIX}"],
             check=False,
             timeout=_HOUSEKEEPING_TIMEOUT_SEC,
         )

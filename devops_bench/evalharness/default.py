@@ -1361,6 +1361,11 @@ class DefaultEvalHarness(Harness):
         leak in. Raises :class:`SandboxError` when a plan or credential
         cannot be built; the caller records a failed task, never degrades.
         """
+        if self._agent_config.sandbox is None:
+            raise SandboxError(
+                "_prepare_sandbox_spec called without a sandbox opt-in; the caller "
+                "must gate on config.sandbox"
+            )
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
         if with_cluster:
             plan = agent_sandbox.build_network_plan(provider, cluster_info)
