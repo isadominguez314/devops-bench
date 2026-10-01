@@ -122,6 +122,15 @@ _SPECS: dict[str, ProviderSpec] = {
         keyless_ok=False,
         backend=None,
     ),
+    # OpenAI via a Codex subscription login; oc bootstraps the OAuth profile itself.
+    "openai-codex": ProviderSpec(
+        canonical="openai-codex",
+        adapter_family="openai",
+        oc_provider="openai",
+        api_key_envs=(),
+        keyless_ok=True,
+        backend=None,
+    ),
 }
 
 # Raw alias (lowercased) -> canonical id. Company/runtime names and underscore
@@ -138,6 +147,9 @@ _ALIASES: dict[str, str] = {
     "anthropic-bedrock": "anthropic-bedrock",
     "anthropic_bedrock": "anthropic-bedrock",
     "openai": "openai",
+    "openai-codex": "openai-codex",
+    "openai_codex": "openai-codex",
+    "codex": "openai-codex",
 }
 
 
