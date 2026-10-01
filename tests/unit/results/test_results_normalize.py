@@ -379,6 +379,33 @@ def test_build_rows_leaves_a_withheld_recoverable_null_on_the_row() -> None:
     assert d["recoverableSafetyScore"] is None
 
 
+def test_build_rows_leaves_correctness_null_for_a_run_the_agent_never_completed() -> None:
+    record = {
+        "name": "Agent crashed",
+        "folder": "task_z",
+        "status": "agent_error",
+        "scores": {"VerificationCorrectness": {"score": 1.0, "success": True}},
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["correctnessScore"] is None
+
+
+def test_build_rows_keeps_correctness_for_an_ordinary_completed_run() -> None:
+    record = {
+        "name": "Finished",
+        "folder": "task_z",
+        "status": "success",
+        "trajectory": [{"step": 1}],
+        "scores": {"ChecklistScore": {"score": 0.9, "success": True}},
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["correctnessScore"] == 0.9
+
+
 def test_build_rows_failed_record_has_null_scores_and_tokens():
     record = {
         "name": "Broken Task",
@@ -483,6 +510,7 @@ def test_manifest_to_dict_keys():
         "augmentation",
         "sandboxImage",
         "sandboxImageDigest",
+        "judgeModel",
     }
 
 
@@ -504,6 +532,11 @@ def test_build_rows_carries_per_record_sandboxed():
     assert inside.to_dict()["sandboxed"] is True
     assert exempt.to_dict()["sandboxed"] is False
     assert legacy.to_dict()["sandboxed"] is None
+
+
+def test_manifest_records_the_judge_model():
+    assert _manifest(judge_model="judge-m").to_dict()["judgeModel"] == "judge-m"
+    assert _manifest().to_dict()["judgeModel"] is None
 
 
 def test_build_rows_propagates_validated():
