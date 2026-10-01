@@ -262,7 +262,7 @@ Four things are deliberate here:
 
 ### `manifest.json` — run-level identity
 
-The shared identity for every row in the run: schema version, `runId`, timestamp, `setupId`, `model`, `harness`, `augmentation`, and `reasoningEffort`.
+The shared identity for every row in the run: schema version, `runId`, timestamp, `setupId`, `model`, `harness`, `augmentation`, `reasoningEffort`, and `judgeModel` (the model that graded judged metrics; null when no judge ran).
 
 ## How to read a result
 

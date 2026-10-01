@@ -2098,3 +2098,12 @@ def test_only_readonly_quota_declines_quota_writes() -> None:
         if not all(t.agent_quota_writes for t in FileSystemTaskLoader().load_tasks(str(p)))
     ]
     assert declining == ["readonly-quota"]
+
+
+def test_resolve_model_name_prefers_the_judges_own_label() -> None:
+    """The judge's own label wins over its client's; no judge resolves to None."""
+    resolve = harness_default._resolve_model_name  # noqa: SLF001
+    client = SimpleNamespace(model_name="client-m")
+    assert resolve(SimpleNamespace(_model_name="judge-m", client=client)) == "judge-m"
+    assert resolve(SimpleNamespace(client=client)) == "client-m"
+    assert resolve(None) is None
