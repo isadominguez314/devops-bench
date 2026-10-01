@@ -37,6 +37,7 @@ from devops_bench.agents.capabilities import (
     SkillBinding,
 )
 from devops_bench.chaos import ChaosSpec
+from devops_bench.chaos.agent import driver_identity
 from devops_bench.cheat_detection import (
     DEFAULT_BASELINE,
     SensitiveAccessRule,
@@ -1473,6 +1474,9 @@ class DefaultEvalHarness(Harness):
             },
             # Per-task, not per-arm: a requires_unsandboxed task in a sandboxed run reads False.
             "sandboxed": sandboxed,
+            # Which models scored and disrupted the run; ``judge`` is filled by ``_score``.
+            "judge": {},
+            "chaos_driver": driver_identity() if task.chaos_spec else {},
             "verification_parse_errors": [],
             "verification_report": [],
             "verification_status": "",
@@ -1554,7 +1558,7 @@ class DefaultEvalHarness(Harness):
         if not scorable:
             return
         # Lazy import keeps ``deepeval`` / provider SDKs out of harness import.
-        from devops_bench.metrics import evaluate_metrics_batch, get_judge_model
+        from devops_bench.metrics import describe_judge, evaluate_metrics_batch, get_judge_model
 
         try:
             judge_model = self._judge_model or get_judge_model()
@@ -1563,4 +1567,7 @@ class DefaultEvalHarness(Harness):
             # judge, so a judge outage must not leave a cheating run ungated.
             _log.exception("judge unavailable; scoring deterministic metrics only")
             judge_model = None
+        judge = describe_judge(judge_model) if judge_model is not None else {}
+        for record in scorable:
+            record["judge"] = dict(judge)
         evaluate_metrics_batch(scorable, judge_model, use_mcp=self.use_mcp)

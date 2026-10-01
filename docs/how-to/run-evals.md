@@ -50,7 +50,10 @@ configuration surface — including the MCP and skills bindings
 The judge is selected the same way, with `JUDGE_PROVIDER` / `JUDGE_MODEL` (or the
 `--judge-provider` / `--judge-model` flags). With both unset, the judge inherits
 `AGENT_PROVIDER` (defaulting to `google`) and the Gemini adapter falls back to
-`AGENT_MODEL`, then to `gemini-3.1-pro-preview` (`devops_bench/models/gemini.py`). See
+`AGENT_MODEL`, then to `gemini-3.1-pro-preview` (`devops_bench/models/gemini.py`). That
+fallback means the agent grades itself, so the harness logs a warning when it happens,
+and every record stores the models that scored and disrupted the run under `judge` and
+`chaos_driver` (the latter resolves `CHAOS_PROVIDER` / `CHAOS_MODEL` the same way). See
 [model providers](../components/model_providers.md) for how provider keys and
 API-key routing work, including the keyless Vertex/Bedrock backends that
 authenticate via ambient credentials instead of an `AGENT_API_KEY`.

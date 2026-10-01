@@ -22,12 +22,17 @@ error string; and retain the model's final text across the turn cap.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
-from devops_bench.chaos.agent import ChaosAgent
+import pytest
+from pytest_mock import MockerFixture
+
+from devops_bench.chaos import agent as chaos_agent
+from devops_bench.chaos.agent import ChaosAgent, driver_identity
 from devops_bench.models.base import LLMClient
 
 
@@ -78,6 +83,56 @@ def _handler_returning(
         return text
 
     return _handler, seen
+
+
+def test_agent_warns_when_chaos_model_falls_back_to_agent_model(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("CHAOS_MODEL", raising=False)
+    monkeypatch.setenv("AGENT_MODEL", "arm-model")
+    get_model = mocker.patch.object(chaos_agent, "get_model", return_value=_ScriptedClient([]))
+    handler, _ = _handler_returning("unused")
+
+    with caplog.at_level(logging.WARNING):
+        ChaosAgent(system_instruction="s", tool=_TOOL, tool_handler=handler)
+
+    assert "CHAOS_MODEL unset" in caplog.text
+    assert get_model.call_args.kwargs["model_name"] == "arm-model"
+
+
+def test_agent_is_quiet_when_chaos_model_is_pinned(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("CHAOS_MODEL", "pinned")
+    mocker.patch.object(chaos_agent, "get_model", return_value=_ScriptedClient([]))
+    handler, _ = _handler_returning("unused")
+
+    with caplog.at_level(logging.WARNING):
+        ChaosAgent(system_instruction="s", tool=_TOOL, tool_handler=handler)
+
+    assert "CHAOS_MODEL unset" not in caplog.text
+
+
+def test_driver_identity_prefers_chaos_env_and_canonicalizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_PROVIDER", "anthropic")
+    monkeypatch.setenv("AGENT_MODEL", "arm-model")
+    monkeypatch.delenv("CHAOS_PROVIDER", raising=False)
+    monkeypatch.delenv("CHAOS_MODEL", raising=False)
+    assert driver_identity() == {"provider": "anthropic", "model": "arm-model"}
+
+    monkeypatch.setenv("CHAOS_PROVIDER", "gemini")
+    monkeypatch.setenv("CHAOS_MODEL", "chaos-x")
+    assert driver_identity() == {"provider": "google", "model": "chaos-x"}
+
+
+def test_driver_identity_reports_an_unknown_provider_as_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CHAOS_PROVIDER", "no-such-provider")
+    monkeypatch.setenv("CHAOS_MODEL", "chaos-x")
+    assert driver_identity() == {"provider": "no-such-provider", "model": "chaos-x"}
 
 
 def test_agent_runs_one_turn_when_model_emits_no_tool_calls() -> None:
