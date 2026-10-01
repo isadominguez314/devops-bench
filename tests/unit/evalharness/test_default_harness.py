@@ -1192,6 +1192,21 @@ def test_agent_config_snapshot_has_no_sandbox_when_flag_off(
     assert harness.build_agent_config().sandbox is None
 
 
+def test_prepare_sandbox_spec_refuses_without_a_sandbox_opt_in(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller gates on config.sandbox; the precondition is explicit, not a
+    bare TypeError out of dataclasses.replace(None, ...)."""
+    from devops_bench.core import SandboxError
+
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    harness = DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results")
+    )
+    with pytest.raises(SandboxError, match="without a sandbox opt-in"):
+        harness._prepare_sandbox_spec(tmp_path / "ws", tmp_path / "creds", "c1")  # noqa: SLF001
+
+
 def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
