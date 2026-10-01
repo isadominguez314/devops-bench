@@ -1589,6 +1589,8 @@ def _run_colliding_batch(
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    # The prompt names an output the agent writes, not a seeded input.
+    monkeypatch.setenv("BENCH_REQUIRE_FIXTURES", "0")
 
     _CollidingDeliverableAgent.home = fake_home
     _CollidingDeliverableAgent.calls = 0

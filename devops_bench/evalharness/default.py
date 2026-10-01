@@ -983,18 +983,7 @@ class DefaultEvalHarness(Harness):
             target_dep, ns = self._resolve_deployment_and_namespace(task)
 
             prompt = self.replace_placeholders(task.prompt, active_cluster_name, target_dep, ns)
-            # Before the agent starts, confirm the home fixtures this prompt
-            # promises are actually where it says. A missing one does not fail
-            # the agent, it makes it hunt the filesystem and get graded on what
-            # it could reconstruct — indistinguishable, from the score, from a
-            # model that simply did worse. Raises unless BENCH_REQUIRE_FIXTURES
-            # is off; skipped when a sandbox mount plan already carried the
-            # fixtures in, since host paths then say nothing about the agent's
-            # view.
-            # Unsandboxed, the agent inherits this process's HOME, so the
-            # default (Path.home()) is the agent's own view. Sandboxed, its HOME
-            # is the workspace copy — and if a mount plan filled that, the check
-            # is skipped entirely rather than second-guessing the bind.
+            # A missing promised fixture fails the run instead of being graded as a weak model.
             check_prompt_fixtures(
                 prompt,
                 task.name,
