@@ -18,13 +18,15 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from deepeval.models import DeepEvalBaseLLM
 
 from devops_bench.core import get_env, get_logger
+from devops_bench.core.model_providers import resolve_provider
 from devops_bench.models import LLMClient, get_model
 
-__all__ = ["ModelLayerJudge", "get_judge_model"]
+__all__ = ["ModelLayerJudge", "describe_judge", "get_judge_model"]
 
 _log = get_logger("metrics.geval")
 
@@ -57,8 +59,16 @@ class ModelLayerJudge(DeepEvalBaseLLM):
         if client is None:
             provider = provider or get_env("JUDGE_PROVIDER")
             model_name = model_name or get_env("JUDGE_MODEL")
+            if model_name is None:
+                _log.warning(
+                    "JUDGE_MODEL unset; the judge falls back to AGENT_MODEL (the agent grades itself)"
+                )
             client = get_model(provider=provider, model_name=model_name)
+            # Mirror get_model's provider resolution so the record names what was built.
+            provider = resolve_provider(provider or get_env("AGENT_PROVIDER")).canonical
         self.client = client
+        #: Canonical provider id the judge was built for; None for a supplied client with no provider.
+        self.provider = provider
         # Mirror the adapter's resolved model name so DeepEval can label results.
         self._model_name = model_name or getattr(client, "model_name", None) or "judge"
 
@@ -110,6 +120,15 @@ class ModelLayerJudge(DeepEvalBaseLLM):
     def get_model_name(self) -> str:
         """Return the configured judge model name (DeepEval contract)."""
         return self._model_name
+
+
+def describe_judge(judge: Any) -> dict[str, str | None]:
+    """Return the ``{"provider", "model"}`` identity a run record stores for its judge."""
+    get_name = getattr(judge, "get_model_name", None)
+    return {
+        "provider": getattr(judge, "provider", None),
+        "model": get_name() if callable(get_name) else None,
+    }
 
 
 def get_judge_model(provider: str | None = None, model_name: str | None = None) -> ModelLayerJudge:

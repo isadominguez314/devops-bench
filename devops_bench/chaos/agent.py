@@ -21,11 +21,13 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from devops_bench.core import first_env, get_logger
+from devops_bench.core import first_env, get_env, get_logger
+from devops_bench.core.errors import ConfigError
+from devops_bench.core.model_providers import resolve_provider
 from devops_bench.models import LLMClient, get_model
 from devops_bench.models.utils.loop import LoopResult, run_tool_loop
 
-__all__ = ["ChaosAgent", "ToolHandler"]
+__all__ = ["ChaosAgent", "ToolHandler", "driver_identity"]
 
 _log = get_logger("chaos.agent")
 
@@ -36,6 +38,16 @@ _MAX_TURNS = 8
 #: Concrete faults implement this and pass it to :class:`ChaosAgent` — see
 #: :func:`devops_bench.chaos.faults.generate_load.run_chaos_command`.
 ToolHandler = Callable[[str, threading.Event | None], str]
+
+
+def driver_identity() -> dict[str, str | None]:
+    """Return the ``{"provider", "model"}`` the chaos driver would resolve from the environment."""
+    raw = first_env("CHAOS_PROVIDER", "AGENT_PROVIDER")
+    try:
+        provider: str | None = resolve_provider(raw).canonical
+    except ConfigError:  # an unknown alias is reported as written; get_model raises on it later
+        provider = raw
+    return {"provider": provider, "model": first_env("CHAOS_MODEL", "AGENT_MODEL")}
 
 
 class ChaosAgent:
@@ -69,6 +81,10 @@ class ChaosAgent:
         if client is None:
             provider = first_env("CHAOS_PROVIDER", "AGENT_PROVIDER")
             model_name = first_env("CHAOS_MODEL", "AGENT_MODEL")
+            if get_env("CHAOS_MODEL") is None:
+                _log.warning(
+                    "CHAOS_MODEL unset; the chaos driver falls back to AGENT_MODEL (%s)", model_name
+                )
             client = get_model(provider=provider, model_name=model_name)
         self._client = client
         self._system_instruction = system_instruction

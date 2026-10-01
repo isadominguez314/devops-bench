@@ -16,11 +16,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+from pytest_mock import MockerFixture
+
 from devops_bench.metrics import geval
-from devops_bench.metrics.geval import ModelLayerJudge
+from devops_bench.metrics.geval import ModelLayerJudge, describe_judge
 
 
 def _fake_client(text="judged", model_name="judge-model"):
@@ -40,6 +44,34 @@ def test_wraps_supplied_client_without_get_model(mocker):
     get_model.assert_not_called()
     assert judge.load_model() is client
     assert judge.get_model_name() == "explicit"
+
+
+def test_warns_and_records_provider_when_judge_model_unset(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    mocker.patch.object(geval, "get_model", return_value=_fake_client(model_name="arm-model"))
+    mocker.patch.dict(os.environ, {"AGENT_PROVIDER": "anthropic"}, clear=True)
+
+    with caplog.at_level(logging.WARNING):
+        judge = ModelLayerJudge()
+
+    assert "JUDGE_MODEL unset" in caplog.text
+    assert describe_judge(judge) == {"provider": "anthropic", "model": "arm-model"}
+
+
+def test_describe_judge_uses_judge_env_when_set(mocker: MockerFixture) -> None:
+    mocker.patch.object(geval, "get_model", return_value=_fake_client())
+    mocker.patch.dict(
+        os.environ,
+        {"AGENT_PROVIDER": "anthropic", "JUDGE_PROVIDER": "gemini", "JUDGE_MODEL": "judge-x"},
+        clear=True,
+    )
+
+    assert describe_judge(ModelLayerJudge()) == {"provider": "google", "model": "judge-x"}
+
+
+def test_describe_judge_tolerates_a_foreign_judge() -> None:
+    assert describe_judge(object()) == {"provider": None, "model": None}
 
 
 def test_builds_client_from_config(mocker):
