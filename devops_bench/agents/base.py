@@ -42,6 +42,7 @@ from pathlib import Path
 
 from devops_bench.agents.config import AgentConfig
 from devops_bench.agents.result import AgentResult
+from devops_bench.agents.sandbox import SandboxExecutor
 from devops_bench.core import Registry, SandboxError, get_logger
 from devops_bench.core.subprocess import CompletedProcess
 from devops_bench.core.subprocess import run as _host_subprocess_run
@@ -217,11 +218,6 @@ class AgentHarness(ABC):
             The completed process, in either mode.
         """
         if self.config.sandbox is not None:
-            # Function-local import: the sandbox module is only needed once a
-            # run actually opted in, and this keeps ``import
-            # devops_bench.agents`` byte-identical for everyone else.
-            from devops_bench.agents.sandbox import SandboxExecutor
-
             return SandboxExecutor(self.config.sandbox).run(
                 cmd,
                 cwd=cwd,
