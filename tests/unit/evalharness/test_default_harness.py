@@ -1326,6 +1326,15 @@ def test_chaos_invalidated_entries_empty_when_spec_opts_out_of_verification() ->
     assert chaos_invalidated_entries([spec], {"status": "failed"}) == {}
 
 
+def test_verification_status_names_chaos_invalidation() -> None:
+    status = harness_default._verification_status({"Spike Verification": "never fired"})  # noqa: SLF001
+    assert status == "chaos_invalidated"
+
+
+def test_verification_status_is_evaluated_when_nothing_was_invalidated() -> None:
+    assert harness_default._verification_status({}) == "evaluated"  # noqa: SLF001
+
+
 def _spike_entries() -> list[Any]:
     """The load-spike objective plus an unrelated objective, both converge-mode."""
     entries, errors = parse_entries(
@@ -1637,6 +1646,7 @@ def test_run_never_grades_the_spike_entry_when_the_fault_did_not_fire(
     record = _run_chaos_task(tmp_path, injection_succeeds=False)
 
     assert record["chaos_report"]["status"] == "failed"
+    assert record["verification_status"] == "chaos_invalidated"
 
     report = record["verification_report"]
     spike = next(r for r in report if r["name"] == "Planned Load Spike Verification")
@@ -1663,6 +1673,7 @@ def test_run_invalidates_the_spike_entry_even_when_the_agent_crashes(
 
     assert record["status"] == "failed"
     assert record["chaos_report"]["status"] == "failed"
+    assert record["verification_status"] == "chaos_invalidated"
 
     report = record["verification_report"]
     spike = next(r for r in report if r["name"] == "Planned Load Spike Verification")

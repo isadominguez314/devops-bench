@@ -181,6 +181,11 @@ def chaos_invalidated_entries(
     }
 
 
+def _verification_status(invalidated: Mapping[str, str]) -> str:
+    """Return ``"chaos_invalidated"`` when a chaos entry went unscored, else ``"evaluated"``."""
+    return "chaos_invalidated" if invalidated else "evaluated"
+
+
 def _ensure_builtin_agents_registered() -> None:
     """Import the builtin agent modules so their registrations fire.
 
@@ -1237,12 +1242,14 @@ class DefaultEvalHarness(Harness):
                 verification_report: list[dict[str, Any]] = []
                 verification_status = "skipped_no_infra"
             else:
+                invalidated = chaos_invalidated_entries(chaos_specs, chaos_report)
                 verification_report = self._run_verification(
                     entries,
                     hold_observations=hold_observations,
-                    invalidated=chaos_invalidated_entries(chaos_specs, chaos_report),
+                    invalidated=invalidated,
                 )
-                verification_status = "evaluated"
+                # A fault that never landed invalidates the run, not just one entry.
+                verification_status = _verification_status(invalidated)
 
             result = self._build_success_record(
                 task=task,
@@ -1277,12 +1284,13 @@ class DefaultEvalHarness(Harness):
                 exception_verification_status = "skipped_no_infra"
             elif infra_up and entries:
                 try:
+                    exception_invalidated = chaos_invalidated_entries(chaos_specs, chaos_report)
                     exception_verification_report = self._run_verification(
                         entries,
                         hold_observations=hold_observations,
-                        invalidated=chaos_invalidated_entries(chaos_specs, chaos_report),
+                        invalidated=exception_invalidated,
                     )
-                    exception_verification_status = "evaluated"
+                    exception_verification_status = _verification_status(exception_invalidated)
                 except Exception:  # noqa: BLE001 - a crash here must not mask the original failure
                     _log.exception(
                         "verification crashed while building the failed record for %s", task.name
