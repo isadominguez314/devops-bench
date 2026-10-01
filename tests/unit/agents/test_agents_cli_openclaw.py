@@ -711,6 +711,16 @@ def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
         _build_env(AgentConfig(provider="google-vertyx"))
 
 
+def test_model_override_anthropic_direct_pins_messages_transport() -> None:
+    """A Claude 5 id on the direct API gets the anthropic-messages transport."""
+    override = _build_model_override(AgentConfig(model="claude-fable-5-1", provider="anthropic"))
+    entry = override["models"]["providers"]["anthropic"]
+    assert entry["api"] == "anthropic-messages"
+    assert entry["baseUrl"] == "https://api.anthropic.com"
+    assert entry["models"] == [{"id": "claude-fable-5-1", "name": "claude-fable-5-1"}]
+    assert override["agents"]["defaults"]["models"] == {"anthropic/claude-fable-5-1": {}}
+
+
 def test_model_override_raises_for_unpinned_transport() -> None:
     """A catalog-override model whose provider has no pinned transport fails loud
     rather than shipping a transport-less entry (which would 401 via the OpenAI
