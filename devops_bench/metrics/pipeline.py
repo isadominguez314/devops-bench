@@ -21,7 +21,7 @@ from typing import Any
 
 from deepeval.test_case import LLMTestCase
 
-from devops_bench.core import get_bool, get_logger, score_keys
+from devops_bench.core import get_bool, get_logger, is_unscoreable_run, score_keys
 
 # Imported for their @METRICS.register side effects.
 from devops_bench.metrics import (
@@ -382,6 +382,17 @@ def evaluate_metrics_batch(
         # like the metric loop: a malformed sub-score raises out of the scoring
         # formula, and must cost this record its composite rather than abort the
         # remaining records in the batch.
+        if is_unscoreable_run(res):
+            # The agent never completed its turn: keep sub-scores for triage, withhold the composite.
+            _log.warning(
+                "no composite outcome score for %s: status=%r, errors=%d, trajectory steps=%d",
+                res.get("name"),
+                res.get("status"),
+                len(res.get("errors") or []),
+                len(res.get("trajectory") or []),
+            )
+            res["scores"] = scores
+            continue
         try:
             _finalize_outcome_score(scores)
         except Exception:  # noqa: BLE001 - one record must not abort the batch

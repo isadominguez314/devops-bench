@@ -27,6 +27,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
 from devops_bench.core import score_keys
+from devops_bench.core.run_status import is_unscoreable_run
 from devops_bench.results.row import CheckGroupRow, CheckRow, Manifest, ResultRow
 
 __all__ = [
@@ -400,7 +401,10 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
     for record in records:
         scores = record.get("scores")
         tokens = normalize_tokens(record.get("tokens"))
-        correctness = _first_score(scores, _CORRECTNESS_KEYS)
+        # Same rule as the composite: a run the agent never performed publishes no correctness.
+        correctness = (
+            None if is_unscoreable_run(record) else _first_score(scores, _CORRECTNESS_KEYS)
+        )
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
         task_meta = record.get("task_metadata")
         if not isinstance(task_meta, Mapping):
