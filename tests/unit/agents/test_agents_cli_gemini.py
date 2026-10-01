@@ -234,7 +234,7 @@ def test_build_env_vertex_defaults_the_location_and_omits_an_unset_project(
         monkeypatch.delenv(var, raising=False)
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
     assert "GOOGLE_CLOUD_PROJECT" not in env
-    assert env["GOOGLE_CLOUD_LOCATION"] == "us-central1"
+    assert env["GOOGLE_CLOUD_LOCATION"] == "global"
 
 
 def test_build_env_non_vertex_writes_no_vertex_routing_vars(

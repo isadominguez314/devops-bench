@@ -178,7 +178,8 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     if spec.backend == "vertex":
         # Without these the embedded google-genai SDK defaults to the Gemini
         # API and ignores the Vertex routing. GCP_* fallbacks match what the
-        # bastion exports (GCP_LOCATION is a zone, not a Vertex region).
+        # bastion exports (GCP_LOCATION is a zone, not a Vertex region);
+        # "global" is the only location the -preview model ids serve from.
         overlay["GOOGLE_GENAI_USE_VERTEXAI"] = "true"
         project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT_ID")
         if project:
@@ -186,7 +187,7 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
         overlay["GOOGLE_CLOUD_LOCATION"] = (
             os.environ.get("GOOGLE_CLOUD_LOCATION")
             or os.environ.get("GCP_VERTEX_LOCATION")
-            or "us-central1"
+            or "global"
         )
     if config.api_key:
         for var in spec.api_key_envs:
