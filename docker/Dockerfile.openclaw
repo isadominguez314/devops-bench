@@ -23,66 +23,47 @@
 # agent's cluster credential, workspace, and fixtures are mounted at run time
 # by devops_bench/agents/sandbox.py, never baked in here.
 
-FROM node:22-slim
+# Node 24: openclaw 2026.9.3+ needs Node >=24.16. Pinned by multi-arch
+# manifest-list digest (amd64 + arm64).
+FROM node:24-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
 
-# Versions are pinned so a rebuild reproduces the image an A/B arm was scored
-# with; bump them deliberately and re-baseline.
-#
-# kubectl and helm match fleet/pins.yaml's tools block, so the agent inside the
-# boundary sees the same versions the executor uses outside it.
-ARG KUBECTL_VERSION=v1.36.4
-ARG HELM_VERSION=v3.21.4
-
-# OPENCLAW_VERSION and ANTHROPIC_VERTEX_PROVIDER_VERSION are a matched
-# core+plugin pair and must be bumped together. 2026.9.1-beta.1 is the earliest
-# pairing confirmed live to work end to end, and the reasons are worth keeping:
-#
-#   openclaw@2026.7.1 (npm "latest" at the time): the plugin's bundled
-#     @anthropic-ai/vertex-sdk + gaxios/google-auth-library combination throws
-#     inside its JWT token-exchange flow, so every run fails with "Failed to
-#     acquire Google OAuth credentials" (openclaw/openclaw#107341).
-#   openclaw@2026.7.2-beta.7 (first release carrying that fix): a separate bug.
-#     The plugin's "activation": {"onStartup": false} manifest flag makes
-#     `oc plugins list` (and the synthetic-auth provider discovery sharing its
-#     code) skip anthropic-vertex entirely, so it never reaches the auth hook.
-#   openclaw@2026.9.1-beta.1: discovery is fixed, and this is the first version
-#     where the per-agent SQLite auth-profile store is fully wired for
-#     anthropic-vertex. It is also the version gpt-5.6-sol was confirmed live
-#     on, which is what this image is built to run.
-#
-# Note this is AHEAD of fleet/pins.yaml's tools.openclaw (2026.8.1-beta.3),
-# which pins the `oc` binary installed on the executor host. A sandboxed run
-# uses the version below and an unsandboxed run uses the host's, so those two
-# want reconciling before results from both are compared.
-ARG OPENCLAW_VERSION=2026.9.1-beta.1
-ARG ANTHROPIC_VERTEX_PROVIDER_VERSION=2026.9.1-beta.1
+# Changing any pin below changes the agent under test; re-baseline after a bump.
+ARG KUBECTL_VERSION=v1.35.9
+ARG KUBECTL_SHA256_AMD64=3cfeaf80be482b435b0aa214aff6e0b2c312ee23c0ff20810c75517b6004c6eb
+ARG KUBECTL_SHA256_ARM64=39c98bca82875d9a9ddfb6f3c5ab17c3f78ea0801230683e538a67d5c053308d
+ARG HELM_VERSION=v3.22.0
+ARG HELM_SHA256_AMD64=1e4ab49e429626cf6c6958d914248b78c9730803c2751b87627e171dc800e7bb
+ARG HELM_SHA256_ARM64=f14e804dfee240f55525b667488fe9adca349e63e00c9af634c0beb1421ac310
+# Must equal the host oc pin in tf/modules/bastion/startup.sh: the host oc reads
+# back the session store the image's oc writes, and the harness refuses a skew.
+# The anthropic-vertex plugin is a matched core+plugin pair; bump both together.
+ARG OPENCLAW_VERSION=2026.9.6
+ARG ANTHROPIC_VERTEX_PROVIDER_VERSION=2026.9.6
 
 # ripgrep and jq are what the agent's own search and JSON handling reach for.
-#
-# The bookworm-backports line is inherited from Dockerfile.gemini-cli. Verify
-# before relying on it: as built today the resulting git is 1:2.39.5-0+deb12u3,
-# plain bookworm rather than backports, so any task needing a git feature newer
-# than 2.39 (reftable, for instance) will not find it here.
-RUN echo "deb http://deb.debian.org/debian bookworm-backports main" > /etc/apt/sources.list.d/backports.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        git \
         jq \
         ripgrep \
-    && apt-get install -y -t bookworm-backports --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-# kubectl and helm: resolve the arch from the build platform rather than
-# hardcoding amd64, so the image builds on an arm64 laptop as well as the
-# x86 bastion.
 RUN arch="$(dpkg --print-architecture)" \
-    && curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" \
-    && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl \
-    && rm kubectl \
-    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
-        | tar -xz -C /tmp \
+    && case "${arch}" in \
+        amd64) kubectl_sha="${KUBECTL_SHA256_AMD64}"; helm_sha="${HELM_SHA256_AMD64}" ;; \
+        arm64) kubectl_sha="${KUBECTL_SHA256_ARM64}"; helm_sha="${HELM_SHA256_ARM64}" ;; \
+        *) echo "unsupported architecture for kubectl/helm: ${arch}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${arch}/kubectl" \
+    && echo "${kubectl_sha}  /tmp/kubectl" | sha256sum -c - \
+    && install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl \
+    && rm /tmp/kubectl \
+    && curl -fsSL -o /tmp/helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
+    && echo "${helm_sha}  /tmp/helm.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/helm.tar.gz -C /tmp \
     && install -o root -g root -m 0755 "/tmp/linux-${arch}/helm" /usr/local/bin/helm \
-    && rm -rf "/tmp/linux-${arch}"
+    && rm -rf /tmp/helm.tar.gz "/tmp/linux-${arch}"
 
 RUN npm install -g "openclaw@${OPENCLAW_VERSION}" \
     && npm cache clean --force
@@ -95,9 +76,8 @@ RUN npm install -g "openclaw@${OPENCLAW_VERSION}" \
 RUN ln -s "$(command -v openclaw)" /usr/local/bin/oc
 
 # anthropic-vertex (Claude on Vertex, e.g. claude-fable-5) is a separately
-# published plugin rather than one of openclaw's bundled "stock" plugins.
-# gpt-5.6-sol does not need it, but installing it here keeps one image able to
-# serve both arms instead of forcing a second openclaw image per provider.
+# published plugin rather than one of openclaw's bundled "stock" plugins;
+# installing it here keeps one image serving every model provider.
 #
 # Install it with `npm install -g` into the SAME global prefix as openclaw,
 # not with `oc plugins install`. npm then dedupes the "openclaw" peer
@@ -122,7 +102,7 @@ RUN npm install -g "@openclaw/anthropic-vertex-provider@${ANTHROPIC_VERTEX_PROVI
 
 # Fail the build rather than ship an image whose `oc` is missing or is not the
 # pinned version, which would otherwise only surface as a failed run.
-RUN oc --version
+RUN oc --version | grep -qF "${OPENCLAW_VERSION}"
 
 # The sandbox wrapper mounts the per-run workspace at /workspace, repoints HOME
 # to /workspace/home so a bare "~" cannot reach the operator's profile, and on
