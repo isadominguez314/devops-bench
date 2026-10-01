@@ -211,17 +211,12 @@ export AGENT_MODEL="gemini-3.1-pro-preview"
 # set it here too (e.g. GEMINI_API_KEY / ANTHROPIC_API_KEY).
 # export GEMINI_API_KEY=""
 
-# --- Judge ---
-# Must match _matrix_lib.sh exactly. These two disagreed (-preview here, plain
-# there), so which judge scored a run depended on how it was launched -- and
-# nothing recorded the answer.
+# --- Judge (must match _matrix_lib.sh) ---
 export JUDGE_PROVIDER="google"
 export JUDGE_MODEL="gemini-3.1-pro"
 export JUDGE_API_KEY=""
 
-# --- Chaos driver ---
-# Only optimize-scale uses this, but unset it falls back to AGENT_MODEL, which
-# is how the load spike failed to inject in every optimize-scale run.
+# --- Chaos driver (unset, it falls back to AGENT_MODEL) ---
 export CHAOS_PROVIDER="google"
 export CHAOS_MODEL="gemini-3.1-pro"
 EOF
