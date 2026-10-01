@@ -918,12 +918,8 @@ class DefaultEvalHarness(Harness):
         # which also leaves that record ungated, since an absent verdict is an
         # abstention rather than a zero.
         if self.cheat_detect:
-            # Three prompt-driven authorizations, applied in order: an entry the
-            # prompt names drops its path rule; a passive home-listing sighting
-            # stops flagging when the prompt sent the agent into home; and any
-            # rule matching the content of an input the prompt named is dropped,
-            # since matching it proves only that the agent read what it was told
-            # to read.
+            # Prompt-driven authorizations: named entries, home listings, delivered inputs.
+            produced_in_batch = frozenset(created_by)
             for record, inventory_rules in zip(detailed_results, task_inventories, strict=True):
                 try:
                     prompt_text = record.get("input") or ""
@@ -936,6 +932,7 @@ class DefaultEvalHarness(Harness):
                                 prompt_text,
                             ),
                             prompt_text,
+                            produced_in_batch=produced_in_batch,
                         ),
                     )
                 except Exception:  # noqa: BLE001 - detection must never sink a completed run
