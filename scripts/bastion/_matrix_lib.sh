@@ -29,19 +29,10 @@
 # Run config: PROJECT_ID (req unless DRY_RUN), CLUSTER_NAME, GCP_LOCATION,
 # AGENT_PROVIDER, JUDGE_PROVIDER, JUDGE_MODEL, MAX_PARALLEL, RESULTS_DIR,
 # MCP_SERVER_BIN, SKILLS_PATHS, SKIP_SYNC, DRY_RUN, MATRIX_TASKS, MATRIX_MODELS.
-# RESUME_STAMP=<stamp>: skip launching; re-poll + pull an existing remote run
-#   (use the stamp printed by the original invocation) — survives a dead local
-#   process. SSH keepalive + a retrying pull keep brief drops from aborting.
-# BENCH_VERTEX=1: run agents + judges against Vertex AI via the bastion VM SA's
-#   ADC instead of the API-key endpoints. The runner unsets every API key from
-#   secrets.env and exports GOOGLE_GENAI_USE_VERTEXAI/GOOGLE_CLOUD_*/
-#   GCP_VERTEX_LOCATION (default location 'global'; override GOOGLE_CLOUD_LOCATION
-#   / GCP_VERTEX_LOCATION). For the legacy oc arm also set AGENT_PROVIDER=
-#   google-vertex so the model id becomes 'google-vertex/<model>'. Prereq: the oc
-#   google-vertex provider must be auth'd once (see docs/components/bastion.md).
-# BENCH_REMOTE=1: run the matrix ON the bastion over ssh (sync + remote nohup +
-#   pull). Default (unset) runs every combo LOCALLY on this host (no ssh/sync;
-#   outputs in ~/matrix-runs/<stamp>, no pull). BASTION_* matter only when set.
+# RESUME_STAMP=<stamp>: skip launching; re-poll + pull an existing remote run.
+# BENCH_VERTEX=1: agents + judges use Vertex AI via the VM SA's ADC (API keys
+#   unset, location 'global'); legacy oc arm also needs AGENT_PROVIDER=google-vertex.
+# BENCH_REMOTE=1: run on the bastion over ssh; unset runs every combo locally.
 
 BASTION_VM="${BASTION_VM:-bench-bastion}"
 BASTION_ZONE="${BASTION_ZONE:-us-central1-a}"
@@ -127,20 +118,12 @@ resolve_tasks() {
   fi
 }
 
-# Per-task extra env, ';'-prefixed so it appends onto an existing KVS list.
-# Some tasks need the harness integration contract (TARGET_DEPLOYMENT_NAME /
-# NAMESPACE) pinned so the prompt / chaos service_url / verification placeholders
-# match what the task's stack actually deployed. The harness reads these from the
-# environment and its defaults DIFFER across arms (refactored namespace "default"
-# vs legacy "production"), so they must be set explicitly here, not left to the
-# per-arm default. Emits nothing for tasks that don't need it.
+# Per-task extra env (';'-prefixed KVS). Pins TARGET_DEPLOYMENT_NAME/NAMESPACE where
+# the per-arm harness defaults differ from what the task's stack deploys.
 task_extra_env() {
   case "$1" in
     */optimize-scale/*) echo ";TARGET_DEPLOYMENT_NAME=scale-target;NAMESPACE=default" ;;
-    # Pre-seeded fixtures: pin NAMESPACE so the prompt's {{NAMESPACE}} resolves to
-    # the same namespace the stack deploys the fixture into, on BOTH arms (the
-    # harness default differs: refactored "default" vs legacy "production"). The
-    # value matches each stack's own namespace default.
+    # Pre-seeded fixtures: NAMESPACE must match the stack's own default on both arms.
     */multi-region-failover/*)      echo ";NAMESPACE=storefront" ;;
     */secret-rotation/*)            echo ";NAMESPACE=secret-rotation" ;;
     */cp-recovery/*)                echo ";NAMESPACE=cp-recovery" ;;
@@ -213,19 +196,11 @@ _runner_env() {
   echo '[ -f .venv/bin/activate ] && source .venv/bin/activate || true'
   echo 'set -a; [ -f ~/secrets.env ] && . ~/secrets.env; set +a'
   if [ -n "${BENCH_VERTEX:-}" ]; then
-    # Vertex mode: drop every API key secrets.env exported so agents AND judges
-    # fall back to ADC (the bastion VM SA via the metadata server), then point
-    # everything at Vertex. Location is global — the gemini-3.x *-preview models
-    # 404 on regional endpoints (us-central1). The legacy judge defaults to
-    # us-central1, so GCP_VERTEX_LOCATION must override it too.
+    # Vertex mode: drop API keys so everything falls back to ADC; location must be
+    # global (the gemini-3.x preview ids 404 on regional endpoints).
     echo 'unset AGENT_API_KEY GEMINI_API_KEY GOOGLE_API_KEY JUDGE_API_KEY GOOGLE_GENAI_API_KEY'
-    # The literal marker tells oc's google-vertex provider "use ADC". Passing it
-    # via env (not `oc models auth paste-api-key`) is what makes it PORTABLE
-    # across oc's isolated per-run OPENCLAW_STATE_DIRs — a pasted profile lives
-    # only in the global agent sqlite store, which parallel runs don't share, so
-    # they'd fail with `No API key found for provider "google-vertex"`. The
-    # gemini CLI and the google-genai judge ignore it (they pick ADC from
-    # GOOGLE_GENAI_USE_VERTEXAI + project/location).
+    # Literal marker = "use ADC" for oc's google-vertex provider; via env so it
+    # reaches every per-run OPENCLAW_STATE_DIR. Other consumers ignore it.
     echo 'export GOOGLE_CLOUD_API_KEY=gcp-vertex-credentials'
     echo "export GOOGLE_GENAI_USE_VERTEXAI=true GOOGLE_CLOUD_PROJECT='${PROJECT_ID}' GOOGLE_CLOUD_LOCATION='${GOOGLE_CLOUD_LOCATION:-global}' GCP_VERTEX_LOCATION='${GCP_VERTEX_LOCATION:-global}'"
     # Vertex model auth reads GCP_PROJECT_ID from the environment directly
@@ -261,11 +236,8 @@ print('answered:', text[:60])
   return "${rc}"
 }
 
-# Run the COMBOS matrix. Arg: a human label for logging.
-#
-# Resume/attach: set RESUME_STAMP=<stamp> (from an earlier run's output) to skip
-# launching and just re-poll + pull an existing remote run — for when the local
-# process died after the bastion runner was already launched.
+# Run the COMBOS matrix. Arg: a human label for logging. RESUME_STAMP re-attaches
+# to an existing remote run instead of launching.
 matrix_dispatch() {
   local label="$1"
 
@@ -363,10 +335,8 @@ matrix_dispatch() {
     echo "echo ALL_DONE >\"\$HOME/${REMOTE_OUT}/.done\""
   } >"${runner}"
 
-  # Staged under $HOME, not /tmp: the runner is executed, and a shared /tmp lets
-  # any other local user pre-create the path (or symlink it) and hijack what
-  # runs. Per-stamp so two matrices can be launched in parallel without
-  # clobbering each other's runner script.
+  # Under $HOME, not shared /tmp (the runner is executed); per-stamp so parallel
+  # matrices don't clobber each other.
   local staged_runner="\$HOME/.matrix-runner-${STAMP}.sh"
   local local_staged_runner="${HOME}/.matrix-runner-${STAMP}.sh"
   # Create the output dir (and its parent) BEFORE the nohup redirect — the
