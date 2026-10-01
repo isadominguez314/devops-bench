@@ -18,7 +18,7 @@
 # OPENAI_BASE_URL (see docs/how-to/serve-a-local-model.md).
 #
 # The port binds on all interfaces so a sandboxed agent can reach it at
-# host.docker.internal; the VPC firewall is what keeps it internal.
+# host.docker.internal; the network firewall is what keeps it internal.
 #
 #   MODEL          Hugging Face repo id            (default Qwen/Qwen3.8-27B-FP8)
 #   SERVED_NAME    model id the endpoint advertises (default qwen3.8-27b-fp8)

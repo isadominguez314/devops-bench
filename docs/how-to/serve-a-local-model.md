@@ -2,20 +2,21 @@
 
 Run an open-weights model on a GPU bastion behind an OpenAI-compatible endpoint
 and point the openclaw harness at it. The recipe below is what produced the
-`qwen3.8-27b-fp8` arm: Qwen 3.8 27B FP8 on one RTX PRO 6000 (GCE `g4-standard-48`),
-served by SGLang with a 256K context.
+`qwen3.8-27b-fp8` arm: Qwen 3.8 27B FP8 on one RTX PRO 6000 GPU, served by SGLang
+with a 256K context.
 
 ## 1. GPU VM
 
-- G4 shapes need `hyperdisk-balanced` boot disks, not `pd-balanced`.
-- On GCE, containers get no DNS or egress until Docker is told about the
-  1460-byte MTU. Put this in `/etc/docker/daemon.json` and restart Docker:
+- Check your cloud's supported boot disk types for the GPU machine shape.
+- On a network with an MTU below 1500 (common on cloud VPCs), containers get no
+  DNS or egress until Docker is told about it. For a 1460-byte MTU, put this in
+  `/etc/docker/daemon.json` and restart Docker:
 
   ```json
   { "dns": ["8.8.8.8", "8.8.4.4"], "mtu": 1460 }
   ```
 
-- The Ubuntu accelerator images ship `net.ipv4.ip_forward = 0`; set it to 1
+- Some accelerator OS images ship `net.ipv4.ip_forward = 0`; set it to 1
   (and persist it under `/etc/sysctl.d/`) or containers have no egress at all,
   whatever the MTU says.
 - Sandboxed runs reach the host as `host.docker.internal`; add
@@ -53,5 +54,5 @@ Then select the served model id: `MATRIX_MODELS=qwen3.8-27b-fp8` with
 writes a per-run `openai` provider entry with that base URL and opts it into
 private-network access, so the same settings work sandboxed and unsandboxed.
 
-Measured on the G4: about 46 tokens/s decode and 8.7K tokens/s prefill; a
+Measured on that GPU: about 46 tokens/s decode and 8.7K tokens/s prefill; a
 20-task openclaw matrix at three in flight finishes in about five hours.
