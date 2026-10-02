@@ -227,6 +227,17 @@ def test_token_ttl_for_adds_slack_and_caps_the_lifetime(
     assert creds.token_ttl_for(timeout_sec) == expected
 
 
+@pytest.mark.parametrize("timeout_sec", [None, 30000.0])
+def test_token_ttl_for_warns_when_the_token_may_outlive_the_agent(
+    timeout_sec: float | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Past the cap the credential expires mid-run, which is worth more than an info line."""
+    with caplog.at_level("WARNING"):
+        creds.token_ttl_for(timeout_sec)
+
+    assert any("capping" in r.message for r in caplog.records if r.levelname == "WARNING")
+
+
 # -- kubeconfig rendering ----------------------------------------------------
 
 
@@ -394,11 +405,24 @@ def _ns(name: str, **labels: str) -> dict:
     return {"metadata": {"name": name, "labels": labels}}
 
 
-def _policy_docs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+def _rendered(tmp_path: Path, *names: str) -> list[dict]:
+    """Parse the named rendered manifests into one document list (missing files contribute none)."""
+    docs: list[dict] = []
+    for name in names:
+        path = tmp_path / name
+        if path.exists():
+            docs.extend(d for d in yaml.safe_load_all(path.read_text()) if d)
+    return docs
+
+
+def _policy_docs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pod_security: str = creds.POD_SECURITY_BASELINE,
+) -> list[dict]:
     _patch_kubectl(monkeypatch)
-    creds.enforce_pod_security(tmp_path)
-    text = (tmp_path / "bench-agent-pod-security.yaml").read_text()
-    return [d for d in yaml.safe_load_all(text) if d]
+    creds.enforce_pod_security(tmp_path, pod_security=pod_security)
+    return _rendered(tmp_path, "bench-agent-pod-security.yaml", "bench-agent-namespace-guards.yaml")
 
 
 def _doc(docs: list[dict], kind: str, name: str) -> dict:
@@ -443,6 +467,17 @@ def test_pod_security_policy_also_matches_the_ephemeral_container_subresource(
 
     assert "pods" in resources
     assert "pods/ephemeralcontainers" in resources
+
+
+def test_pod_security_policy_is_not_scoped_to_the_agents_username(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A controller creates the agent's pods under its own identity; a username match would miss them."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
+
+    assert "matchConditions" not in policy["spec"]
+    assert creds._AGENT_USERNAME not in yaml.safe_dump(policy)
 
 
 def test_pod_security_policy_exempts_the_clusters_own_components(
@@ -509,8 +544,65 @@ def test_namespace_guard_denies_claiming_the_managed_label(
     rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
     expressions = " ".join(v["expression"] for v in policy["spec"]["validations"])
 
-    assert rule["operations"] == ["CREATE", "UPDATE"]
+    assert "UPDATE" in rule["operations"]
     assert "addonmanager.kubernetes.io/mode" in expressions
+
+
+def test_namespace_guard_denies_deleting_the_clusters_own_namespaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The supplement grants ``delete`` on namespaces; only three are apiserver-protected."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
+    rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
+    name_rule, label_rule = policy["spec"]["validations"][:2]
+
+    assert "DELETE" in rule["operations"]
+    # On DELETE ``object`` is null and, failing closed, an evaluation error would deny every delete.
+    assert policy["spec"]["variables"][0]["expression"] == (
+        "request.operation == 'DELETE' ? oldObject : object"
+    )
+    for expression in (name_rule["expression"], label_rule["expression"]):
+        assert "variables.ns.metadata" in expression
+        assert "object.metadata" not in expression
+
+
+def test_namespace_guard_requires_psa_on_namespaces_the_agent_creates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Labels miss namespaces created after provisioning; requiring one puts PSA in front of policy 2."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
+    on_create = next(
+        v
+        for v in policy["spec"]["validations"]
+        if "request.operation != 'CREATE'" in v["expression"]
+    )
+
+    assert "object.metadata.labels['pod-security.kubernetes.io/enforce']" in on_create["expression"]
+    assert "'baseline'" in on_create["expression"]
+    assert "'restricted'" in on_create["expression"]
+    assert "'privileged'" not in on_create["expression"]
+    assert "pod-security.kubernetes.io/enforce=baseline" in on_create["message"]
+
+
+def test_namespace_guard_denies_removing_or_weakening_the_psa_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Requiring the label at CREATE is pointless if ``kubectl label ns x enforce-`` removes it."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
+    on_update = next(
+        v
+        for v in policy["spec"]["validations"]
+        if "request.operation != 'UPDATE'" in v["expression"]
+    )
+
+    # Compares old against new: a namespace that never carried an accepted level is left alone.
+    assert (
+        "oldObject.metadata.labels['pod-security.kubernetes.io/enforce']" in on_update["expression"]
+    )
+    assert "object.metadata.labels['pod-security.kubernetes.io/enforce']" in on_update["expression"]
 
 
 def test_namespace_guard_applies_only_to_the_agents_own_identity(
@@ -522,6 +614,28 @@ def test_namespace_guard_applies_only_to_the_agents_own_identity(
     condition = policy["spec"]["matchConditions"][0]["expression"]
 
     assert f"system:serviceaccount:{creds.AGENT_NAMESPACE}:{creds.AGENT_SA_NAME}" in condition
+
+
+def test_privileged_keeps_the_guards_and_drops_only_the_pod_policy_and_labels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The guards govern where the agent may write, which a privileged task does not change."""
+    calls = _patch_kubectl(monkeypatch, namespaces={"items": [_ns("default")]})
+
+    creds.enforce_pod_security(tmp_path, pod_security=creds.POD_SECURITY_PRIVILEGED)
+
+    assert any(_applies(c, "bench-agent-namespace-guards.yaml") for c in calls)
+    assert any(_applies(c, "bench-agent-nonconformant-pods.yaml") for c in calls)
+    assert not any(_applies(c, "bench-agent-pod-security.yaml") for c in calls)
+    assert [c for c in calls if "label" in c] == []
+    docs = _rendered(tmp_path, "bench-agent-namespace-guards.yaml")
+    guard = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-namespace-guard")
+    assert _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-exempt-namespace-guard")
+    # Only the PSA-label half goes: the agent is allowed privileged pods, so no level is required.
+    expressions = " ".join(v["expression"] for v in guard["spec"]["validations"])
+    assert "addonmanager.kubernetes.io/mode" in expressions
+    assert "pod-security.kubernetes.io/enforce" not in expressions
+    assert _guard_expression(_rendered(tmp_path, "bench-agent-nonconformant-pods.yaml")) == "true"
 
 
 def _exempt_guard_resources(docs: list[dict], operation: str) -> set[str]:
@@ -651,6 +765,18 @@ def test_enforce_pod_security_leaves_the_clusters_own_namespaces_alone(
     labelled = [c for c in calls if "label" in c]
     assert len(labelled) == 1
     assert labelled[0][:4] == ["kubectl", "label", "namespace", "default"]
+
+
+def test_enforce_pod_security_lists_namespaces_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exempt set, the shell-guard scan and the labeller all read the same listing."""
+    calls = _patch_kubectl(monkeypatch, namespaces={"items": [_ns("default")]})
+
+    creds.enforce_pod_security(tmp_path)
+
+    ns_gets = [c for c in calls if "get" in c and c[c.index("get") + 1] == "namespaces"]
+    assert len(ns_gets) == 1
 
 
 def test_enforce_pod_security_pins_every_call_to_the_runs_context(
@@ -858,7 +984,7 @@ def test_provision_enforces_pod_security_by_default(
 def test_provision_honours_the_privileged_opt_out(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The privileged opt-out applies nothing pod-security-related at all."""
+    """The privileged opt-out drops the pod policy and the labels, and nothing else."""
     calls = _patch_kubectl(monkeypatch)
 
     creds.provision_agent_credentials(
@@ -870,6 +996,7 @@ def test_provision_honours_the_privileged_opt_out(
 
     assert not any(_applies(c, "bench-agent-pod-security.yaml") for c in calls)
     assert [c for c in calls if "label" in c] == []
+    assert any(_applies(c, "bench-agent-namespace-guards.yaml") for c in calls)
 
 
 def test_provision_refuses_a_cluster_no_provider_vouched_for(
