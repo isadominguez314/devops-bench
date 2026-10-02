@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from devops_bench.metrics import checklist as cl
 from devops_bench.metrics.base import MetricScore
 
@@ -52,56 +54,70 @@ class _FakeGEval:
         self.name = name
 
 
-def _stub_geval(monkeypatch) -> None:
+def _stub_geval(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cl, "GEval", _FakeGEval)
 
 
-def test_checklist_is_withheld_when_the_judge_evaluates_nothing(monkeypatch) -> None:
-    """Nothing judged means no opinion to publish — not a zero."""
+def _by_name(out: list[MetricScore]) -> dict[str, MetricScore]:
+    return {ms.name: ms for ms in out}
+
+
+def test_checklist_abstains_when_the_judge_evaluates_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing judged means a null aggregate and a null entry per item — not a zero, not silence."""
     _stub_geval(monkeypatch)
 
-    def dead_judge(case, metrics):
+    def dead_judge(case: object, metrics: list[_FakeGEval]) -> list[MetricScore]:
         raise RuntimeError("404 models/gemini-3.1-pro is not found")
 
     monkeypatch.setattr(cl, "run_geval", dead_judge)
 
-    out = list(cl.ChecklistMetric().evaluate(_ctx()))
+    scores = _by_name(list(cl.ChecklistMetric().evaluate(_ctx())))
 
-    assert out == [], "a dead judge must publish no ChecklistScore at all"
+    aggregate = scores["ChecklistScore"]
+    assert aggregate.score is None and aggregate.success is None
+    assert aggregate.reason == "None of 3 checks could be judged."
+    items = [ms for name, ms in scores.items() if name.startswith("Check: ")]
+    assert len(items) == 3
+    assert all(ms.score is None and "404" in (ms.reason or "") for ms in items)
 
 
-def test_checklist_scores_over_what_was_actually_judged(monkeypatch) -> None:
-    """A partial outage shrinks the denominator; it does not fail the items."""
+def test_checklist_scores_over_what_was_actually_judged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A partial outage shrinks the denominator; the skipped item is recorded as null."""
     _stub_geval(monkeypatch)
     calls = {"n": 0}
 
-    def flaky(case, metrics):
+    def flaky(case: object, metrics: list[_FakeGEval]) -> list[MetricScore]:
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("judge blew up on this one")
-        return [MetricScore(name=f"Check: {calls['n']}", score=1.0, success=True)]
+        return [MetricScore(name=metrics[0].name, score=1.0, success=True)]
 
     monkeypatch.setattr(cl, "run_geval", flaky)
 
-    out = list(cl.ChecklistMetric().evaluate(_ctx()))
-    score = next(s for s in out if s.name == "ChecklistScore")
+    scores = _by_name(list(cl.ChecklistMetric().evaluate(_ctx())))
 
-    assert score.score == 1.0, "both judged items passed, so the ratio is over 2 not 3"
-    assert "could not be judged" in (score.reason or "")
+    aggregate = scores["ChecklistScore"]
+    assert aggregate.score == 1.0, "both judged items passed, so the ratio is over 2 not 3"
+    assert aggregate.success is True
+    assert aggregate.reason == "Passed 2 out of 2 evaluated checks (1 could not be judged)."
+    skipped = scores["Check: beta must hold"]
+    assert skipped.score is None and skipped.success is None
+    assert "judge blew up" in (skipped.reason or "")
 
 
-def test_a_fully_judged_checklist_is_unchanged(monkeypatch) -> None:
+def test_a_fully_judged_checklist_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     """The ordinary path keeps its previous meaning."""
     _stub_geval(monkeypatch)
 
-    def judge(case, metrics):
-        return [MetricScore(name="Check: x", score=0.0, success=False)]
+    def judge(case: object, metrics: list[_FakeGEval]) -> list[MetricScore]:
+        return [MetricScore(name=metrics[0].name, score=0.0, success=False)]
 
     monkeypatch.setattr(cl, "run_geval", judge)
 
-    out = list(cl.ChecklistMetric().evaluate(_ctx()))
-    score = next(s for s in out if s.name == "ChecklistScore")
+    scores = _by_name(list(cl.ChecklistMetric().evaluate(_ctx())))
 
-    assert score.score == 0.0
-    assert "could not be judged" not in (score.reason or "")
-    assert "0 out of 3" in (score.reason or "")
+    assert scores["ChecklistScore"].score == 0.0
+    assert scores["ChecklistScore"].reason == "Passed 0 out of 3 evaluated checks."
+    assert all(ms.score == 0.0 for name, ms in scores.items() if name.startswith("Check: "))
