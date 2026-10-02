@@ -125,15 +125,14 @@ _AGENT_USERNAME = f"system:serviceaccount:{AGENT_NAMESPACE}:{AGENT_SA_NAME}"
 # The exempt names as a CEL list literal, for the guard policy's expression.
 _EXEMPT_CEL_LIST = ", ".join(f"'{name}'" for name in sorted(_POLICY_EXEMPT_NAMESPACES))
 
-# Cluster-wide backstop behind the PSA labels (labels miss namespaces created later);
-# ``failurePolicy: Fail`` throughout, because a control that fails open is not a control.
-# ``pods/ephemeralcontainers`` is a distinct subresource: without it ``kubectl debug`` attaches
-# privileged containers unchecked. The namespace guard covers UPDATE too — names are immutable
-# but the agent holds ``patch``, so the addon-manager label would be a one-command escape.
-# The exempt-namespace guard denies agent workload writes and exec into exempt namespaces
-# outright; it matches every pod-producing kind because controllers create pods under their
-# own identity, which is also why username scoping is sound for it and NOT for the pod policy.
-# Two exempt-guard bindings: a namespaceSelector ANDs, so "by name OR by label" takes one each.
+# Levels the namespace guard accepts on a namespace the agent creates: PSA then covers it
+# and the pod policy is the backstop, not the only control.
+_PSA_REQUIRED_LEVELS = ("baseline", "restricted")
+
+# Cluster-wide backstop behind the PSA labels; ``failurePolicy: Fail`` throughout, because a
+# control that fails open is not a control. ``pods/ephemeralcontainers`` is a distinct
+# subresource: without it ``kubectl debug`` attaches privileged containers unchecked.
+# Deliberately NOT username-scoped: controllers create pods under their own identity.
 _POD_SECURITY_POLICY_MANIFEST = f"""\
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -194,7 +193,43 @@ spec:
           values: [{", ".join(sorted(_POLICY_EXEMPT_NAMESPACES))}]
         - key: {_ADDON_MANAGER_LABEL}
           operator: DoesNotExist
----
+"""
+
+
+def _cel_declares_psa(obj: str) -> str:
+    """CEL: ``obj`` carries an accepted ``pod-security.kubernetes.io/enforce`` label."""
+    levels = ", ".join(f"'{level}'" for level in _PSA_REQUIRED_LEVELS)
+    return (
+        f"has({obj}.metadata.labels) && '{_PSA_ENFORCE_LABEL}' in {obj}.metadata.labels && "
+        f"{obj}.metadata.labels['{_PSA_ENFORCE_LABEL}'] in [{levels}]"
+    )
+
+
+# Under baseline the agent must label the namespaces it creates and may not weaken the label
+# later; the UPDATE half leaves namespaces that never carried an accepted level alone.
+_PSA_NAMESPACE_VALIDATIONS = f"""\
+    - expression: "request.operation != 'CREATE' || ({_cel_declares_psa("object")})"
+      message: >-
+        a namespace the sandboxed agent creates must carry
+        {_PSA_ENFORCE_LABEL}={_PSA_REQUIRED_LEVELS[0]} (or
+        {_PSA_REQUIRED_LEVELS[1]}) so Pod Security Admission covers it; add the
+        label to the manifest and retry
+    - expression: >-
+        request.operation != 'UPDATE' ||
+        !({_cel_declares_psa("oldObject")}) ||
+        ({_cel_declares_psa("object")})
+      message: >-
+        the sandboxed agent may not remove or weaken a namespace's
+        {_PSA_ENFORCE_LABEL} label
+"""
+
+
+def _render_namespace_guard(pod_security: str) -> str:
+    """Render the guard on namespace writes; ``privileged`` drops only the PSA-label half."""
+    # UPDATE: names are immutable but the agent holds patch, so the addon-manager label would
+    # be a one-command escape. DELETE: object is null, so every rule reads variables.ns.
+    psa = "" if pod_security == POD_SECURITY_PRIVILEGED else _PSA_NAMESPACE_VALIDATIONS
+    return f"""\
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -205,22 +240,26 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
-        operations: ["CREATE", "UPDATE"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["namespaces"]
   matchConditions:
     - name: only-the-sandboxed-agent
       expression: "request.userInfo.username == '{_AGENT_USERNAME}'"
+  variables:
+    - name: ns
+      expression: "request.operation == 'DELETE' ? oldObject : object"
   validations:
-    - expression: "!(object.metadata.name in [{_EXEMPT_CEL_LIST}])"
+    - expression: "!(variables.ns.metadata.name in [{_EXEMPT_CEL_LIST}])"
       message: >-
         that namespace name is reserved for the cluster's own components and is
         exempt from the benchmark's pod-security policy
     - expression: >-
-        !has(object.metadata.labels) ||
-        !('{_ADDON_MANAGER_LABEL}' in object.metadata.labels)
+        !has(variables.ns.metadata.labels) ||
+        !('{_ADDON_MANAGER_LABEL}' in variables.ns.metadata.labels)
       message: >-
         that label marks a namespace as the cluster's own to manage and is
         exempt from the benchmark's pod-security policy
+{psa}\
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -230,6 +269,14 @@ spec:
   policyName: bench-agent-namespace-guard
   validationActions: ["Deny"]
 ---
+"""
+
+
+# Denies agent workload writes and exec into exempt namespaces outright; matches every
+# pod-producing kind because controllers create pods under their own identity, which is also
+# why username scoping is sound here. Two bindings: a namespaceSelector ANDs, so "by name OR
+# by label" takes one each.
+_EXEMPT_NAMESPACE_GUARD_MANIFEST = f"""\
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -437,14 +484,15 @@ subjects:
 
 def token_ttl_for(agent_timeout_sec: float | None) -> int:
     """Return a token lifetime: timeout plus slack, capped at two hours (cap alone if unbounded)."""
+    # Warnings, not info: past the cap the agent's credential expires while it is still running.
     if agent_timeout_sec is None:
-        _log.info(
+        _log.warning(
             "agent runs without a timeout; capping its cluster token at %ds", _MAX_TOKEN_TTL_SEC
         )
         return _MAX_TOKEN_TTL_SEC
     requested = int(agent_timeout_sec) + TOKEN_TTL_SLACK_SEC
     if requested > _MAX_TOKEN_TTL_SEC:
-        _log.info(
+        _log.warning(
             "capping the agent cluster token lifetime at %ds (%ds requested)",
             _MAX_TOKEN_TTL_SEC,
             requested,
@@ -470,26 +518,44 @@ def ensure_agent_identity(work_dir: Path, context: str | None = None) -> None:
     )
 
 
-def enforce_pod_security(work_dir: Path, context: str | None = None) -> None:
-    """Deny privileged pods, host namespaces, and hostPath mounts cluster-wide.
+def enforce_pod_security(
+    work_dir: Path, context: str | None = None, pod_security: str = POD_SECURITY_BASELINE
+) -> None:
+    """Apply the namespace guards and, unless ``privileged``, the pod policy and PSA labels.
 
-    PSA ``baseline`` labels plus the admission-policy backstop; namespaces already
-    declaring an ``enforce`` level are left alone. Pre-existing non-conformant pods
-    are handled by :func:`_deny_shell_into_nonconformant_pods`.
+    The guards always apply: they govern where the agent may write, not what its pods
+    may do. Namespaces already declaring an ``enforce`` level are left alone. Pre-existing
+    non-conformant pods are handled by :func:`_deny_shell_into_nonconformant_pods`.
 
     Raises:
         SandboxError: Cluster does not serve the policy API; deliberately not gated by the hatch.
-        SubprocessError: Policy apply or pod listing failed; label failures are warned and skipped.
+        SubprocessError: Policy apply or a listing failed; label failures are warned and skipped.
     """
     _require_policy_api(context)
+    # Listed once; the exempt set, the shell-guard scan and the labeller all read it.
+    namespaces = kubectl.get_resource("namespaces", context=context, timeout=60).get("items", [])
+
+    guards = work_dir / "bench-agent-namespace-guards.yaml"
+    guards.write_text(_render_namespace_guard(pod_security) + _EXEMPT_NAMESPACE_GUARD_MANIFEST)
+    kubectl.apply(str(guards), context=context)
+
+    if pod_security == POD_SECURITY_PRIVILEGED:
+        _log.warning(
+            "task declares agent_pod_security: %s, so privileged pods, host namespaces and "
+            "hostPath mounts are NOT denied for this run; the namespace guards still apply",
+            POD_SECURITY_PRIVILEGED,
+        )
+        # Nothing to deny, but a reused cluster must not keep the previous run's list.
+        _apply_shell_guard(work_dir, [], context)
+        return
 
     manifest = work_dir / "bench-agent-pod-security.yaml"
     manifest.write_text(_POD_SECURITY_POLICY_MANIFEST)
     kubectl.apply(str(manifest), context=context)
 
-    _deny_shell_into_nonconformant_pods(work_dir, context)
+    _deny_shell_into_nonconformant_pods(work_dir, _policy_exempt_namespaces(namespaces), context)
 
-    for name in _labellable_namespaces(context):
+    for name in _labellable_namespaces(namespaces):
         try:
             kubectl.label(
                 "namespace",
@@ -521,11 +587,10 @@ def _require_policy_api(context: str | None) -> None:
         ) from exc
 
 
-def _policy_exempt_namespaces(context: str | None) -> set[str]:
-    """Name the exempt namespaces on the cluster, mirroring the guard's two bindings."""
-    listing = kubectl.get_resource("namespaces", context=context, timeout=60)
+def _policy_exempt_namespaces(namespaces: list[dict]) -> set[str]:
+    """Name the exempt namespaces among the listed ones, mirroring the guard's two bindings."""
     exempt = set()
-    for item in listing.get("items", []):
+    for item in namespaces:
         meta = item.get("metadata", {})
         name = meta.get("name", "")
         if name and (
@@ -548,9 +613,8 @@ def _violates_pod_security(spec: dict) -> bool:
     return False
 
 
-def _nonconformant_pods(context: str | None) -> list[str]:
+def _nonconformant_pods(exempt: set[str], context: str | None) -> list[str]:
     """List ``namespace/name`` of pods the policy would deny, outside the exempt namespaces."""
-    exempt = _policy_exempt_namespaces(context)
     listing = kubectl.get_resource("pods", all_namespaces=True, context=context, timeout=60)
     found = []
     for item in listing.get("items", []):
@@ -563,9 +627,11 @@ def _nonconformant_pods(context: str | None) -> list[str]:
     return sorted(found)
 
 
-def _deny_shell_into_nonconformant_pods(work_dir: Path, context: str | None = None) -> None:
+def _deny_shell_into_nonconformant_pods(
+    work_dir: Path, exempt: set[str], context: str | None = None
+) -> None:
     """Deny the agent exec/attach/port-forward into pods that predate the policy."""
-    pods = _nonconformant_pods(context)
+    pods = _nonconformant_pods(exempt, context)
     if pods:
         _log.warning(
             "%d pod(s) predate the pod-security policy and violate it (%s); they were "
@@ -576,22 +642,20 @@ def _deny_shell_into_nonconformant_pods(work_dir: Path, context: str | None = No
         )
     else:
         _log.info("no pre-existing non-conformant pods; the shell guard is inert this run")
+    _apply_shell_guard(work_dir, pods, context)
 
-    # Applied even when empty: a reused cluster must not keep the previous run's list.
+
+def _apply_shell_guard(work_dir: Path, pods: list[str], context: str | None) -> None:
+    """Apply the shell guard even when empty: a reused cluster must not keep the last run's list."""
     manifest = work_dir / "bench-agent-nonconformant-pods.yaml"
     manifest.write_text(_render_nonconformant_pod_guard(pods))
     kubectl.apply(str(manifest), context=context)
 
 
-def _labellable_namespaces(context: str | None) -> list[str]:
-    """List namespaces to label, skipping system, cluster-managed, and already-enforcing ones."""
-    try:
-        listing = kubectl.get_resource("namespaces", context=context, timeout=60)
-    except SubprocessError as exc:
-        _log.warning("could not list namespaces for pod-security labelling: %s", exc)
-        return []
+def _labellable_namespaces(namespaces: list[dict]) -> list[str]:
+    """Pick namespaces to label, skipping system, cluster-managed, and already-enforcing ones."""
     names = []
-    for item in listing.get("items", []):
+    for item in namespaces:
         meta = item.get("metadata", {})
         name = meta.get("name", "")
         if not name or name in _LABEL_EXEMPT_NAMESPACES:
@@ -695,7 +759,7 @@ def provision_agent_credentials(
         plan: The run's network plan, supplying the context pin and any server rewrite.
         dest_dir: Directory (outside the workspace) for the kubeconfig and rendered manifests.
         token_ttl_sec: Requested token lifetime; see :func:`token_ttl_for`.
-        pod_security: ``"privileged"`` skips :func:`enforce_pod_security` entirely.
+        pod_security: ``"privileged"`` skips the pod policy and PSA labels, never the guards.
 
     Returns:
         Path of the written kubeconfig (mode 0600).
@@ -710,30 +774,23 @@ def provision_agent_credentials(
     # One switch for both: an operator who cannot create cluster roles cannot create policies.
     allow_admin = get_bool(ALLOW_ADMIN_ENV, False)
 
-    if pod_security == POD_SECURITY_PRIVILEGED:
+    try:
+        enforce_pod_security(dest_dir, plan.kubectl_context, pod_security)
+    except SubprocessError as exc:
+        # Caught here too, else the first cluster-scoped write makes the hatch unreachable.
+        if not allow_admin:
+            _teardown_after_failed_provisioning(plan.kubectl_context)
+            raise SandboxError(
+                f"could not enforce pod security for the sandboxed agent ({exc}); "
+                "refusing to run against a cluster where the privileged-pod and "
+                f"hostPath escape is not denied — set {ALLOW_ADMIN_ENV}=1 to "
+                "accept that explicitly"
+            ) from exc
         _log.warning(
-            "task declares agent_pod_security: %s, so privileged pods, host namespaces "
-            "and hostPath mounts are NOT denied for this run",
-            POD_SECURITY_PRIVILEGED,
+            "%s is set: continuing without pod-security enforcement (%s)",
+            ALLOW_ADMIN_ENV,
+            exc,
         )
-    else:
-        try:
-            enforce_pod_security(dest_dir, plan.kubectl_context)
-        except SubprocessError as exc:
-            # Caught here too, else the first cluster-scoped write makes the hatch unreachable.
-            if not allow_admin:
-                _teardown_after_failed_provisioning(plan.kubectl_context)
-                raise SandboxError(
-                    f"could not enforce pod security for the sandboxed agent ({exc}); "
-                    "refusing to run against a cluster where the privileged-pod and "
-                    f"hostPath escape is not denied — set {ALLOW_ADMIN_ENV}=1 to "
-                    "accept that explicitly"
-                ) from exc
-            _log.warning(
-                "%s is set: continuing without pod-security enforcement (%s)",
-                ALLOW_ADMIN_ENV,
-                exc,
-            )
 
     try:
         ensure_agent_identity(dest_dir, plan.kubectl_context)

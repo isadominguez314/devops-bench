@@ -329,13 +329,20 @@ Overlapping controls, applied at the same point:
    cluster's own system namespaces exempted. It matches
    `pods/ephemeralcontainers` as well as `pods`, so `kubectl debug` cannot
    attach a privileged container to an already-admitted pod.
-3. **A second policy guarding the exemption list**, denying the agent the
-   creation of a namespace named after one of the exempt namespaces, or the
+3. **A second policy guarding namespaces**, denying the agent the creation or
+   deletion of a namespace named after one of the exempt namespaces, and the
    labelling of any namespace as the cluster's own. The exemptions are by name
    and several do not exist on every provider (`gmp-system` on kind,
    `local-path-storage` on GKE), so without this the agent could simply claim
-   an unused one and deploy there. It covers `UPDATE` as well as `CREATE`,
-   because a name is immutable but a label is not.
+   an unused one and deploy there. It covers `UPDATE` because a name is
+   immutable but a label is not, and `DELETE` because the agent holds `delete`
+   on namespaces and only `default`, `kube-system` and `kube-public` are
+   protected by the apiserver itself. The same policy requires every namespace
+   the agent creates to carry `pod-security.kubernetes.io/enforce=baseline` (or
+   `restricted`) and refuses to let it remove or weaken that label later, so Pod
+   Security Admission covers the agent's own namespaces and policy 2 is the
+   backstop rather than the only control. A bare `kubectl create namespace` is
+   therefore denied with a message naming the label to add.
 4. **A third policy denying the agent workloads inside the exempt namespaces.**
    Guarding the names only protects the ones that do not exist yet. `edit` is
    bound cluster-wide, so the agent can write to `kube-system` on every
@@ -386,12 +393,13 @@ which namespaces are its own to run, so it covers managed namespaces that do
 not exist yet. The names are still needed: nothing carries that label on kind
 or vcluster, and on GKE `kube-system` itself does not.
 
-The first policy exists because labels cannot cover a namespace the agent
-creates *after* provisioning, and at least one task asks it to create one.
-`bench-system` is skipped by the labeller — it holds only a ServiceAccount — but
-is deliberately **not** exempt from the policy, since the agent can create pods
-there. Together these deny the privileged-pod-plus-`hostPath` escape that was
-used to read the benchmark's own answer key off a node's disk.
+Policy 2 still matters after policy 3 puts a PSA label on every namespace the
+agent creates: PSA `baseline` and policy 2 are not identical, a label the
+labeller failed to apply leaves a gap, and `bench-system` is skipped by the
+labeller — it holds only a ServiceAccount — but is deliberately **not** exempt
+from the policy, since the agent can create pods there. Together these deny the
+privileged-pod-plus-`hostPath` escape that was used to read the benchmark's own
+answer key off a node's disk.
 
 **The cluster must be Kubernetes 1.30 or newer.** Four of the five controls are
 `ValidatingAdmissionPolicy` objects, and `admissionregistration.k8s.io/v1` only
@@ -407,7 +415,11 @@ defaults to a digest-pinned `v1.30.0`; lowering it breaks every sandboxed run.
 A task whose subject matter genuinely is privileged workloads opts out with
 `agent_pod_security: privileged` in its `task.yaml` (see
 [Add a task](../how-to/add-a-task.md)). The default is `baseline`, and any other
-value is a load-time validation error rather than a silent fall-back.
+value is a load-time validation error rather than a silent fall-back. The
+opt-out drops exactly two things: policy 2 and the PSA labels (including policy
+3's label requirement). Policies 3 and 4 still apply, because where the agent
+may write is unrelated to what its pods may do, and policy 5 is still applied
+with an empty list so a reused cluster does not keep the previous run's.
 
 **None of this is torn down.** `bench-system`, the ClusterRoleBindings, the
 admission policies and the PSA labels outlive the run. On a disposable cluster that is
