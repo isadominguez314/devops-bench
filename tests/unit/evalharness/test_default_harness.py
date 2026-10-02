@@ -1197,14 +1197,16 @@ def test_prepare_sandbox_spec_refuses_without_a_sandbox_opt_in(
 ) -> None:
     """The caller gates on config.sandbox; the precondition is explicit, not a
     bare TypeError out of dataclasses.replace(None, ...)."""
-    from devops_bench.core import SandboxError
+    from devops_bench.core import ClusterInfo, SandboxError
 
     monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
     harness = DefaultEvalHarness(
         project_id="p", cluster_name="c", results_root=str(tmp_path / "results")
     )
     with pytest.raises(SandboxError, match="without a sandbox opt-in"):
-        harness._prepare_sandbox_spec(tmp_path / "ws", tmp_path / "creds", "c1")  # noqa: SLF001
+        harness._prepare_sandbox_spec(  # noqa: SLF001
+            tmp_path / "ws", tmp_path / "creds", ClusterInfo(name="c1"), None, "baseline"
+        )
 
 
 def test_prepare_sandbox_spec_completes_the_skeletal_spec(
@@ -1271,13 +1273,15 @@ def test_prepare_sandbox_spec_without_a_cluster_skips_the_plan_and_credential(
     """no_infra / noop deployer: no network plan is built (a stale kind
     context matching the configured name must not leak its admin cert) and
     the mounted kubeconfig is a credential-free stub."""
+    from devops_bench.core import ClusterInfo
+
     harness = _sandboxed_harness(monkeypatch, tmp_path)
 
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("must not touch kubectl without a cluster")
 
     monkeypatch.setattr(harness_default.agent_sandbox, "build_network_plan", boom)
-    monkeypatch.setattr(harness_default.agent_sandbox, "build_agent_kubeconfig", boom)
+    monkeypatch.setattr(harness_default.agent_credentials, "provision_agent_credentials", boom)
     monkeypatch.setattr(
         harness_default.agent_sandbox, "discover_fixture_mounts", lambda cluster: {}
     )
@@ -1287,7 +1291,7 @@ def test_prepare_sandbox_spec_without_a_cluster_skips_the_plan_and_credential(
     creds = tmp_path / "creds-n"
     creds.mkdir()
     spec = harness._prepare_sandbox_spec(  # noqa: SLF001
-        workspace, creds, "c1", with_cluster=False
+        workspace, creds, ClusterInfo(name="c1"), None, "baseline", with_cluster=False
     )
 
     assert spec.network == harness_default.agent_sandbox.NetworkPlan()
