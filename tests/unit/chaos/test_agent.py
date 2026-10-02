@@ -96,8 +96,18 @@ def test_agent_warns_when_chaos_model_falls_back_to_agent_model(
     with caplog.at_level(logging.WARNING):
         ChaosAgent(system_instruction="s", tool=_TOOL, tool_handler=handler)
 
-    assert "CHAOS_MODEL unset" in caplog.text
+    assert "CHAOS_MODEL unset; the chaos driver resolved to" in caplog.text
     assert get_model.call_args.kwargs["model_name"] == "arm-model"
+
+
+def test_agent_identity_reads_the_built_client() -> None:
+    client = _ScriptedClient([])
+    client.provider, client.model_name = "google", "gemini-3.1-pro-preview"
+    handler, _ = _handler_returning("unused")
+
+    agent = ChaosAgent(system_instruction="s", tool=_TOOL, tool_handler=handler, client=client)
+
+    assert agent.identity == {"provider": "google", "model": "gemini-3.1-pro-preview"}
 
 
 def test_agent_is_quiet_when_chaos_model_is_pinned(

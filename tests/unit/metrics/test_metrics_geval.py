@@ -27,9 +27,10 @@ from devops_bench.metrics import geval
 from devops_bench.metrics.geval import ModelLayerJudge, describe_judge
 
 
-def _fake_client(text="judged", model_name="judge-model"):
+def _fake_client(text="judged", model_name="judge-model", provider=None):
     client = MagicMock()
     client.model_name = model_name
+    client.provider = provider  # get_model stamps this on a real client
     client.generate_content = AsyncMock(return_value="raw-response")
     client.get_text_content = MagicMock(return_value=text)
     return client
@@ -49,18 +50,58 @@ def test_wraps_supplied_client_without_get_model(mocker):
 def test_warns_and_records_provider_when_judge_model_unset(
     mocker: MockerFixture, caplog: pytest.LogCaptureFixture
 ) -> None:
-    mocker.patch.object(geval, "get_model", return_value=_fake_client(model_name="arm-model"))
-    mocker.patch.dict(os.environ, {"AGENT_PROVIDER": "anthropic"}, clear=True)
+    built = _fake_client(model_name="arm-model", provider="anthropic")
+    mocker.patch.object(geval, "get_model", return_value=built)
+    mocker.patch.dict(
+        os.environ, {"AGENT_PROVIDER": "anthropic", "AGENT_MODEL": "arm-model"}, clear=True
+    )
 
     with caplog.at_level(logging.WARNING):
         judge = ModelLayerJudge()
 
-    assert "JUDGE_MODEL unset" in caplog.text
+    assert "JUDGE_MODEL unset; the judge resolved to anthropic/arm-model" in caplog.text
+    assert "(agent: anthropic/arm-model)" in caplog.text
     assert describe_judge(judge) == {"provider": "anthropic", "model": "arm-model"}
 
 
+def test_warning_names_a_cross_provider_fallback(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    """JUDGE_PROVIDER set, JUDGE_MODEL unset: the other provider gets the agent's model id."""
+    built = _fake_client(model_name="gemini-x", provider="ollama")
+    mocker.patch.object(geval, "get_model", return_value=built)
+    mocker.patch.dict(
+        os.environ,
+        {"JUDGE_PROVIDER": "ollama", "AGENT_PROVIDER": "google", "AGENT_MODEL": "gemini-x"},
+        clear=True,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        ModelLayerJudge()
+
+    assert "the judge resolved to ollama/gemini-x (agent: google/gemini-x)" in caplog.text
+
+
+def test_supplied_client_provider_alias_is_canonicalized(mocker: MockerFixture) -> None:
+    get_model = mocker.patch.object(geval, "get_model")
+
+    judge = ModelLayerJudge(client=_fake_client(), provider="gemini")
+
+    get_model.assert_not_called()
+    assert judge.provider == "google"
+    assert describe_judge(judge)["provider"] == "google"
+
+
+def test_describe_judge_never_reports_the_placeholder_name() -> None:
+    judge = ModelLayerJudge(client=_fake_client(model_name=None))
+
+    assert judge.get_model_name() == "judge"
+    assert describe_judge(judge) == {"provider": None, "model": None}
+
+
 def test_describe_judge_uses_judge_env_when_set(mocker: MockerFixture) -> None:
-    mocker.patch.object(geval, "get_model", return_value=_fake_client())
+    built = _fake_client(model_name="judge-x", provider="google")
+    mocker.patch.object(geval, "get_model", return_value=built)
     mocker.patch.dict(
         os.environ,
         {"AGENT_PROVIDER": "anthropic", "JUDGE_PROVIDER": "gemini", "JUDGE_MODEL": "judge-x"},
