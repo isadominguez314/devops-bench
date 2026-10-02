@@ -486,10 +486,24 @@ def test_pod_security_policy_also_matches_the_ephemeral_container_subresource(
     """A rule naming only ``pods`` never sees ``kubectl debug --profile=sysadmin``."""
     docs = _policy_docs(tmp_path, monkeypatch)
     policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
-    resources = policy["spec"]["matchConstraints"]["resourceRules"][0]["resources"]
+    rules = policy["spec"]["matchConstraints"]["resourceRules"]
+    ephemeral = next(r for r in rules if "pods/ephemeralcontainers" in r["resources"])
 
-    assert "pods" in resources
-    assert "pods/ephemeralcontainers" in resources
+    assert any("pods" in r["resources"] for r in rules)
+    # Ephemeral containers are added with an UPDATE on the subresource, never a CREATE.
+    assert "UPDATE" in ephemeral["operations"]
+
+
+def test_pod_security_policy_does_not_reevaluate_pod_updates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A pod's security-relevant spec is immutable; matching UPDATE would only deny a label on a fixture pod."""
+    docs = _policy_docs(tmp_path, monkeypatch)
+    policy = _doc(docs, "ValidatingAdmissionPolicy", "bench-agent-pod-security")
+    rules = policy["spec"]["matchConstraints"]["resourceRules"]
+    pods = next(r for r in rules if r["resources"] == ["pods"])
+
+    assert pods["operations"] == ["CREATE"]
 
 
 def test_pod_security_policy_is_not_scoped_to_the_agents_username(
@@ -715,7 +729,13 @@ def test_exempt_namespace_guard_covers_exec_into_the_clusters_own_pods(
     """A shell in a privileged system pod is the same escape; exec arrives as CONNECT, not CREATE."""
     matched = _exempt_guard_resources(_policy_docs(tmp_path, monkeypatch), "CONNECT")
 
-    assert {"/pods/exec", "/pods/attach", "/pods/portforward"} <= matched
+    assert {
+        "/pods/exec",
+        "/pods/attach",
+        "/pods/portforward",
+        "/pods/proxy",
+        "/services/proxy",
+    } <= matched
 
 
 def test_exempt_namespace_guard_selects_exactly_what_the_pod_policy_skips(
@@ -750,6 +770,19 @@ def test_enforce_pod_security_labels_ordinary_namespaces(
     assert len(labelled) == 1
     assert labelled[0][:4] == ["kubectl", "label", "namespace", "default"]
     assert "pod-security.kubernetes.io/enforce=baseline" in labelled[0]
+
+
+def test_enforce_pod_security_labels_the_harness_namespace_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The agent can create pods in ``bench-system``; PSA baseline is wider than the policy's CEL."""
+    calls = _patch_kubectl(monkeypatch, namespaces={"items": [_ns(creds.AGENT_NAMESPACE)]})
+
+    creds.enforce_pod_security(tmp_path)
+
+    labelled = [c for c in calls if "label" in c]
+    assert len(labelled) == 1
+    assert labelled[0][:4] == ["kubectl", "label", "namespace", creds.AGENT_NAMESPACE]
 
 
 def test_enforce_pod_security_leaves_a_declared_level_alone(
@@ -830,6 +863,28 @@ def test_enforce_pod_security_refuses_a_cluster_too_old_for_the_policy(
     assert not any("apply" in c for c in calls)
 
 
+def test_a_forbidden_policy_api_read_is_not_reported_as_a_version_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On GKE the policy API is gated by IAM; 'upgrade the cluster' would send the operator the wrong way."""
+    monkeypatch.delenv(creds.ALLOW_ADMIN_ENV, raising=False)
+    _patch_kubectl(monkeypatch)
+    real = kubectl.run
+
+    def forbid_the_policy_read(argv, **kwargs):
+        if "get" in argv and argv[argv.index("get") + 1] == creds._POLICY_API_RESOURCE:
+            raise SubprocessError(argv, 1, stderr="Error from server (Forbidden): forbidden")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", forbid_the_policy_read)
+
+    with pytest.raises(SubprocessError):
+        creds.enforce_pod_security(tmp_path)
+    with pytest.raises(SandboxError, match="pod security") as info:
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+    assert creds._MIN_CLUSTER_VERSION not in str(info.value)
+
+
 def test_the_version_refusal_is_not_the_admin_escape_hatch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -900,7 +955,7 @@ def test_the_shell_guard_covers_every_way_into_a_running_container(
     rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
 
     assert rule["operations"] == ["CONNECT"]
-    assert set(rule["resources"]) == {"pods/exec", "pods/attach", "pods/portforward"}
+    assert set(rule["resources"]) == {"pods/exec", "pods/attach", "pods/portforward", "pods/proxy"}
     assert _doc(docs, "ValidatingAdmissionPolicyBinding", creds._NONCONFORMANT_GUARD_NAME)["spec"][
         "validationActions"
     ] == ["Deny"]
