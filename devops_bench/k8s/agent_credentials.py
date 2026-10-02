@@ -91,8 +91,9 @@ _POLICY_EXEMPT_NAMESPACES = frozenset(
 # because on kind/vcluster nothing carries this label, and on GKE kube-system does not.
 _ADDON_MANAGER_LABEL = "addonmanager.kubernetes.io/mode"
 
-# Namespaces the PSA labeller skips: the policy-exempt set plus the harness's own.
-_LABEL_EXEMPT_NAMESPACES = _POLICY_EXEMPT_NAMESPACES | {AGENT_NAMESPACE}
+# Namespaces the PSA labeller skips; the harness's own is labelled like any other, since the
+# agent can create pods in it and PSA baseline is wider than the policy's CEL.
+_LABEL_EXEMPT_NAMESPACES = _POLICY_EXEMPT_NAMESPACES
 
 _PSA_ENFORCE_LABEL = "pod-security.kubernetes.io/enforce"
 
@@ -110,6 +111,8 @@ _PSA_REQUIRED_LEVELS = ("baseline", "restricted")
 # control that fails open is not a control. ``pods/ephemeralcontainers`` is a distinct
 # subresource: without it ``kubectl debug`` attaches privileged containers unchecked.
 # Deliberately NOT username-scoped: controllers create pods under their own identity.
+# Pod UPDATE is not matched (as in PSA): the security-relevant spec is immutable, and
+# re-evaluating it would deny metadata-only writes to the pre-existing pods the shell guard covers.
 _POD_SECURITY_POLICY_MANIFEST = f"""\
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -121,8 +124,12 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["pods", "pods/ephemeralcontainers"]
+        resources: ["pods/ephemeralcontainers"]
   validations:
     - expression: "!has(object.spec.hostNetwork) || !object.spec.hostNetwork"
       message: "hostNetwork is not allowed for benchmark workloads"
@@ -281,7 +288,12 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CONNECT"]
-        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+        resources:
+          - pods/exec
+          - pods/attach
+          - pods/portforward
+          - pods/proxy
+          - services/proxy
   matchConditions:
     - name: only-the-sandboxed-agent
       expression: "request.userInfo.username == '{_AGENT_USERNAME}'"
@@ -344,7 +356,7 @@ spec:
       - apiGroups: [""]
         apiVersions: ["v1"]
         operations: ["CONNECT"]
-        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+        resources: ["pods/exec", "pods/attach", "pods/portforward", "pods/proxy"]
   matchConditions:
     - name: only-the-sandboxed-agent
       expression: "request.userInfo.username == '{_AGENT_USERNAME}'"
@@ -525,11 +537,26 @@ def enforce_pod_security(
     _log.info("pod security enforced: baseline labels plus the cluster-wide admission policy")
 
 
+# What kubectl says when the apiserver serves no such resource; anything else is not a version floor.
+_MISSING_RESOURCE_MARKERS = (
+    "doesn't have a resource type",
+    "could not find the requested resource",
+)
+
+
 def _require_policy_api(context: str | None) -> None:
-    """Refuse a cluster too old to serve the pod-security backstop at ``v1``."""
+    """Refuse a cluster too old to serve the pod-security backstop at ``v1``.
+
+    Raises:
+        SandboxError: The apiserver serves no such resource (the version floor).
+        SubprocessError: Any other failure (RBAC, timeout, unreachable), passed through so the
+            caller reports it as an enforcement failure rather than a version problem.
+    """
     try:
         kubectl.get_resource(_POLICY_API_RESOURCE, context=context, timeout=60)
     except SubprocessError as exc:
+        if not any(marker in (exc.stderr or "") for marker in _MISSING_RESOURCE_MARKERS):
+            raise
         raise SandboxError(
             f"this cluster does not serve {_POLICY_API_RESOURCE} ({exc}); the sandbox's "
             "pod-security backstop is a ValidatingAdmissionPolicy, which reached GA in "

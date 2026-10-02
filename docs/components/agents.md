@@ -328,7 +328,11 @@ Overlapping controls, applied at the same point:
    `hostPath` volumes — cluster-wide, in `Deny` mode, failing closed, with the
    cluster's own system namespaces exempted. It matches
    `pods/ephemeralcontainers` as well as `pods`, so `kubectl debug` cannot
-   attach a privileged container to an already-admitted pod.
+   attach a privileged container to an already-admitted pod. It evaluates
+   `CREATE` on pods and `UPDATE` only on that subresource, as Pod Security
+   Admission does: a pod's security-relevant spec is immutable, and matching
+   every update would deny a plain `kubectl label` on the fixture pods policy 5
+   exists for.
 3. **A second policy guarding namespaces**, denying the agent the creation or
    deletion of a namespace named after one of the exempt namespaces, and the
    labelling of any namespace as the cluster's own. The exemptions are by name
@@ -351,10 +355,12 @@ Overlapping controls, applied at the same point:
    carrying the full set. A boundary probe caught this; it is not hypothetical.
    The policy matches every kind that can produce a pod, not `pods` alone, since
    a `Deployment` reaches the same place with its pod created by the ReplicaSet
-   controller. It matches `pods/exec`, `pods/attach` and `pods/portforward` too,
-   because `edit` grants exec and these are precisely the namespaces whose pods
-   are legitimately privileged. It does not touch config: a ConfigMap in
-   `kube-system` is a blast-radius question rather than an escape.
+   controller. It matches `pods/exec`, `pods/attach`, `pods/portforward`,
+   `pods/proxy` and `services/proxy` too, because `edit` grants all five and
+   these are precisely the namespaces whose pods are legitimately privileged;
+   the proxy subresources are an HTTP path into the same pods, arriving as the
+   same `CONNECT`. It does not touch config: a ConfigMap in `kube-system` is a
+   blast-radius question rather than an escape.
 5. **A fourth policy denying the agent a shell into pods that predate all of
    the above.** Admission only sees requests, so nothing here retracts a pod
    that already exists — and the deployer runs *before* credentials are
@@ -364,11 +370,13 @@ Overlapping controls, applied at the same point:
    root by a route policy 2 never sees. Before the agent starts, the harness
    scans every namespace for pods policy 2 would have rejected — skipping the
    ones policy 4 already covers — and renders their `namespace/name` into a
-   policy denying the agent `exec`, `attach` and `port-forward` into exactly
-   those. They are named individually rather than matched on a property because
-   admission cannot see the target pod's spec on a `CONNECT`: the object on an
-   exec request is a `PodExecOptions`, so a name list is the only thing there is
-   to test. The list stays correct for the run — policy 2 denies these pods on
+   policy denying the agent `exec`, `attach`, `port-forward` and `pods/proxy`
+   into exactly those. They are named individually rather than matched on a
+   property because admission cannot see the target pod's spec on a `CONNECT`:
+   the object on an exec request is a `PodExecOptions`, so a name list is the
+   only thing there is to test. For the same reason `services/proxy` is not
+   covered here: that request carries the Service's name, not the pod's, so a
+   Service fronting one of these pods remains reachable over HTTP. The list stays correct for the run — policy 2 denies these pods on
    `CREATE`, so a name that leaves it cannot come back. It is applied even when
    the list is empty, since nothing here is torn down and a reused cluster would
    otherwise keep the previous run's list.
@@ -394,22 +402,25 @@ not exist yet. The names are still needed: nothing carries that label on kind
 or vcluster, and on GKE `kube-system` itself does not.
 
 Policy 2 still matters after policy 3 puts a PSA label on every namespace the
-agent creates: PSA `baseline` and policy 2 are not identical, a label the
-labeller failed to apply leaves a gap, and `bench-system` is skipped by the
-labeller — it holds only a ServiceAccount — but is deliberately **not** exempt
-from the policy, since the agent can create pods there. Together these deny the
-privileged-pod-plus-`hostPath` escape that was used to read the benchmark's own
-answer key off a node's disk.
+agent creates: PSA `baseline` and policy 2 are not identical, and a label the
+labeller failed to apply leaves a gap. `bench-system` is labelled like any other
+namespace and is deliberately **not** exempt from the policy, since the agent
+can create pods there. Together these deny the privileged-pod-plus-`hostPath`
+escape that was used to read the benchmark's own answer key off a node's disk.
 
 **The cluster must be Kubernetes 1.30 or newer.** Four of the five controls are
 `ValidatingAdmissionPolicy` objects, and `admissionregistration.k8s.io/v1` only
 reached GA in 1.30 — 1.29 serves `v1beta1`, behind a feature gate. The harness
 checks for the `v1` resource before it applies anything and refuses by name if
 it is missing, rather than letting the apply fail with kubectl's `no matches for
-kind`, which reads like a typo in our own manifest. This is deliberately *not*
-routed through `BENCH_SANDBOX_ALLOW_ADMIN_CREDS`: that hatch is for an operator
-whose credential cannot write cluster-scoped objects, and no credential makes a
-1.29 apiserver serve a v1 policy. For kind, the floor is why `node_image`
+kind`, which reads like a typo in our own manifest. The check reads kubectl's
+error: only "the server doesn't have a resource type" is the version floor. A
+`Forbidden` (the GKE IAM case above), a timeout or an unreachable apiserver is
+passed through as an enforcement failure, so the operator is told what actually
+happened. The version floor itself is deliberately *not* routed through
+`BENCH_SANDBOX_ALLOW_ADMIN_CREDS`: that hatch is for an operator whose
+credential cannot write cluster-scoped objects, and no credential makes a 1.29
+apiserver serve a v1 policy. For kind, the floor is why `node_image`
 defaults to a digest-pinned `v1.30.0`; lowering it breaks every sandboxed run.
 
 A task whose subject matter genuinely is privileged workloads opts out with
