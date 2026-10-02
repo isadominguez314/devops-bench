@@ -21,13 +21,12 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from devops_bench.core import first_env, get_env, get_logger
-from devops_bench.core.errors import ConfigError
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core import get_env, get_logger
+from devops_bench.core.model_identity import driver_identity
 from devops_bench.models import LLMClient, describe_client, get_model
 from devops_bench.models.utils.loop import LoopResult, run_tool_loop
 
-__all__ = ["ChaosAgent", "ToolHandler", "driver_identity"]
+__all__ = ["ChaosAgent", "ToolHandler"]
 
 _log = get_logger("chaos.agent")
 
@@ -38,16 +37,6 @@ _MAX_TURNS = 8
 #: Concrete faults implement this and pass it to :class:`ChaosAgent` — see
 #: :func:`devops_bench.chaos.faults.generate_load.run_chaos_command`.
 ToolHandler = Callable[[str, threading.Event | None], str]
-
-
-def driver_identity() -> dict[str, str | None]:
-    """Return the ``{"provider", "model"}`` the environment configures for the chaos driver."""
-    raw = first_env("CHAOS_PROVIDER", "AGENT_PROVIDER")
-    try:
-        provider: str | None = resolve_provider(raw).canonical
-    except ConfigError:  # an unknown alias is reported as written; get_model raises on it later
-        provider = raw
-    return {"provider": provider, "model": first_env("CHAOS_MODEL", "AGENT_MODEL")}
 
 
 class ChaosAgent:
@@ -64,7 +53,7 @@ class ChaosAgent:
             set when a disruption is observably active (e.g. load is flowing);
             forwarded unchanged.
         client: Optional pre-built LLM client. When omitted one is built from
-            :func:`driver_identity`.
+            :func:`~devops_bench.core.model_identity.driver_identity`.
         max_turns: Override for the safety turn cap.
     """
 
