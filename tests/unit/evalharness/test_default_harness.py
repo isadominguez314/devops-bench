@@ -760,23 +760,28 @@ def _stub_agent_result() -> AgentResult:
 def test_records_carry_judge_and_chaos_driver_identity(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The seed stamps the chaos driver from env; ``_score`` stamps the judge it used."""
-    monkeypatch.setenv("CHAOS_PROVIDER", "gemini")
-    monkeypatch.setenv("CHAOS_MODEL", "chaos-x")
+    """``chaos_driver`` comes from the chaos report; ``_score`` stamps the judge it used."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
     record = harness._build_success_record(  # noqa: SLF001
         task=_stub_task(),
         prompt="p",
         expected_output="e",
         agent_res=_stub_agent_result(),
-        chaos_report={},
+        chaos_report={"status": "success", "driver": {"provider": "google", "model": "chaos-x"}},
         perf_report={},
     )
     assert record["chaos_driver"] == {"provider": "google", "model": "chaos-x"}
     assert record["judge"] == {}
-    # No chaos_spec, no driver.
-    plain = harness._empty_record(Task.from_dict({"task_id": "t", "name": "n", "prompt": "p"}))  # noqa: SLF001
-    assert plain["chaos_driver"] == {}
+    # A fault that never built its driver leaves the field empty, chaos_spec or not.
+    undriven = harness._build_success_record(  # noqa: SLF001
+        task=_stub_task(),
+        prompt="p",
+        expected_output="e",
+        agent_res=_stub_agent_result(),
+        chaos_report={"status": "failed", "error": "port-forward failed"},
+        perf_report={},
+    )
+    assert undriven["chaos_driver"] == {}
 
     judge = SimpleNamespace(provider="anthropic", client=SimpleNamespace(model_name="judge-x"))
     failed = {"status": "failed"}
@@ -788,6 +793,30 @@ def test_records_carry_judge_and_chaos_driver_identity(
     assert record["judge"] == {"provider": "anthropic", "model": "judge-x"}
     assert "judge" not in failed
     batch.assert_called_once()
+
+
+def test_harness_warns_at_init_with_the_configured_judge(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("AGENT_PROVIDER", "gemini")
+    monkeypatch.setenv("AGENT_MODEL", "arm-model")
+    monkeypatch.delenv("JUDGE_MODEL", raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    assert "JUDGE_MODEL unset; the judge is configured as google/arm-model" in caplog.text
+
+
+def test_harness_is_quiet_at_init_when_the_judge_is_pinned_or_injected(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        DefaultEvalHarness(project_id="p", cluster_name="c", judge_model=object())
+        monkeypatch.setenv("JUDGE_MODEL", "judge-x")
+        DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    assert "JUDGE_MODEL unset" not in caplog.text
 
 
 def test_judge_identity_is_empty_when_the_judge_cannot_be_built(isolated_env: None) -> None:
