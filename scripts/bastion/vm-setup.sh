@@ -94,8 +94,9 @@ fi
 # breaks all container DNS (kind hides this — its embedded DNS at 127.0.0.11
 # forwards from the host namespace, where DOCKER-USER does not apply). The
 # token endpoints are HTTP on port 80, so they stay rejected, and a DNS
-# answer cannot carry a credential. -I inserts at the head of the chain, so
-# the ACCEPT rules go in *after* the REJECT to end up above it.
+# answer cannot carry a credential. Order matters (the ACCEPTs must sit above
+# the REJECT) and must not depend on what an earlier run or a debugging session
+# left behind, so all three are removed and re-inserted at the head every run.
 #
 # iptables rules do not survive a reboot and DOCKER-USER is created by
 # dockerd: re-run this script after a reboot. See docs/components/infra.md.
@@ -105,18 +106,21 @@ if ! command -v iptables >/dev/null 2>&1; then
 elif ! sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
   echo "    WARN: no DOCKER-USER chain yet (is dockerd running?); re-run after Docker starts."
 else
-  if sudo iptables -C DOCKER-USER -d 169.254.169.254 -j REJECT >/dev/null 2>&1; then
-    echo "    already blocked."
-  else
-    sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT \
-      && echo "    containers can no longer reach 169.254.169.254." \
-      || echo "    WARN: could not install the rule; containers can still reach the metadata server."
-  fi
-  for proto in udp tcp; do
-    sudo iptables -C DOCKER-USER -d 169.254.169.254 -p "$proto" --dport 53 -j ACCEPT >/dev/null 2>&1 \
-      || sudo iptables -I DOCKER-USER -d 169.254.169.254 -p "$proto" --dport 53 -j ACCEPT \
-      || echo "    WARN: could not permit $proto/53; container DNS will fail on this host."
+  reject="-d 169.254.169.254 -j REJECT"
+  accept_udp="-d 169.254.169.254 -p udp --dport 53 -j ACCEPT"
+  accept_tcp="-d 169.254.169.254 -p tcp --dport 53 -j ACCEPT"
+  # shellcheck disable=SC2086  # the rule specs are deliberately word-split
+  for rule in "$accept_tcp" "$accept_udp" "$reject"; do
+    while sudo iptables -C DOCKER-USER $rule >/dev/null 2>&1; do sudo iptables -D DOCKER-USER $rule; done
   done
+  # Inserted at position 1 in reverse order, so the chain reads ACCEPT tcp, ACCEPT udp, REJECT.
+  if sudo iptables -I DOCKER-USER 1 $reject \
+      && sudo iptables -I DOCKER-USER 1 $accept_udp \
+      && sudo iptables -I DOCKER-USER 1 $accept_tcp; then
+    echo "    containers can no longer reach 169.254.169.254."
+  else
+    echo "    WARN: could not install the rules; containers may still reach the metadata server."
+  fi
   echo "    DNS to 169.254.169.254 still permitted (port 53 only)."
 fi
 
