@@ -140,10 +140,8 @@ class ChecklistMetric:
                 unjudged += 1
                 _log.error("Error evaluating metric %s: %s", m.name, e)
 
-        # A check the judge could not evaluate is not a check the agent failed,
-        # so unjudged items leave the denominator. When nothing could be judged
-        # there is no opinion to publish at all: abstain, so the composite
-        # withholds instead of reporting a zero as if it had been measured.
+        # A check the judge could not evaluate is not a failure. Unjudged items
+        # leave the denominator. When nothing is judged, nothing is published.
         judged = total - unjudged
         if total > 0 and judged == 0:
             _log.error(
