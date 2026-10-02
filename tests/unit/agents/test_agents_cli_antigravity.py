@@ -432,6 +432,8 @@ class TestDefaultEffort:
         ("google/gemini-3.1-pro-preview-low", "--model=gemini-3.1-pro", "--effort=low"),
         # Display name carries its own tier; a second --effort is rejected.
         ("Gemini 3.1 Pro (Low)", "--model=Gemini 3.1 Pro (Low)", None),
+        # No model configured: neither flag is passed, Antigravity picks its own.
+        (None, None, None),
     ],
 )
 @mock.patch.object(agy_mod, "_log")
@@ -443,8 +445,8 @@ def test_agy_cli_agent_execute_flow(
     mock_log,
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
-    model: str,
-    want_model_flag: str,
+    model: str | None,
+    want_model_flag: str | None,
     want_effort_flag: str | None,
 ) -> None:
     monkeypatch.delenv(agy_mod._EFFORT_ENV, raising=False)
@@ -497,7 +499,8 @@ def test_agy_cli_agent_execute_flow(
     assert "--dangerously-skip-permissions" in args
     assert "--prompt=run task" in args
     assert any(a.startswith("--gemini_dir=") for a in args)
-    assert want_model_flag in args
+    model_flags = [a for a in args if a.startswith("--model")]
+    assert model_flags == ([want_model_flag] if want_model_flag else [])
     effort_flags = [a for a in args if a.startswith("--effort")]
     assert effort_flags == ([want_effort_flag] if want_effort_flag else [])
 

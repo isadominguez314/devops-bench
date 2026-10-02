@@ -79,20 +79,17 @@ def _read_db_tokens(db_path: pathlib.Path) -> dict | None:
     return None
 
 
-# agy names the reasoning tier separately from the model: every selection in its
-# catalogue is a base model plus one of these, and there is no untiered form --
-# a bare slug is refused with "requires --effort". This is the union across
-# models, not a per-model list: in agy 1.2.0 the Flash models take all three but
-# Gemini 3.1 Pro only low and high. A per-model table would go stale with every
-# agy release, so a tier the chosen model lacks is left for agy to reject.
+# Antigravity names the reasoning tier separately from the model and has no
+# untiered form. This is the union across models, not a per-model list: a tier
+# the chosen model lacks is left for the CLI to reject at startup.
 _AGY_EFFORT_TIERS: tuple[str, ...] = ("low", "medium", "high")
 
-# Vertex publishes preview model ids with this suffix. agy's catalogue does not
-# carry it and rejects the suffixed id outright, with or without --effort.
+# Vertex publishes preview model ids with this suffix. Antigravity's catalogue
+# does not carry it and rejects the suffixed id outright, with or without --effort.
 _VERTEX_PREVIEW_SUFFIX: str = "-preview"
 
 # A display-name selection ("Gemini 3.1 Pro (Low)") already names its tier, and
-# agy errors if --effort is passed alongside one. Recognize it so it survives
+# the CLI errors if --effort is passed alongside one. Recognize it so it survives
 # untouched: it is the spelling ``agy --help`` steers operators towards.
 _DISPLAY_TIER_RE: re.Pattern[str] = re.compile(
     rf"\((?:{'|'.join(map(re.escape, _AGY_EFFORT_TIERS))})\)\s*$", re.IGNORECASE
@@ -101,7 +98,7 @@ _DISPLAY_TIER_RE: re.Pattern[str] = re.compile(
 # The tier is a scoring variable, not a formatting detail -- `low` and `high`
 # are materially different agents. `high` is the least surprising default
 # because the other harnesses run their model with no reasoning throttle, so
-# anything lower would hand the agy arm a handicap that reads as a capability
+# anything lower would hand the Antigravity arm a handicap that reads as a capability
 # gap in the results rather than as the configuration choice it is.
 _DEFAULT_AGY_EFFORT: str = "high"
 _EFFORT_ENV: str = "AGENT_MODEL_EFFORT"
@@ -114,19 +111,19 @@ def _default_effort() -> str:
         The tier from ``AGENT_MODEL_EFFORT``, or ``high``.
 
     Raises:
-        core.ConfigError: If ``AGENT_MODEL_EFFORT`` names a tier no agy model
-            offers. Rejected here rather than passed through, so a typo fails
-            on the misconfiguration itself instead of surfacing as agy's own
-            startup error. A real tier the chosen model lacks (``medium`` on
-            Gemini 3.1 Pro) is not caught here; agy rejects it at startup,
-            before the agent takes any action.
+        core.ConfigError: If ``AGENT_MODEL_EFFORT`` names a tier no Antigravity
+            model offers. Rejected here rather than passed through, so a typo
+            fails on the misconfiguration itself instead of surfacing as the
+            CLI's own startup error. A real tier the chosen model lacks
+            (``medium`` on Gemini 3.1 Pro) is not caught here; Antigravity
+            rejects it at startup, before the agent takes any action.
     """
     effort = os.environ.get(_EFFORT_ENV, "").strip()
     if not effort:
         return _DEFAULT_AGY_EFFORT
     if effort.lower() not in _AGY_EFFORT_TIERS:
         raise core.ConfigError(
-            f"{_EFFORT_ENV}={effort!r} is not a reasoning tier agy accepts "
+            f"{_EFFORT_ENV}={effort!r} is not a reasoning tier Antigravity accepts "
             f"(known: {', '.join(_AGY_EFFORT_TIERS)})"
         )
     return effort.lower()
@@ -136,11 +133,11 @@ def _resolve_model_name(model: str) -> tuple[str, str | None]:
     """Resolve a matrix model id to the ``(model, effort)`` pair ``agy`` expects.
 
     ``AGENT_MODEL`` is one value shared by every arm and by the judge, and it is
-    spelled for Vertex -- ``google/gemini-3.1-pro-preview``. agy accepts neither
-    the provider prefix nor the ``-preview`` suffix, and refuses any selection
-    that does not name a reasoning tier exactly once. Normalizing here confines
-    the quirk to the one harness that has it; respelling ``AGENT_MODEL`` instead
-    would desynchronize the agy arm's label from every other arm in the matrix.
+    spelled for Vertex -- ``google/gemini-3.1-pro-preview``. Antigravity accepts
+    neither the provider prefix nor the ``-preview`` suffix, and refuses any
+    selection that does not name a reasoning tier exactly once. Normalizing here
+    confines the quirk to the one harness that has it; respelling ``AGENT_MODEL``
+    instead would desynchronize this arm's label from every other arm in the matrix.
 
     e.g. ``"google/gemini-3.1-pro-preview"`` -> ``("gemini-3.1-pro", "high")``,
     and ``"gemini-3.1-pro-preview-low"`` -> ``("gemini-3.1-pro", "low")``.
@@ -151,13 +148,13 @@ def _resolve_model_name(model: str) -> tuple[str, str | None]:
     Returns:
         The id to pass as ``--model``, and the tier to pass as ``--effort`` --
         or ``None`` for the tier when the id already names its own, in which
-        case ``--effort`` must be omitted or agy rejects the pair.
+        case ``--effort`` must be omitted or the CLI rejects the pair.
     """
     name = model.split("/")[-1].strip()
     if _DISPLAY_TIER_RE.search(name):
         return name, None
     # The tier comes off first: a tier suffix would otherwise hide -preview
-    # from the check below, and agy rejects any id that still carries it.
+    # from the check below, and Antigravity rejects any id that still carries it.
     effort: str | None = None
     for tier in _AGY_EFFORT_TIERS:
         if name.lower().endswith(f"-{tier}"):
@@ -225,10 +222,9 @@ def _build_env(config: agents_config.AgentConfig) -> dict[str, str]:
         overlay["GEMINI_API_KEY"] = config.api_key
         overlay["GOOGLE_API_KEY"] = config.api_key
 
-    # No GEMINI_MODEL here. It is a Gemini CLI variable; agy ignores it
-    # entirely -- verified against 1.2.0, where a garbage value raises no error
-    # and a valid one does not change the model the run reports. The model
-    # travels on --model, which is also the only spelling agy validates.
+    # No GEMINI_MODEL here. It is a Gemini CLI variable; Antigravity ignores it
+    # (a garbage value raises no error, a valid one does not change the model the
+    # run reports). The model travels on --model, the only spelling it validates.
 
     if config.extra_env:
         overlay.update(config.extra_env)
