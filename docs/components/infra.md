@@ -139,7 +139,7 @@ The `--project` and `--cluster` CLI flags supply the project and cluster name fo
 
 `scripts/bastion/vm-setup.sh` prepares the GCE VM the benchmark matrix runs on: agent CLIs, the chaos load generator, PATH fixes, and MCP skills. It is idempotent — re-run it any time.
 
-It also installs three firewall rules, and the order they sit in the chain is the point:
+It also installs three firewall rules, and the order they sit in the chain is the point. The script removes any earlier copies and re-inserts all three at the head on every run, so a re-run (or a debugging session that deleted one) cannot leave the `REJECT` above the `ACCEPT`s:
 
 ```
 sudo iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT
