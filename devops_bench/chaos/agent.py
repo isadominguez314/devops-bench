@@ -24,7 +24,7 @@ from typing import Any
 from devops_bench.core import first_env, get_env, get_logger
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider
-from devops_bench.models import LLMClient, get_model
+from devops_bench.models import LLMClient, describe_client, get_model
 from devops_bench.models.utils.loop import LoopResult, run_tool_loop
 
 __all__ = ["ChaosAgent", "ToolHandler", "driver_identity"]
@@ -41,7 +41,7 @@ ToolHandler = Callable[[str, threading.Event | None], str]
 
 
 def driver_identity() -> dict[str, str | None]:
-    """Return the ``{"provider", "model"}`` the chaos driver would resolve from the environment."""
+    """Return the ``{"provider", "model"}`` the environment configures for the chaos driver."""
     raw = first_env("CHAOS_PROVIDER", "AGENT_PROVIDER")
     try:
         provider: str | None = resolve_provider(raw).canonical
@@ -63,9 +63,8 @@ class ChaosAgent:
         chaos_active_event: Optional :class:`threading.Event` the handler may
             set when a disruption is observably active (e.g. load is flowing);
             forwarded unchanged.
-        client: Optional pre-built LLM client. When omitted one is selected
-            via ``first_env("CHAOS_PROVIDER","AGENT_PROVIDER")`` /
-            ``first_env("CHAOS_MODEL","AGENT_MODEL")``.
+        client: Optional pre-built LLM client. When omitted one is built from
+            :func:`driver_identity`.
         max_turns: Override for the safety turn cap.
     """
 
@@ -79,19 +78,25 @@ class ChaosAgent:
         max_turns: int = _MAX_TURNS,
     ) -> None:
         if client is None:
-            provider = first_env("CHAOS_PROVIDER", "AGENT_PROVIDER")
-            model_name = first_env("CHAOS_MODEL", "AGENT_MODEL")
+            configured = driver_identity()
+            client = get_model(provider=configured["provider"], model_name=configured["model"])
             if get_env("CHAOS_MODEL") is None:
                 _log.warning(
-                    "CHAOS_MODEL unset; the chaos driver falls back to AGENT_MODEL (%s)", model_name
+                    "CHAOS_MODEL unset; the chaos driver resolved to %s/%s",
+                    client.provider,
+                    client.model_name,
                 )
-            client = get_model(provider=provider, model_name=model_name)
         self._client = client
         self._system_instruction = system_instruction
         self._tool = tool
         self._tool_handler = tool_handler
         self._chaos_active_event = chaos_active_event
         self._max_turns = max_turns
+
+    @property
+    def identity(self) -> dict[str, str | None]:
+        """The ``{"provider", "model"}`` of the client actually driving this agent."""
+        return describe_client(self._client)
 
     def run(self, goal: str) -> str:
         """Run the chaos loop synchronously and return the model's final text.

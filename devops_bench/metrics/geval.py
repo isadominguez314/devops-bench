@@ -24,7 +24,7 @@ from deepeval.models import DeepEvalBaseLLM
 
 from devops_bench.core import get_env, get_logger
 from devops_bench.core.model_providers import resolve_provider
-from devops_bench.models import LLMClient, get_model
+from devops_bench.models import LLMClient, describe_client, get_model
 
 __all__ = ["ModelLayerJudge", "describe_judge", "get_judge_model"]
 
@@ -59,16 +59,21 @@ class ModelLayerJudge(DeepEvalBaseLLM):
         if client is None:
             provider = provider or get_env("JUDGE_PROVIDER")
             model_name = model_name or get_env("JUDGE_MODEL")
-            if model_name is None:
-                _log.warning(
-                    "JUDGE_MODEL unset; the judge falls back to AGENT_MODEL (the agent grades itself)"
-                )
             client = get_model(provider=provider, model_name=model_name)
-            # Mirror get_model's provider resolution so the record names what was built.
-            provider = resolve_provider(provider or get_env("AGENT_PROVIDER")).canonical
+            if model_name is None:
+                # Name what was actually built: same model as the agent, or a foreign model id.
+                _log.warning(
+                    "JUDGE_MODEL unset; the judge resolved to %s/%s (agent: %s/%s)",
+                    client.provider,
+                    client.model_name,
+                    resolve_provider(get_env("AGENT_PROVIDER")).canonical,
+                    get_env("AGENT_MODEL"),
+                )
         self.client = client
-        #: Canonical provider id the judge was built for; None for a supplied client with no provider.
-        self.provider = provider
+        #: Canonical provider id: stamped on a built client, or the caller's alias canonicalized.
+        self.provider = getattr(client, "provider", None) or (
+            resolve_provider(provider).canonical if provider else None
+        )
         # Mirror the adapter's resolved model name so DeepEval can label results.
         self._model_name = model_name or getattr(client, "model_name", None) or "judge"
 
@@ -124,11 +129,9 @@ class ModelLayerJudge(DeepEvalBaseLLM):
 
 def describe_judge(judge: Any) -> dict[str, str | None]:
     """Return the ``{"provider", "model"}`` identity a run record stores for its judge."""
-    get_name = getattr(judge, "get_model_name", None)
-    return {
-        "provider": getattr(judge, "provider", None),
-        "model": get_name() if callable(get_name) else None,
-    }
+    identity = describe_client(getattr(judge, "client", None))
+    identity["provider"] = getattr(judge, "provider", None) or identity["provider"]
+    return identity
 
 
 def get_judge_model(provider: str | None = None, model_name: str | None = None) -> ModelLayerJudge:

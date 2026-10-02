@@ -778,7 +778,7 @@ def test_records_carry_judge_and_chaos_driver_identity(
     plain = harness._empty_record(Task.from_dict({"task_id": "t", "name": "n", "prompt": "p"}))  # noqa: SLF001
     assert plain["chaos_driver"] == {}
 
-    judge = SimpleNamespace(provider="anthropic", get_model_name=lambda: "judge-x")
+    judge = SimpleNamespace(provider="anthropic", client=SimpleNamespace(model_name="judge-x"))
     failed = {"status": "failed"}
     with (
         patch("devops_bench.metrics.get_judge_model", return_value=judge),
