@@ -75,9 +75,10 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.vertex_env import vertex_project
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
@@ -392,7 +393,15 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
 
 
 def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
-    """Forward explicit provider routing and enable metadata auth in the image."""
+    """Forward explicit provider routing and give the container a model credential.
+
+    A keyless Vertex run (``google-vertex`` or ``anthropic-vertex``) cannot see
+    the host's ADC, so it gets the shared metadata-emulator recipe from
+    :func:`~devops_bench.core.model_providers.sandbox_credential_env`, as
+    gemini_cli does: the metadata-host vars point the SDK at a host-side server
+    serving a narrowly scoped impersonated token, never at the VM's own
+    identity. A keyed run's key already crosses by value.
+    """
     overlay = {
         name: os.environ[name]
         for name in (
@@ -407,7 +416,10 @@ def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
     }
     _write_node_fetch_shim(workdir)
     overlay["NODE_OPTIONS"] = "--import=/workspace/node-fetch-shim/register.mjs"
-    if _oc_provider_or_none(config) == "anthropic-vertex":
+    spec = resolve_provider(config.provider)
+    if spec.backend == "vertex" and not config.api_key:
+        overlay.update(sandbox_credential_env(spec, project=vertex_project()))
+    if spec.oc_provider == "anthropic-vertex":
         overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
         overlay.setdefault("GOOGLE_CLOUD_API_KEY", "gcp-vertex-credentials")
     return overlay
@@ -432,9 +444,8 @@ def _oc_model_flag(config: AgentConfig) -> str:
 def _oc_provider_or_none(config: AgentConfig) -> str | None:
     """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
 
-    Shared by :func:`_needs_anthropic_vertex_auth_profile` and the sandboxed
-    anthropic-vertex env passthrough in :meth:`OpenClawAgent._execute`, so the
-    "is this run on anthropic-vertex" check has exactly one implementation.
+    Tolerant on purpose: :func:`_needs_anthropic_vertex_auth_profile` runs
+    before :func:`_build_env` has had its chance to fail loud on a typo.
     """
     try:
         return resolve_provider(config.provider).oc_provider

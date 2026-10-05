@@ -971,16 +971,71 @@ def test_vertex_auth_profile_seeded_for_headless_run() -> None:
     assert "models auth paste-api-key" in command
 
 
+_FAKE_EMULATOR_ENV = {
+    "GCE_METADATA_HOST": "host.docker.internal:41234",
+    "GCE_METADATA_IP": "host.docker.internal:41234",
+    "METADATA_SERVER_DETECTION": "assume-present",
+}
+
+
+def _install_fake_emulator(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Stub the shared Vertex credential recipe; returns the calls it received."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_credential_env(spec: Any, *, project: str | None = None, **kw: Any) -> dict[str, str]:
+        calls.append({"backend": spec.backend, "project": project})
+        return dict(_FAKE_EMULATOR_ENV)
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", fake_credential_env)
+    return calls
+
+
 def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """anthropic-vertex: the SDK is switched to metadata auth AND pointed at the
+    host-side emulator; without the second half it would walk to the real
+    link-local endpoint and the VM's own service account."""
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/host.json")
+    calls = _install_fake_emulator(monkeypatch)
     overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="anthropic-vertex"), tmp_path)
     assert overlay["GOOGLE_CLOUD_PROJECT"] == "test-project"
     assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
+    assert overlay["GOOGLE_CLOUD_API_KEY"] == "gcp-vertex-credentials"
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in overlay
     assert (tmp_path / "node-fetch-shim" / "register.mjs").is_file()
+    assert calls == [{"backend": "vertex", "project": "test-project"}]
+
+
+def test_sandbox_google_vertex_overlay_gets_the_same_credential_recipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GCP_PROJECT_ID", "p-from-repo-var")
+    calls = _install_fake_emulator(monkeypatch)
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
+    assert "ANTHROPIC_VERTEX_USE_GCP_METADATA" not in overlay
+    assert calls == [{"backend": "vertex", "project": "p-from-repo-var"}]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        AgentConfig(provider="google-vertex", api_key="express-key"),
+        AgentConfig(provider="google", api_key="k"),
+        AgentConfig(provider="anthropic", api_key="k"),
+    ],
+)
+def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: AgentConfig
+) -> None:
+    """A key crosses by value; the emulator is only for keyless Vertex."""
+    calls = _install_fake_emulator(monkeypatch)
+    overlay = oc_mod._sandbox_provider_env(config, tmp_path)
+    assert "GCE_METADATA_HOST" not in overlay
+    assert calls == []
 
 
 @pytest.mark.parametrize(
