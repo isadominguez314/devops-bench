@@ -658,6 +658,25 @@ def test_executor_run_rejects_stdin_input(tmp_path: Path) -> None:
         executor.run(["gemini"], input="data")
 
 
+def test_executor_run_accepts_an_empty_stdin_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``input=""`` is how a host-side harness closes stdin; the container has
+    no stdin anyway, so the executor must treat it as equivalent, not refuse."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    seen: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        seen.append(argv)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    result = executor.run(["claude", "-p", "hi"], check=False, input="")
+
+    assert result.stdout == "ok"
+    assert seen[0][:2] == ["docker", "run"]
+
+
 def test_executor_run_reaps_the_container_on_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

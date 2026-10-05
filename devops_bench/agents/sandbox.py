@@ -553,8 +553,10 @@ class SandboxExecutor:
     ) -> CompletedProcess:
         """Run ``cmd`` in the sandbox container; mirrors ``core.subprocess.run``.
 
-        ``env`` and ``input`` are rejected (credential-inheritance channel; no
-        stdin). Docker's own launch failures raise :class:`SandboxError` rather
+        ``env`` is rejected (credential-inheritance channel), as is any non-empty
+        ``input``: the container runs without ``-i``, so an empty payload is
+        already what it gets and passes through, but a real one would be lost.
+        Docker's own launch failures raise :class:`SandboxError` rather
         than masquerading as an agent exit code. The container is reaped by name
         on every exit path, since ``--rm`` does not fire when the client is
         killed by the host-side timeout.
@@ -569,9 +571,10 @@ class SandboxExecutor:
                 "SandboxExecutor never forwards a full environment; pass the "
                 "resolved overlay via extra_env"
             )
-        if input is not None:
+        if input:
             raise SandboxError(
-                "the sandboxed agent runs without stdin (no -i, by design); input= is unsupported"
+                "the sandboxed agent runs without stdin (no -i, by design); a non-empty "
+                "input= would be silently dropped"
             )
         # Filter once so the client env matches the names wrap_argv emits.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
