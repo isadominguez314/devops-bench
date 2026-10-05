@@ -30,19 +30,22 @@ from devops_bench.run import BenchmarkResult
 def _restore_devops_bench_logger() -> Iterator[None]:
     """Undo ``main``'s ``configure_logging`` side effects after each test.
 
-    ``main`` attaches a real handler and sets ``propagate = False`` on the
-    package logger — correct in production, but ``caplog`` in later tests
-    relies on propagation to the root logger, so leak-through here fails
-    unrelated tests depending on execution order.
+    ``main`` attaches a real handler, sets ``propagate = False`` and sets the
+    level on the package logger — correct in production, but ``caplog`` in
+    later tests relies on propagation to the root logger and on the default
+    threshold, so leak-through here fails unrelated tests depending on
+    execution order.
     """
     import logging
 
     root = logging.getLogger("devops_bench")
     saved_handlers = list(root.handlers)
     saved_propagate = root.propagate
+    saved_level = root.level
     yield
     root.handlers = saved_handlers
     root.propagate = saved_propagate
+    root.setLevel(saved_level)
 
 
 def test_build_parser_parses_flags() -> None:
@@ -171,6 +174,26 @@ def test_main_exit_two_on_malformed_env(
     err = capsys.readouterr().err
     assert "error:" in err
     assert "EVAL_LIMIT" in err
+
+
+def test_main_exit_two_on_unknown_log_level(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unknown ``BENCH_LOG_LEVEL`` is a configuration error like any other."""
+    monkeypatch.setenv("BENCH_LOG_LEVEL", "LOUD")
+    assert main(["src", "--no-infra"]) == 2
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "BENCH_LOG_LEVEL" in err
+    assert "LOUD" in err
+
+
+def test_help_works_even_with_an_unknown_log_level(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Logging is configured after parsing, so ``--help`` never depends on the env."""
+    monkeypatch.setenv("BENCH_LOG_LEVEL", "LOUD")
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--help"])
+    assert excinfo.value.code == 0
 
 
 def test_main_attaches_a_real_log_handler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
