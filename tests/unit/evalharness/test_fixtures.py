@@ -21,8 +21,10 @@ from pathlib import Path
 
 import pytest
 
+from devops_bench.agents.sandbox import CONTAINER_HOME
 from devops_bench.evalharness.fixtures import (
     REQUIRE_FIXTURES_ENV,
+    FixtureError,
     check_prompt_fixtures,
     prompt_fixture_paths,
 )
@@ -92,13 +94,15 @@ def test_it_raises_when_a_fixture_exists_but_is_unreadable(tmp_path: Path) -> No
 
 
 def test_it_names_the_task_and_every_missing_path(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(FixtureError) as excinfo:
         check_prompt_fixtures(_CVE_PROMPT, "cve-remediation", tmp_path)
     message = str(excinfo.value)
     assert "cve-remediation" in message
     assert "cve-repo-c1.git" in message
     assert "cve-advisory-c1.json" in message
     assert REQUIRE_FIXTURES_ENV in message
+    # The record builder reads the list off the exception on the raising path.
+    assert len(excinfo.value.problems) == 2
 
 
 def test_the_env_escape_hatch_downgrades_to_a_warning(
@@ -115,21 +119,30 @@ def test_a_mounted_fixture_is_checked_at_its_host_source(tmp_path: Path) -> None
     source = tmp_path / "operator" / "rightsizing-report-c1.json"
     source.parent.mkdir()
     source.write_text("{}")
-    mounts = {str(source): "/workspace/home/rightsizing-report-c1.json"}
+    mounts = {str(source): f"{CONTAINER_HOME}/rightsizing-report-c1.json"}
     assert check_prompt_fixtures(_SPOT_PROMPT, "spot", tmp_path / "home", mounts=mounts) == []
+
+
+def test_a_same_name_mounted_outside_the_container_home_does_not_count(tmp_path: Path) -> None:
+    source = tmp_path / "operator" / "rightsizing-report-c1.json"
+    source.parent.mkdir()
+    source.write_text("{}")
+    mounts = {str(source): "/workspace/other/rightsizing-report-c1.json"}
+    with pytest.raises(RuntimeError, match="not in the sandbox mount plan"):
+        check_prompt_fixtures(_SPOT_PROMPT, "spot", tmp_path / "home", mounts=mounts)
 
 
 def test_a_promised_fixture_missing_from_the_mount_plan_fails(tmp_path: Path) -> None:
     # One of two promised fixtures was discovered; the other never made the plan.
     repo = tmp_path / "operator" / "cve-repo-c1.git"
     repo.mkdir(parents=True)
-    mounts = {str(repo): "/workspace/home/cve-repo-c1.git"}
+    mounts = {str(repo): f"{CONTAINER_HOME}/cve-repo-c1.git"}
     with pytest.raises(RuntimeError, match="cve-advisory-c1.json \\(not in the sandbox mount plan"):
         check_prompt_fixtures(_CVE_PROMPT, "cve-remediation", tmp_path / "home", mounts=mounts)
 
 
 def test_a_mounted_fixture_with_a_missing_host_source_fails(tmp_path: Path) -> None:
-    mounts = {str(tmp_path / "gone.json"): "/workspace/home/rightsizing-report-c1.json"}
+    mounts = {str(tmp_path / "gone.json"): f"{CONTAINER_HOME}/rightsizing-report-c1.json"}
     with pytest.raises(RuntimeError, match="does not exist"):
         check_prompt_fixtures(_SPOT_PROMPT, "spot", tmp_path / "home", mounts=mounts)
 

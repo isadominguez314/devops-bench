@@ -21,9 +21,10 @@ import re
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
+from devops_bench.agents.sandbox import CONTAINER_HOME
 from devops_bench.core import get_bool, get_logger
 
-__all__ = ["REQUIRE_FIXTURES_ENV", "check_prompt_fixtures", "prompt_fixture_paths"]
+__all__ = ["REQUIRE_FIXTURES_ENV", "FixtureError", "check_prompt_fixtures", "prompt_fixture_paths"]
 
 _log = get_logger("evalharness.fixtures")
 
@@ -61,6 +62,14 @@ def prompt_fixture_paths(prompt: str, home: Path | None = None) -> list[Path]:
     return list(seen.values())
 
 
+class FixtureError(RuntimeError):
+    """A promised fixture is unusable; ``problems`` lists each one for the record."""
+
+    def __init__(self, message: str, problems: list[str]) -> None:
+        super().__init__(message)
+        self.problems = problems
+
+
 def _unreadable_reason(path: Path) -> str | None:
     """Return why ``path`` is unusable as a fixture, or ``None``.
 
@@ -90,16 +99,16 @@ def check_prompt_fixtures(
         task_name: Task name, for the message.
         home: Home directory the prompt's ``~`` resolves to for the agent.
         mounts: The sandbox mount plan (host path -> container path) when the
-            agent is sandboxed. Each promised name must then appear in the plan
-            and its host source must be readable, since the container binds
-            that source under this process's uid.
+            agent is sandboxed. Each promised name must then be mounted at its
+            container-home destination and its host source must be readable,
+            since the container binds that source under this process's uid.
 
     Returns:
         One human-readable problem per unusable fixture; empty when every
         promised path is present and readable, or when there are none.
 
     Raises:
-        RuntimeError: When a fixture is unusable and
+        FixtureError: When a fixture is unusable and
             :data:`REQUIRE_FIXTURES_ENV` is not set to a false value.
     """
     problems: list[str] = []
@@ -110,11 +119,12 @@ def check_prompt_fixtures(
             if (reason := _unreadable_reason(path)) is not None
         ]
     else:
-        source_by_name = {PurePosixPath(c).name: Path(h) for h, c in mounts.items()}
+        source_by_dest = {str(PurePosixPath(c)): Path(h) for h, c in mounts.items()}
         for path in prompt_fixture_paths(prompt, home):
-            source = source_by_name.get(path.name)
+            dest = f"{CONTAINER_HOME}/{path.name}"
+            source = source_by_dest.get(dest)
             if source is None:
-                problems.append(f"{path.name} (not in the sandbox mount plan)")
+                problems.append(f"{dest} (not in the sandbox mount plan)")
             elif (reason := _unreadable_reason(source)) is not None:
                 problems.append(f"{source} ({reason})")
     if not problems:
@@ -131,4 +141,4 @@ def check_prompt_fixtures(
     if not get_bool(REQUIRE_FIXTURES_ENV, True):
         _log.warning("%s (continuing: %s is off)", message, REQUIRE_FIXTURES_ENV)
         return problems
-    raise RuntimeError(message)
+    raise FixtureError(message, problems)

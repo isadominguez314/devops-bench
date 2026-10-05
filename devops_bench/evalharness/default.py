@@ -61,7 +61,7 @@ from devops_bench.core import (
 from devops_bench.deployers.factory import get_deployer
 from devops_bench.evalharness.artifacts import collect_generated_files, snapshot_dir
 from devops_bench.evalharness.base import Harness
-from devops_bench.evalharness.fixtures import check_prompt_fixtures
+from devops_bench.evalharness.fixtures import FixtureError, check_prompt_fixtures
 from devops_bench.evalharness.hold import (
     HoldObservation,
     SafeguardMonitor,
@@ -1106,6 +1106,8 @@ class DefaultEvalHarness(Harness):
             )
             _log.info("agent response for %s:\n%s", task.name, result["output"])
         except Exception as exc:  # noqa: BLE001 - surface every task failure
+            if isinstance(exc, FixtureError):
+                fixture_problems = list(exc.problems)
             _log.error("critical error during task %s: %s", task.name, exc)
             # The exception may predate the success path's stop(); stop() is idempotent.
             if safeguard_monitor is not None:

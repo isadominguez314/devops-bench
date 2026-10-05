@@ -1615,6 +1615,38 @@ def _run_colliding_batch(
         AGENTS._items.pop("fake-colliding-deliverable", None)  # noqa: SLF001
 
 
+def test_a_missing_required_fixture_fails_the_record_and_lists_it(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On the raising path the failed record still carries ``fixture_problems``."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+    monkeypatch.delenv("BENCH_REQUIRE_FIXTURES", raising=False)
+    _CollidingDeliverableAgent.home = fake_home
+    _CollidingDeliverableAgent.calls = 0
+    AGENTS.register("fake-colliding-deliverable")(_CollidingDeliverableAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p",
+            cluster_name="c",
+            agent_type="fake-colliding-deliverable",
+            no_infra=True,
+            results_root=str(tmp_path / "results"),
+        )
+        prompt = "A report has been delivered to '~/report-c.json'."
+        results = harness.run([Task.from_dict({"task_id": "t1", "name": "spot", "prompt": prompt})])
+    finally:
+        AGENTS._items.pop("fake-colliding-deliverable", None)  # noqa: SLF001
+
+    record = results[0]
+    assert record["status"] == "failed"
+    assert _CollidingDeliverableAgent.calls == 0  # the agent never started
+    assert len(record["fixture_problems"]) == 1
+    assert "report-c.json" in record["fixture_problems"][0]
+    assert "report-c.json" in record["error"]
+
+
 def test_prompt_named_mid_batch_entry_is_caught_by_content_fingerprint(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

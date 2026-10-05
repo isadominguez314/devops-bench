@@ -215,7 +215,9 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
-def test_up_holds_default_state_private(mocker, monkeypatch, tf_deployer):
+def test_up_holds_default_state_private(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, tf_deployer: TFDeployer
+) -> None:
     # No TF_DATA_DIR: tofu writes its default in-directory state. A stale
     # world-readable state from an older run must be tightened too.
     monkeypatch.delenv("TF_DATA_DIR", raising=False)
@@ -231,8 +233,11 @@ def test_up_holds_default_state_private(mocker, monkeypatch, tf_deployer):
 
 
 def test_up_precreates_isolated_state_private_before_apply(
-    mocker, monkeypatch, tmp_path, tf_deployer
-):
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tf_deployer: TFDeployer,
+) -> None:
     monkeypatch.setenv("TF_DATA_DIR", str(tmp_path / "tf-data"))
     state = tmp_path / "terraform.tfstate"
     seen: list[int] = []
@@ -248,11 +253,13 @@ def test_up_precreates_isolated_state_private_before_apply(
     assert _mode(state.with_suffix(".tfstate.backup")) == 0o600
 
 
-def test_down_holds_state_private_even_when_destroy_fails(mocker, monkeypatch, tf_deployer):
+def test_down_holds_state_private_even_when_destroy_fails(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, tf_deployer: TFDeployer
+) -> None:
     monkeypatch.delenv("TF_DATA_DIR", raising=False)
     state = Path(tf_deployer.work_dir) / "terraform.tfstate"
 
-    def fail_destroy(cmd, **_):
+    def fail_destroy(cmd: list[str], **_: object) -> None:
         if "destroy" in cmd:
             raise RuntimeError("boom")
 
