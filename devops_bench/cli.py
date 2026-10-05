@@ -153,22 +153,25 @@ def main(argv: list[str] | None = None) -> int:
     """
     from devops_bench.run import run_benchmark
 
-    # Attach the stderr handler for the package logger. Without this every
-    # _log call in the library is silent in a real run: the package root
-    # carries a NullHandler (so library use stays quiet by default), which
-    # also suppresses logging's last-resort fallback. The harness makes
-    # operator-facing promises through warnings — e.g. "task X declares
-    # requires_unsandboxed; running it OUTSIDE the agent sandbox" — and a
-    # promise nobody can see is not kept. Idempotent, honours BENCH_LOG_LEVEL.
-    configure_logging()
-
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # args_to_config runs inside the try: BenchmarkConfig.from_env raises
-    # ConfigError on malformed env (e.g. a non-integer EVAL_LIMIT), which must
-    # exit 2 like every other configuration error, not escape as a traceback.
+    # Everything that reads the environment runs inside the try, so a
+    # malformed value (a non-integer EVAL_LIMIT, an unknown BENCH_LOG_LEVEL)
+    # exits 2 like every other configuration error, not as a traceback.
     try:
+        # Attach the stderr handler for the package logger. Without this every
+        # _log call in the library is silent in a real run: the package root
+        # carries a NullHandler (so library use stays quiet by default), which
+        # also suppresses logging's last-resort fallback. The harness makes
+        # operator-facing promises through warnings — e.g. "task X declares
+        # requires_unsandboxed; running it OUTSIDE the agent sandbox" — and a
+        # promise nobody can see is not kept. Idempotent, honours
+        # BENCH_LOG_LEVEL. After parse_args so --help never depends on it.
+        try:
+            configure_logging()
+        except ValueError as exc:
+            raise ConfigError(f"BENCH_LOG_LEVEL: {exc}") from exc
         config = args_to_config(args)
         result = run_benchmark(config)
     except ConfigError as exc:

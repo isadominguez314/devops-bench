@@ -527,7 +527,7 @@ def test_run_one_evaluates_verification_on_the_exception_path_when_infra_is_up(
     """
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
-    def _boom(prompt: str, ctx: Any) -> Any:
+    def _boom(prompt: str, ctx: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("agent crashed")
 
     # ``execute_agent`` is patched directly, not the agent itself: AgentHarness.run()
@@ -556,6 +556,7 @@ def test_run_one_evaluates_verification_on_the_exception_path_when_infra_is_up(
     record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
+    assert "agent crashed" in (record["error"] or "")  # the double's error, not a TypeError
     assert record["verification_report"] == canned_report
     assert record["verification_status"] == "evaluated"
 
@@ -571,7 +572,7 @@ def test_run_one_reports_evaluated_on_the_exception_path_with_no_entries_declare
     """
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
-    def _boom(prompt: str, ctx: Any) -> Any:
+    def _boom(prompt: str, ctx: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("agent crashed")
 
     monkeypatch.setattr(harness, "execute_agent", _boom)
@@ -587,6 +588,7 @@ def test_run_one_reports_evaluated_on_the_exception_path_with_no_entries_declare
     record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
+    assert "agent crashed" in (record["error"] or "")  # the double's error, not a TypeError
     assert record["verification_report"] == []
     assert record["verification_status"] == "evaluated"
 
