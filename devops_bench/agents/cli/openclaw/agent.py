@@ -136,19 +136,19 @@ _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
-# catalog; the harness registers these per-run (see :func:`_build_model_override`).
+# catalog, per oc provider; the harness registers these per-run (see
+# :func:`_build_model_override`). Keyed by provider because the override
+# replaces oc's provider entry: the same id on a provider not listed here must
+# keep passing through to oc's own catalog untouched.
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
-_CATALOG_OVERRIDES: frozenset[str] = frozenset(
-    {
-        "gemini-3.5-flash",
-        "gemini-3.7-flash",
-        "gemini-3.8-flash",
-        "claude-fable-5-1",
-        "claude-sonnet-5",
-        "claude-fable-5",
-        "claude-opus-5",
-    }
-)
+_GEMINI_CATALOG_OVERRIDES = frozenset({"gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.8-flash"})
+_CATALOG_OVERRIDES: dict[str, frozenset[str]] = {
+    "google": _GEMINI_CATALOG_OVERRIDES,
+    "google-vertex": _GEMINI_CATALOG_OVERRIDES,
+    "anthropic-vertex": frozenset(
+        {"claude-fable-5-1", "claude-sonnet-5", "claude-fable-5", "claude-opus-5"}
+    ),
+}
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
 # built-in provider rather than merging, so without ``api`` oc falls back to the
@@ -290,12 +290,12 @@ def _build_model_override(config: AgentConfig) -> dict:
     if not model_id:
         return {}
     provider, _, bare = model_id.partition("/")
-    if bare not in _CATALOG_OVERRIDES:
+    if bare not in _CATALOG_OVERRIDES.get(provider, frozenset()):
         return {}
     # A per-run provider entry *replaces* oc's built-in one, so it must pin a
     # transport; without one oc falls back to the OpenAI transport and 401s. Fail
     # loud rather than ship a broken (transport-less) entry for a provider we have
-    # not pinned.
+    # not pinned (a consistency check between the two tables above).
     if provider not in _PROVIDER_TRANSPORT:
         raise ConfigError(
             f"openclaw catalog override {model_id!r} has no pinned transport for "

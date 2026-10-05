@@ -711,12 +711,22 @@ def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
         _build_env(AgentConfig(provider="google-vertyx"))
 
 
-def test_model_override_raises_for_unpinned_transport() -> None:
+def test_model_override_raises_for_unpinned_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     """A catalog-override model whose provider has no pinned transport fails loud
     rather than shipping a transport-less entry (which would 401 via the OpenAI
-    fallback). A full-id with an unknown wire reaches this path."""
+    fallback). Only reachable when the two tables disagree, so force that."""
+    monkeypatch.setitem(oc_mod._CATALOG_OVERRIDES, "mystery", frozenset({"gemini-3.5-flash"}))
     with pytest.raises(ConfigError):
         _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash"))
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "anthropic-bedrock"])
+def test_model_override_leaves_other_providers_catalog_alone(provider: str) -> None:
+    """An id overridden for anthropic-vertex is not overridden for plain anthropic
+    or bedrock: those have no transport pin and resolve through oc's own catalog,
+    as they did before the Claude ids were added."""
+    assert _build_model_override(AgentConfig(model="claude-opus-5", provider=provider)) == {}
+    assert _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash")) == {}
 
 
 def _empty_sessions_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
