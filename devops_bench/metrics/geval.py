@@ -23,7 +23,7 @@ from typing import Any
 from deepeval.models import DeepEvalBaseLLM
 
 from devops_bench.core import get_env, get_logger
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core.model_identity import canonical_provider
 from devops_bench.models import LLMClient, describe_client, get_model
 
 __all__ = ["ModelLayerJudge", "describe_judge", "get_judge_model"]
@@ -66,13 +66,13 @@ class ModelLayerJudge(DeepEvalBaseLLM):
                     "JUDGE_MODEL unset; the judge resolved to %s/%s (agent: %s/%s)",
                     client.provider,
                     client.model_name,
-                    resolve_provider(get_env("AGENT_PROVIDER")).canonical,
+                    canonical_provider(get_env("AGENT_PROVIDER")),
                     get_env("AGENT_MODEL"),
                 )
         self.client = client
         #: Canonical provider id: stamped on a built client, or the caller's alias canonicalized.
         self.provider = getattr(client, "provider", None) or (
-            resolve_provider(provider).canonical if provider else None
+            canonical_provider(provider) if provider else None
         )
         # Mirror the adapter's resolved model name so DeepEval can label results.
         self._model_name = model_name or getattr(client, "model_name", None) or "judge"

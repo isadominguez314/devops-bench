@@ -82,6 +82,23 @@ def test_warning_names_a_cross_provider_fallback(
     assert "the judge resolved to ollama/gemini-x (agent: google/gemini-x)" in caplog.text
 
 
+def test_warning_survives_an_unknown_agent_provider(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bogus AGENT_PROVIDER must not turn the log line into a judge-construction failure."""
+    built = _fake_client(model_name="judge-x", provider="ollama")
+    mocker.patch.object(geval, "get_model", return_value=built)
+    mocker.patch.dict(
+        os.environ, {"JUDGE_PROVIDER": "ollama", "AGENT_PROVIDER": "no-such-provider"}, clear=True
+    )
+
+    with caplog.at_level(logging.WARNING):
+        judge = ModelLayerJudge()
+
+    assert "(agent: no-such-provider/None)" in caplog.text
+    assert judge.provider == "ollama"
+
+
 def test_supplied_client_provider_alias_is_canonicalized(mocker: MockerFixture) -> None:
     get_model = mocker.patch.object(geval, "get_model")
 

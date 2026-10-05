@@ -20,19 +20,25 @@ from devops_bench.core.config import first_env
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider
 
-__all__ = ["configured_identity", "driver_identity", "judge_identity"]
+__all__ = ["canonical_provider", "configured_identity", "driver_identity", "judge_identity"]
+
+
+def canonical_provider(raw: str | None) -> str | None:
+    """Canonicalize a provider alias without raising; an unknown alias is returned as written."""
+    try:
+        return resolve_provider(raw).canonical
+    except ConfigError:  # get_model raises on it later; identity reporting must not
+        return raw
 
 
 def configured_identity(
     provider_vars: tuple[str, ...], model_vars: tuple[str, ...]
 ) -> dict[str, str | None]:
     """Return the ``{"provider", "model"}`` the environment configures (model None = adapter default)."""
-    raw = first_env(*provider_vars)
-    try:
-        provider: str | None = resolve_provider(raw).canonical
-    except ConfigError:  # an unknown alias is reported as written; get_model raises on it later
-        provider = raw
-    return {"provider": provider, "model": first_env(*model_vars)}
+    return {
+        "provider": canonical_provider(first_env(*provider_vars)),
+        "model": first_env(*model_vars),
+    }
 
 
 def driver_identity() -> dict[str, str | None]:
