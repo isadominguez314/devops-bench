@@ -1373,32 +1373,25 @@ def test_inventory_covers_fixture_mounts_at_their_container_paths(
     assert {r.source for r in surviving} == {"stale-notes-c1.md"}
 
 
-def test_stray_container_sweep_is_skipped_under_parallel(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parallel", [True, False])
+def test_stray_container_sweep_is_told_about_parallel(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parallel: bool
 ) -> None:
-    """The sweep matches on the shared name prefix and cannot tell a stray
-    from a sibling harness's live container, so BENCH_PARALLEL must skip it."""
-    monkeypatch.setenv("BENCH_PARALLEL", "1")
+    """The sweep always runs once per batch and is handed BENCH_PARALLEL; it
+    decides itself whether an unscoped prefix match is too broad to act on."""
+    if parallel:
+        monkeypatch.setenv("BENCH_PARALLEL", "1")
+    else:
+        monkeypatch.delenv("BENCH_PARALLEL", raising=False)
     harness = _sandboxed_harness(monkeypatch, tmp_path)
     swept: list[bool] = []
     monkeypatch.setattr(
-        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
+        harness_default.agent_sandbox,
+        "sweep_stray_containers",
+        lambda *, parallel: swept.append(parallel),
     )
     harness.run([])
-    assert swept == []
-
-
-def test_stray_container_sweep_runs_when_not_parallel(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
-    harness = _sandboxed_harness(monkeypatch, tmp_path)
-    swept: list[bool] = []
-    monkeypatch.setattr(
-        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
-    )
-    harness.run([])
-    assert swept == [True]
+    assert swept == [parallel]
 
 
 class _BatchContaminatingAgent(AgentHarness):

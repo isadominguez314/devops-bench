@@ -886,27 +886,16 @@ class DefaultEvalHarness(Harness):
                     "the sandbox seam; refusing the whole batch rather than "
                     "provisioning a cluster per task just to fail each one"
                 )
-            if self.parallel:
-                # The sweep matches on the shared name prefix and cannot tell a
-                # crashed run's stray from a sibling harness's *live* agent
-                # container, so under BENCH_PARALLEL it would reap a concurrent
-                # run mid-task.
-                _log.info(
-                    "BENCH_PARALLEL set: skipping the stray sandbox-container "
-                    "sweep; reap leftovers manually with `docker ps --filter "
-                    "name=devops-bench-agent-` once no benchmark is running"
-                )
-            else:
-                # A container the harness starts is normally reaped around its
-                # own run, but a harness process killed outright (Ctrl-C, OOM,
-                # a host reboot) never gets to run that ``finally``. Sweeping
-                # once here, before this batch's own containers exist, catches
-                # exactly that leak without risking a live container from the
-                # run in progress.
-                try:
-                    agent_sandbox.sweep_stray_containers()
-                except Exception:  # noqa: BLE001 - a sweep failure must not block the run
-                    _log.exception("stray sandbox container sweep failed; continuing")
+            # A container the harness starts is normally reaped around its
+            # own run, but a harness process killed outright (Ctrl-C, OOM, a
+            # host reboot) never gets to run that ``finally``. Sweeping once
+            # here, before this batch's own containers exist, catches exactly
+            # that leak. The sweep itself decides whether BENCH_PARALLEL makes
+            # the match too broad to be safe.
+            try:
+                agent_sandbox.sweep_stray_containers(parallel=self.parallel)
+            except Exception:  # noqa: BLE001 - a sweep failure must not block the run
+                _log.exception("stray sandbox container sweep failed; continuing")
 
         run_dir = self.reporter.new_run_dir()
 

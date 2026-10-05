@@ -642,20 +642,28 @@ def kill_container(name: str) -> None:
         _log.info("reaped sandbox container %s", name)
 
 
-def sweep_stray_containers() -> None:
-    """Reap only the current attempt's leftovers; best-effort against docker failures.
+def sweep_stray_containers(*, parallel: bool = False) -> None:
+    """Best-effort reap of containers a prior crashed run left behind. Never raises.
 
-    A shared name prefix is not proof another process has exited: without an
-    owner id (``BENCH_AGENT_SANDBOX_OWNER``) a stray cannot be told apart from
-    a parallel harness's live container, so unscoped containers are left for
-    explicit operator recovery rather than swept here.
+    With an owner id (``BENCH_AGENT_SANDBOX_OWNER``) only that attempt's
+    containers are swept, which is safe alongside other harnesses. Without one
+    the match is the shared name prefix, which cannot tell a crashed run's
+    stray from a sibling harness's live container, so ``parallel`` skips the
+    sweep and leaves the strays for the operator.
     """
     owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
-    if not owner:
-        return
-    if not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
+    if owner and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
         raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
-    prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-"
+    if not owner and parallel:
+        _log.info(
+            "BENCH_PARALLEL set and no BENCH_AGENT_SANDBOX_OWNER: skipping the stray "
+            "sandbox-container sweep; reap leftovers manually with `%s ps --filter "
+            "name=%s` once no benchmark is running",
+            CONTAINER_RUNTIME,
+            _CONTAINER_NAME_PREFIX,
+        )
+        return
+    prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-" if owner else _CONTAINER_NAME_PREFIX
     try:
         listed = run(
             [CONTAINER_RUNTIME, "ps", "--format", "{{.Names}}"],

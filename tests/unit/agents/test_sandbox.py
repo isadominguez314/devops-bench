@@ -1250,10 +1250,60 @@ def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
     assert "--user" not in executor.wrap_argv(["gemini"])
 
 
-def test_unscoped_sweep_never_touches_other_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unscoped_sweep_is_skipped_under_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without an owner the prefix match could reap a sibling harness's live
+    container, so a parallel batch must not sweep at all."""
     monkeypatch.delenv("BENCH_AGENT_SANDBOX_OWNER", raising=False)
     monkeypatch.setattr(sandbox, "run", lambda *a, **kw: pytest.fail("unscoped docker call"))
-    sandbox.sweep_stray_containers()
+    sandbox.sweep_stray_containers(parallel=True)
+
+
+def test_unscoped_sweep_reaps_every_prefixed_container_when_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serial host with no owner id is the crash-recovery case the sweep
+    exists for: every container carrying the benchmark prefix is a stray."""
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX_OWNER", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="devops-bench-agent-ws1\ndevops-bench-agent-attemptA-ws2\nunrelated\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers(parallel=False)
+
+    kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
+    assert kill_calls == [
+        ["docker", "kill", "devops-bench-agent-ws1"],
+        ["docker", "kill", "devops-bench-agent-attemptA-ws2"],
+    ]
+
+
+def test_owner_scoped_sweep_runs_even_under_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(
+                returncode=0, stdout="devops-bench-agent-attemptA-ws\n", stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers(parallel=True)
+
+    assert [c for c in calls if c[:2] == ["docker", "kill"]] == [
+        ["docker", "kill", "devops-bench-agent-attemptA-ws"]
+    ]
 
 
 def test_owner_is_part_of_container_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
