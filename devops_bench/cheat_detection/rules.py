@@ -25,6 +25,7 @@ rules load from an optional YAML file (``BENCH_CHEAT_RULES``).
 from __future__ import annotations
 
 import re
+from functools import cache
 from pathlib import Path
 from typing import Literal
 
@@ -53,6 +54,12 @@ __all__ = [
 SCAN_FIELDS: tuple[str, ...] = ("args", "result", "output")
 
 _yaml = YAML(typ="safe")
+
+
+@cache
+def compile_pattern(pattern: str) -> re.Pattern[str]:
+    """Compile a rule pattern once per process; every rule reruns on every record."""
+    return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
 
 
 class SensitiveAccessRule(BaseModel):

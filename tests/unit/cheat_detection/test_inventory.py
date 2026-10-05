@@ -456,6 +456,45 @@ def test_fingerprint_of_a_stale_delivered_input_is_dropped(tmp_path: Path) -> No
     assert len(kept) == len(rules) - 1
 
 
+def test_static_rules_survive_an_input_that_matches_them(tmp_path: Path) -> None:
+    # An advisory citing the upstream repo must not silence the upstream-github rule.
+    (tmp_path / "advisory.json").write_text(
+        '{"ref": "https://github.com/kubernetes-sigs/devops-bench/issues/1"}\n'
+    )
+    static = tuple(r for r in DEFAULT_RULES if r.category == "upstream-github")
+    assert static and any(
+        re.search(p, "github.com/kubernetes-sigs/devops-bench") for r in static for p in r.patterns
+    )
+
+    kept = drop_fingerprints_matching_inputs(static, "Read ~/advisory.json.", tmp_path)
+
+    assert kept == static
+
+
+def test_path_rules_survive_an_input_that_names_their_entry(tmp_path: Path) -> None:
+    # An input mentioning another leftover by path keeps that leftover's path rule.
+    (tmp_path / "notes.txt").write_text(f"see {tmp_path}/other-c1.git for the manifests\n")
+    (tmp_path / "other-c1.git").mkdir()
+    rules = build_inventory_rules(tmp_path)
+    path_rules = tuple(r for r in rules if r.source)
+
+    kept = drop_fingerprints_matching_inputs(rules, "Read ~/notes.txt.", tmp_path)
+
+    assert all(r in kept for r in path_rules)
+
+
+def test_an_oversized_input_is_not_read_for_matching(tmp_path: Path) -> None:
+    stale = tmp_path / "stale"
+    stale.mkdir()
+    (stale / "advisory.json").write_text(_STALE_REPORT)
+    rules = build_inventory_rules(stale)
+    (tmp_path / "advisory.json").write_text(_STALE_REPORT + "x" * (64 * 1024))
+
+    kept = drop_fingerprints_matching_inputs(rules, "Read ~/advisory.json.", tmp_path)
+
+    assert kept == rules  # same cap as the fingerprinter: nothing matched, nothing dropped
+
+
 def test_fingerprint_of_a_same_batch_deliverable_is_kept(tmp_path: Path) -> None:
     (tmp_path / "report.md").write_text(_STALE_REPORT)
     rules = build_inventory_rules(tmp_path)

@@ -17,12 +17,12 @@
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
 from devops_bench.agents.sandbox import CONTAINER_HOME
 from devops_bench.core import get_bool, get_logger
+from devops_bench.core.prompt_paths import prompt_fixture_paths
 
 __all__ = ["REQUIRE_FIXTURES_ENV", "FixtureError", "check_prompt_fixtures", "prompt_fixture_paths"]
 
@@ -30,36 +30,6 @@ _log = get_logger("evalharness.fixtures")
 
 #: ``0`` downgrades a missing fixture to a warning, for a deliberately degraded arm.
 REQUIRE_FIXTURES_ENV = "BENCH_REQUIRE_FIXTURES"
-
-# ``~/<name>`` or ``$HOME/<name>`` in prompt prose.
-_HOME_PATH = re.compile(r"[~]/([\w.\-]+)|\$HOME/([\w.\-]+)")
-
-# Sentence punctuation stripped from the tail of a captured name.
-_TRAILING_PUNCT = ".,;:!?'\"`)"
-
-
-def prompt_fixture_paths(prompt: str, home: Path | None = None) -> list[Path]:
-    """Extract the home-relative fixture paths a prompt promises the agent.
-
-    Args:
-        prompt: The fully placeholder-substituted prompt text.
-        home: Home directory to resolve against; defaults to the current
-            process's, which is the agent's when it runs unsandboxed.
-
-    Returns:
-        Absolute paths, de-duplicated, in first-mention order.
-    """
-    base = home or Path.home()
-    seen: dict[str, Path] = {}
-    for match in _HOME_PATH.finditer(prompt):
-        name = (match.group(1) or match.group(2) or "").rstrip(_TRAILING_PUNCT)
-        if not name or name in seen:
-            continue
-        if prompt[match.end() : match.end() + 2] == "{{":
-            # Unsubstituted placeholder: the name is a truncated prefix.
-            continue
-        seen[name] = base / name
-    return list(seen.values())
 
 
 class FixtureError(RuntimeError):

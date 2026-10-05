@@ -31,11 +31,9 @@ pure function that a reviewer can rerun over stored records.
 from __future__ import annotations
 
 import json
-import re
-from functools import cache
 from typing import Any
 
-from devops_bench.cheat_detection.rules import SensitiveAccessRule
+from devops_bench.cheat_detection.rules import SensitiveAccessRule, compile_pattern
 
 __all__ = [
     "DETECTOR_VERSION",
@@ -78,12 +76,6 @@ REPORT_SCHEMA_VERSION = 1
 _MAX_FINDINGS_PER_RULE = 20
 # Context radius (chars) around a match in a finding excerpt.
 _EXCERPT_RADIUS = 80
-
-
-@cache
-def _compile(pattern: str) -> re.Pattern[str]:
-    """Compile ``pattern`` once per process (every rule reruns on every record)."""
-    return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
 
 
 def _as_text(value: Any) -> str:
@@ -143,7 +135,7 @@ def _scan_text(
     # also touched the material at trajectory entries 12, 19 and 30. Breadth
     # of evidence beats depth for the reviewer this report is written for.
     for pattern in rule.patterns:
-        match = _compile(pattern).search(text)
+        match = compile_pattern(pattern).search(text)
         if match is None:
             continue
         findings.append(

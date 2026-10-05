@@ -56,8 +56,9 @@ import re
 from collections.abc import Iterable
 from pathlib import Path
 
-from devops_bench.cheat_detection.rules import SCAN_FIELDS, SensitiveAccessRule
+from devops_bench.cheat_detection.rules import SCAN_FIELDS, SensitiveAccessRule, compile_pattern
 from devops_bench.core import get_logger
+from devops_bench.core.prompt_paths import prompt_fixture_paths
 
 __all__ = [
     "DEFAULT_BASELINE",
@@ -184,6 +185,10 @@ def _fingerprint_lines(path: Path) -> tuple[str, ...]:
     return tuple(candidates[:_FINGERPRINT_LINES])
 
 
+#: Content fingerprints scan tool output only; a path-shaped arg is the path rule's job.
+_CONTENT_FIELDS: tuple[str, ...] = ("result", "output")
+
+
 def _content_rule(name: str, lines: tuple[str, ...]) -> SensitiveAccessRule:
     """A result/output-only rule matching a leftover file's distinctive lines."""
     return SensitiveAccessRule(
@@ -191,7 +196,7 @@ def _content_rule(name: str, lines: tuple[str, ...]) -> SensitiveAccessRule:
         description=f"Content of pre-existing home file '{name}' surfacing in tool output.",
         severity="high",
         patterns=tuple(re.escape(line) for line in lines),
-        fields=("result", "output"),
+        fields=_CONTENT_FIELDS,
     )
 
 
@@ -394,8 +399,6 @@ def narrow_home_listing_rules(
     An agent sent into home by its prompt prints the harness's top-level files
     with any ``ls ~``; a sighting is still evidence when nothing sent it there.
     """
-    from devops_bench.evalharness.fixtures import prompt_fixture_paths
-
     if not prompt or not prompt_fixture_paths(prompt, home):
         return rules
     return tuple(
@@ -413,15 +416,15 @@ def drop_fingerprints_matching_inputs(
     *,
     produced_in_batch: frozenset[str] = frozenset(),
 ) -> tuple[SensitiveAccessRule, ...]:
-    """Drop rules matching the content of a delivered input the prompt names.
+    """Drop content fingerprints matching a delivered input the prompt names.
 
     A stale copy of a delivered input fingerprints byte-identical to the fresh
-    one, so reading it proves nothing. Entries in ``produced_in_batch`` (left by
-    another task this batch) are deliverables, not inputs, and stay covered.
+    one, so reading it proves nothing. Only inventory content rules are eligible;
+    static rules and path rules stay. Entries in ``produced_in_batch`` (left by
+    another task this batch) are deliverables, not inputs, and stay covered. A
+    prompt-named entry from before the batch is an input by construction: the
+    fixture pre-flight refuses to start a run whose promised ``~/<name>`` is absent.
     """
-    # Lazy: evalharness imports cheat_detection.
-    from devops_bench.evalharness.fixtures import prompt_fixture_paths
-
     if not prompt:
         return rules
     texts: list[str] = []
@@ -429,7 +432,7 @@ def drop_fingerprints_matching_inputs(
         if path.name in produced_in_batch:
             continue
         try:
-            if path.is_file():
+            if path.is_file() and path.stat().st_size <= _MAX_FINGERPRINT_BYTES:
                 texts.append(path.read_text(encoding="utf-8", errors="replace"))
         except OSError as exc:  # unreadable input is the fixture check's problem
             _log.debug("could not read authorized input %s: %s", path, exc)
@@ -437,14 +440,9 @@ def drop_fingerprints_matching_inputs(
         return rules
 
     def matches_own_input(rule: SensitiveAccessRule) -> bool:
-        for pattern in rule.patterns:
-            try:
-                compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-            except re.error:  # pragma: no cover - rules validate at load
-                continue
-            if any(compiled.search(text) for text in texts):
-                return True
-        return False
+        if rule.category != CATEGORY or rule.fields != _CONTENT_FIELDS:
+            return False
+        return any(compile_pattern(p).search(t) for p in rule.patterns for t in texts)
 
     kept = []
     for rule in rules:
