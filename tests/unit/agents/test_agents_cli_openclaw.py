@@ -637,8 +637,7 @@ def test_build_openclaw_config_threads_host_kubeconfig_into_mcp_env(
 def test_build_openclaw_config_uses_container_kubeconfig_when_sandboxed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The MCP server runs inside the container, where the credential lives at
-    the read-only bind path, not wherever RunEnv put it on the host."""
+    """The MCP server runs in the container, where the credential is at the bind path."""
     from devops_bench.agents import sandbox as sandbox_mod
 
     monkeypatch.setenv("KUBECONFIG", "/home/op/.devops-bench/runs/r1/kubeconfig")
@@ -737,9 +736,7 @@ def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
 
 
 def test_model_override_raises_for_unpinned_transport(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A catalog-override model whose provider has no pinned transport fails loud
-    rather than shipping a transport-less entry (which would 401 via the OpenAI
-    fallback). Only reachable when the two tables disagree, so force that."""
+    """An override without a transport pin fails loud; only reachable if the tables disagree."""
     monkeypatch.setitem(oc_mod._CATALOG_OVERRIDES, "mystery", frozenset({"gemini-3.5-flash"}))
     with pytest.raises(ConfigError):
         _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash"))
@@ -747,9 +744,7 @@ def test_model_override_raises_for_unpinned_transport(monkeypatch: pytest.Monkey
 
 @pytest.mark.parametrize("provider", ["anthropic", "anthropic-bedrock"])
 def test_model_override_leaves_other_providers_catalog_alone(provider: str) -> None:
-    """An id overridden for anthropic-vertex is not overridden for plain anthropic
-    or bedrock: those have no transport pin and resolve through oc's own catalog,
-    as they did before the Claude ids were added."""
+    """Unlisted providers resolve through oc's own catalog, as before the Claude ids."""
     assert _build_model_override(AgentConfig(model="claude-opus-5", provider=provider)) == {}
     assert _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash")) == {}
 
@@ -1000,9 +995,7 @@ def _install_fake_emulator(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, An
 def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """anthropic-vertex: the SDK is switched to metadata auth AND pointed at the
-    host-side emulator; without the second half it would walk to the real
-    link-local endpoint and the VM's own service account."""
+    """Metadata auth on AND pointed at the emulator, else the SDK reaches the real VM SA."""
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/host.json")
     calls = _install_fake_emulator(monkeypatch)
@@ -1022,10 +1015,7 @@ def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
 def test_sandbox_overlay_keeps_the_shim_out_of_the_artifact_diff(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The shim is harness-owned. It lives under the state dir (an entry the
-    run already creates) rather than as a new top-level workspace entry the
-    harness's before/after diff would collect as agent output, and the
-    container is pointed at it by its container spelling, never a literal."""
+    """No new top-level workspace entry for the artifact diff; container path, not a literal."""
     _install_fake_emulator(monkeypatch)
     state_dir = tmp_path / "state"
     state_dir.mkdir()
