@@ -213,8 +213,8 @@ def test_vertex_env_points_the_container_at_the_emulator(
     assert host == "host.docker.internal"
     assert port.isdigit()
     assert env["GCE_METADATA_IP"] == env["GCE_METADATA_HOST"]
-    # Nothing is minted until the agent actually asks for a token.
-    assert minted == []
+    # Minted once up front, so a bad grant fails here rather than mid-run.
+    assert len(minted) == 1
 
 
 def test_the_service_account_argument_overrides_the_env(
@@ -261,6 +261,8 @@ def test_token_endpoint_serves_an_impersonated_token(
             "print-access-token",
             f"--impersonate-service-account={_SA}",
             "--scopes=https://www.googleapis.com/auth/cloud-platform",
+            # The advertised lifetime is the real one, by construction.
+            f"--lifetime={model_providers._TOKEN_LIFETIME_SEC}s",
         ]
     ]
 
@@ -300,12 +302,51 @@ def test_a_failed_mint_is_reported_with_the_iam_remedy(monkeypatch: pytest.Monke
         )
 
     monkeypatch.setattr(model_providers, "run", failing_run)
-    sandbox_credential_env(resolve_provider("google-vertex"), project=_PROJECT)
-    (emulator,) = model_providers._EMULATORS.values()
+    # Raised from the recipe itself, before any container starts.
     with pytest.raises(ConfigError) as exc:
-        emulator.token()
+        sandbox_credential_env(resolve_provider("google-vertex"), project=_PROJECT)
     assert "PERMISSION_DENIED" in str(exc.value)
     assert "serviceAccountTokenCreator" in str(exc.value)
+
+
+def test_a_failed_refill_is_a_500_with_the_remedy_not_a_dropped_socket(
+    minted: list[list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(VERTEX_SANDBOX_SA_ENV, _SA)
+    sandbox_credential_env(resolve_provider("google-vertex"), project=_PROJECT)
+    (emulator,) = model_providers._EMULATORS.values()
+
+    def failing_run(cmd: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=list(cmd), returncode=1, stdout="", stderr="PERMISSION_DENIED"
+        )
+
+    # The grant is revoked mid-run and the token is inside the refresh margin.
+    monkeypatch.setattr(model_providers, "run", failing_run)
+    emulator._expires_at = time.monotonic() + 10
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        _get(emulator, "/computeMetadata/v1/instance/service-accounts/default/token")
+    assert exc.value.code == 500
+    assert exc.value.headers["Metadata-Flavor"] == "Google"
+    body = exc.value.read().decode("utf-8")
+    assert "PERMISSION_DENIED" in body
+    assert "serviceAccountTokenCreator" in body
+
+
+def test_expires_in_counts_down_between_requests(
+    minted: list[list[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(VERTEX_SANDBOX_SA_ENV, _SA)
+    sandbox_credential_env(resolve_provider("google-vertex"), project=_PROJECT)
+    (emulator,) = model_providers._EMULATORS.values()
+    path = "/computeMetadata/v1/instance/service-accounts/default/token"
+    first = json.loads(_get(emulator, path)[2])["expires_in"]
+    emulator._expires_at -= 1000
+    second = json.loads(_get(emulator, path)[2])["expires_in"]
+    # The SDK schedules its refresh off this number, so it must be the real
+    # remaining life of the one cached token, not a fresh 3600 each time.
+    assert first - 1001 <= second <= first - 999
+    assert len(minted) == 1
 
 
 def test_the_mint_is_bounded_and_a_hang_is_a_config_error(
@@ -322,10 +363,8 @@ def test_the_mint_is_bounded_and_a_hang_is_a_config_error(
 
     monkeypatch.setenv(VERTEX_SANDBOX_SA_ENV, _SA)
     monkeypatch.setattr(model_providers, "run", hanging_run)
-    sandbox_credential_env(resolve_provider("google-vertex"), project=_PROJECT)
-    (emulator,) = model_providers._EMULATORS.values()
     with pytest.raises(ConfigError) as exc:
-        emulator.token()
+        sandbox_credential_env(resolve_provider("google-vertex"), project=_PROJECT)
     assert _SA in str(exc.value)
     assert "bounded at" in str(exc.value)
     assert timeouts == [model_providers._MINT_TIMEOUT_SEC]
@@ -395,8 +434,8 @@ def test_the_residency_ping_answers_with_the_flavor_header(
 def test_unserved_paths_are_404_not_proxied(
     minted: list[list[str]], monkeypatch: pytest.MonkeyPatch, path: str
 ) -> None:
-    # This is an emulator of three endpoints, never a metadata proxy: the
-    # container must not be able to read anything the real server would serve.
+    # An emulator of the handful of paths the auth libraries read, never a
+    # metadata proxy: the container must not see anything else the real server serves.
     monkeypatch.setenv(VERTEX_SANDBOX_SA_ENV, _SA)
     sandbox_credential_env(resolve_provider("google-vertex"), project=_PROJECT)
     (emulator,) = model_providers._EMULATORS.values()
@@ -418,4 +457,5 @@ def test_a_request_without_the_flavor_header_is_refused(
             flavor=False,
         )
     assert exc.value.code == 403
-    assert minted == []
+    # Only the up-front mint; the refused request itself minted nothing.
+    assert len(minted) == 1
