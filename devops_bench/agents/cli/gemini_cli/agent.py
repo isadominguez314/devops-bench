@@ -215,7 +215,8 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
                 "express mode)"
             )
         overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
-        if config.sandbox is not None:
+        if config.sandbox is not None and not (config.api_key or os.environ.get("GOOGLE_API_KEY")):
+            # A key crosses the boundary on its own; only a keyless (ADC) run needs the recipe.
             overlay.update(sandbox_credential_env(spec, project=project))
     else:
         # Pin off explicitly so an ambient GOOGLE_GENAI_USE_VERTEXAI=true can't reroute the run.
