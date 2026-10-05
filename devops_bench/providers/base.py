@@ -106,17 +106,14 @@ class Provider(ABC):
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
         """Describe how a sandboxed agent container reaches this cluster.
 
-        Every provider must override this. The plan must carry the
-        ``kubectl_context`` pin naming the context this cluster wrote (unpinned
-        would mint the agent's credential on the ambient current-context). The
-        sandbox already rewrites a loopback server to ``host.docker.internal``;
-        add more only when that generic step cannot infer it: a Docker network
-        to join, or an in-network hostname.
+        Every provider must override this with a plan pinned via
+        ``kubectl_context`` to the context this cluster wrote; add a Docker
+        network or in-network hostname only when the generic loopback rewrite
+        cannot infer the endpoint.
 
         Raises:
-            SandboxError: Always, from this default: a provider that never
-                overrode it cannot be sandboxed, and that must surface as a
-                plain refusal rather than a run on the wrong cluster.
+            SandboxError: Always, from this default; an un-overridden provider
+                cannot be sandboxed.
         """
         raise SandboxError(
             f"provider {type(self).__name__} does not implement sandbox_network_plan; a "

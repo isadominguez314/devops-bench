@@ -14,27 +14,17 @@
 
 """The single source of truth for agent model-provider config.
 
-Every harness consumes the same ``AGENT_PROVIDER`` / ``AGENT_MODEL`` /
-``AGENT_API_KEY`` contract through :func:`resolve_provider`, so a config that
-works for one harness behaves identically for the others. A raw provider alias
-resolves to a :class:`ProviderSpec` carrying both axes the harnesses need: the
-adapter family (which models-layer client to build) and the backend / transport
-/ key-routing details (which oc wire-provider, which API-key env var(s), and
-whether the backend authenticates without a key).
+Every harness resolves ``AGENT_PROVIDER`` / ``AGENT_MODEL`` / ``AGENT_API_KEY``
+through :func:`resolve_provider`, which maps a raw alias to a
+:class:`ProviderSpec`: adapter family plus backend, key routing and whether the
+backend works keyless. Lives in ``core`` so the models layer and the CLI
+harnesses both import it without a cycle or a provider SDK; named
+``model_providers`` to keep it apart from :mod:`devops_bench.providers` (cloud
+infra).
 
-Lives in ``core`` (not ``models``/``agents``) so both the models layer and the
-CLI harnesses import it without an import cycle and without pulling any provider
-SDK. Named ``model_providers`` to avoid confusion with
-:mod:`devops_bench.providers` (the cloud/infra OpenTofu providers).
-
-This module also owns the **mint-and-inject credential recipes** for the keyless
-backends — see :func:`sandbox_credential_env`. A key-based provider needs
-nothing from them (its key is already in the env overlay and crosses the sandbox
-boundary by value); a keyless backend authenticates through ambient cloud
-identity, which the sandbox deliberately strips, so it needs a host-side recipe
-that mints a narrow short-lived credential and injects it explicitly. Per the
-proposal's review rule, that cloud-specific code lives here — in the
-model-credential layer — and never in :mod:`devops_bench.agents.sandbox`.
+Also owns the credential recipes keyless backends need under the sandbox
+(:func:`sandbox_credential_env`). That cloud-specific code lives here, never in
+:mod:`devops_bench.agents.sandbox`.
 """
 
 from __future__ import annotations
@@ -72,10 +62,8 @@ class ProviderSpec(BaseModel):
             ``MODELS.get`` (e.g. ``gemini`` / ``claude`` / ``ollama``).
         oc_provider: openclaw wire-provider id used in ``provider/model`` and the
             per-run ``_PROVIDER_TRANSPORT`` lookup.
-        api_key_envs: Env var name(s) a CLI harness sets from ``config.api_key``.
-            Empty for ``anthropic-vertex`` / ``anthropic-bedrock`` / ``ollama``
-            (no key is ever threaded). ``google-vertex`` is keyless-ok but still
-            routes a *provided* key to ``GOOGLE_CLOUD_API_KEY``.
+        api_key_envs: Env var name(s) a CLI harness sets from ``config.api_key``;
+            empty where no key is ever threaded.
         keyless_ok: Whether the backend can authenticate without a key (Vertex
             ADC, Bedrock AWS creds, local ollama).
         backend: Adapter backend hint (``"vertex"`` / ``"bedrock"``), or ``None``
@@ -92,13 +80,9 @@ class ProviderSpec(BaseModel):
     backend: str | None = None
 
 
-# Canonical provider id -> spec. Two axes are encoded here: ``adapter_family``
-# (``google`` and ``google-vertex`` both build the ``gemini`` adapter) and the
-# backend/transport/key-routing (which differ between them). Vertex and Bedrock
-# are keyless-ok (ADC / AWS creds) and need no key; ``anthropic-vertex`` /
-# ``anthropic-bedrock`` / ``ollama`` carry empty ``api_key_envs`` so a key is
-# never forced onto them, while ``google-vertex`` still routes a provided key to
-# ``GOOGLE_CLOUD_API_KEY`` (the vertex transport var, not the google-genai one).
+# Canonical id -> spec. ``google`` and ``google-vertex`` share the ``gemini``
+# adapter but differ in backend and key routing; specs with empty
+# ``api_key_envs`` never have a key forced onto them.
 _SPECS: dict[str, ProviderSpec] = {
     "google": ProviderSpec(
         canonical="google",
@@ -158,8 +142,7 @@ _SPECS: dict[str, ProviderSpec] = {
     ),
 }
 
-# Raw alias (lowercased) -> canonical id. Company/runtime names and underscore
-# spellings map onto the canonical wire ids above.
+# Raw alias (lowercased) -> canonical id.
 _ALIASES: dict[str, str] = {
     "gemini": "google",
     "google": "google",
@@ -216,77 +199,49 @@ def resolve_provider(provider: str | None, *, default: str = "google") -> Provid
 # Keyless-backend credential recipes for sandboxed runs
 # --------------------------------------------------------------------------
 #
-# A sandboxed agent has no ambient cloud identity by construction: the
-# operator's gcloud config is not mounted, GOOGLE_APPLICATION_CREDENTIALS and
-# CLOUDSDK_CONFIG never cross the boundary, and on a cloud VM the link-local
-# metadata endpoint is blocked to containers by the DOCKER-USER rule
-# ``vm-setup.sh`` installs. That is the whole point — it is also why every
-# Application Default Credentials lookup inside the container fails.
+# A sandboxed agent has no ambient cloud identity: gcloud config is not
+# mounted, the credential env vars never cross, and the bastion blocks the
+# metadata endpoint to containers, so every ADC lookup inside fails.
 #
-# For Vertex the recipe is a **metadata-server emulator**: a small host-side
-# HTTP server speaking the subset of the GCE metadata protocol that Google's
-# auth libraries use to obtain a token, backed by an impersonated token for a
-# service account that holds ``roles/aiplatform.user`` and nothing else. The
-# container is pointed at it with GCE_METADATA_HOST / GCE_METADATA_IP /
-# METADATA_SERVER_DETECTION.
-#
-# Four simpler things were tried first and none of them work:
-#
-# * There is no supported way to hand the SDK a bare access token.
-# * No ADC file format carries one — ``authorized_user`` needs a refresh token
-#   and ``external_account`` needs a workload-identity pool.
-# * ``GOOGLE_API_KEY`` + ``GOOGLE_GENAI_USE_VERTEXAI`` is Vertex *express mode*
-#   only; a standard project answers ``401: API keys are not supported by this
-#   API``.
-# * Service-account key files are refused by
-#   ``constraints/iam.disableServiceAccountKeyCreation``.
+# For Vertex the recipe is a metadata-server emulator: a host-side HTTP server
+# speaking the slice of the GCE metadata protocol the auth libraries use, backed
+# by an impersonated token for a service account holding only
+# ``roles/aiplatform.user``. Simpler routes do not work: the SDK takes no bare
+# token, no ADC file format carries one, ``GOOGLE_API_KEY`` on Vertex is
+# express mode only, and SA key files are refused by org policy.
 
-# Host-side env var naming the service account the emulator impersonates. It
-# carries the ``BENCH_`` prefix deliberately: the sandbox deny filter drops
-# that prefix, and this is operator configuration that has no business inside
-# the container — only the minted token crosses.
+# Service account the emulator impersonates. BENCH_-prefixed on purpose: the
+# deny filter keeps it host-side; only the minted token crosses.
 VERTEX_SANDBOX_SA_ENV = "BENCH_VERTEX_SANDBOX_SA"
 
-# Hostname the container uses to reach the emulator. ``SandboxExecutor.wrap_argv``
-# passes ``--add-host host.docker.internal:host-gateway`` on every run, so this
-# resolves to the host from any Docker network the run might join.
+# ``wrap_argv`` --add-host's this to the host gateway on every run.
 _EMULATOR_CONTAINER_HOST = "host.docker.internal"
 
-# The emulator binds on all interfaces rather than loopback. It has to: on
-# Linux the container reaches the host at the bridge gateway address, and a
-# server bound to 127.0.0.1 does not answer there (Docker Desktop's proxy
-# hides this on macOS). Exposure is bounded by the host firewall, by an
-# ephemeral port, by the Metadata-Flavor header check below, and above all by
-# what the token is worth: one project's ``aiplatform.user``, for an hour.
+# All interfaces, not loopback: on Linux the container reaches the host at the
+# bridge gateway, which 127.0.0.1 does not answer. Exposure is bounded by the
+# host firewall, the ephemeral port, the Metadata-Flavor check and the token's
+# narrow scope.
 _EMULATOR_BIND_HOST = "0.0.0.0"
 
-# Scope requested for the impersonated token. Vertex requires cloud-platform;
-# the narrowing is done by the service account's IAM role, not by the scope.
+# Vertex requires cloud-platform; the SA's IAM role does the narrowing.
 _TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
-# gcloud mints an impersonated token fresh on every call (it never caches
-# them) with exactly this lifetime, pinned via --lifetime, so the countdown the
-# emulator serves from its own clock is the token's real expiry. Refill once
-# less than the margin is left, so no request gets a token that dies mid-call.
+# gcloud mints impersonated tokens fresh (never cached) with exactly this
+# lifetime, so the countdown served from our clock is the real expiry.
 _TOKEN_LIFETIME_SEC = 3600
 _TOKEN_REFRESH_MARGIN_SEC = 300
 
-# Ceiling on one mint. The call is a single IAM round-trip, so a minute means
-# something is wedged (a prompting credential helper, a dead network) — and a
-# mint runs under the emulator's lock, so left unbounded it would block every
-# request thread behind it for as long as gcloud cares to hang.
+# A mint holds the emulator's lock, so a wedged gcloud must not block every
+# request behind it.
 _MINT_TIMEOUT_SEC = 60
 
-# Every metadata response carries this header, and (per the real server's
-# contract) every request must carry it too.
+# Required on every request and echoed on every response, as the real server does.
 _METADATA_FLAVOR_HEADER = "Metadata-Flavor"
 _METADATA_FLAVOR = "Google"
 
 _METADATA_PREFIX = "/computeMetadata/v1/"
 
-# One emulator per (service account, project) per process, reused across the
-# runs of a matrix. The server thread is a daemon, so it needs no teardown
-# hook: it dies with the harness process.
+# One per (service account, project) per process; a daemon thread, no teardown.
 _EMULATORS: dict[tuple[str, str], _VertexMetadataEmulator] = {}
 _EMULATORS_LOCK = threading.Lock()
 
@@ -296,34 +251,25 @@ def sandbox_credential_env(
 ) -> dict[str, str]:
     """Build the env a *sandboxed* agent needs to authenticate to ``spec``'s backend.
 
-    Keyed off :attr:`ProviderSpec.backend`, so a new keyless backend is one
-    branch here rather than a change at every harness call site. Key-based
-    providers get an empty mapping — their key is already in the overlay and
-    crosses the boundary on its own.
-
-    Callers invoke this only for a sandboxed run; on an unsandboxed run the
-    ambient ADC the host process already has is the right credential and this
-    must not be called, so that the sandbox flag stays byte-for-byte
-    behaviour-preserving when off.
+    Keyed off :attr:`ProviderSpec.backend`. Key-based providers get ``{}``;
+    their key is already in the overlay. Call this only for a sandboxed run; an
+    unsandboxed process already has ambient ADC.
 
     Args:
         spec: The run's resolved provider spec.
-        project: Google Cloud project the run bills to, as already resolved by
-            the caller. Required for the Vertex recipe.
-        service_account: Service account to impersonate, defaulting to
+        project: Cloud project the run bills to. Required for Vertex.
+        service_account: Account to impersonate, defaulting to
             ``$BENCH_VERTEX_SANDBOX_SA``. It should hold ``roles/aiplatform.user``
-            and nothing else, and the host's own identity needs
-            ``roles/iam.serviceAccountTokenCreator`` on it.
+            only; the host identity needs ``roles/iam.serviceAccountTokenCreator``
+            on it.
 
     Returns:
-        Env vars to merge into the overlay that crosses the boundary. Empty for
-        a backend that needs no recipe.
+        Env vars to merge into the boundary overlay; empty when no recipe is needed.
 
     Raises:
-        ConfigError: If the backend is keyless but has no recipe yet, or the
-            Vertex recipe is missing its project / service account, or the
-            token mint fails. Never returns a partial answer: a sandboxed run
-            that cannot authenticate must fail loud rather than degrade.
+        ConfigError: A keyless backend with no recipe, a Vertex recipe missing
+            its project or service account, or a failed mint. Never a partial
+            answer.
     """
     if spec.backend == "vertex":
         return _vertex_metadata_env(project=project, service_account=service_account)
@@ -353,19 +299,14 @@ def _vertex_metadata_env(*, project: str | None, service_account: str | None) ->
             "metadata emulator serves it to the agent's SDK as the run's project"
         )
     emulator = _get_emulator(account, project.strip())
-    # Mint up front: a missing IAM grant fails the run here, before the agent
-    # starts, with the remedy — not mid-run as a dropped connection.
+    # Mint now so a missing grant fails here, before the agent starts.
     emulator.token()
     return {
-        # Both spellings: the Python auth library reads GCE_METADATA_HOST for
-        # the base URL and GCE_METADATA_IP for its reachability probe; the
-        # Node library the Gemini CLI embeds prefers GCE_METADATA_IP. Neither
-        # takes a scheme, both take host:port.
+        # Python auth reads GCE_METADATA_HOST, the Node library GCE_METADATA_IP;
+        # both host:port, no scheme.
         "GCE_METADATA_HOST": emulator.address,
         "GCE_METADATA_IP": emulator.address,
-        # Skip the residency probe outright. Without this the library may
-        # decide it is not on GCE at all (no BIOS marker in a container) and
-        # never ask the emulator for a token.
+        # Skip the GCE residency probe, which fails inside a container.
         "METADATA_SERVER_DETECTION": "assume-present",
     }
 
@@ -385,10 +326,9 @@ def _get_emulator(service_account: str, project: str) -> _VertexMetadataEmulator
 class _VertexMetadataEmulator:
     """A GCE metadata server serving one impersonated, ``aiplatform``-scoped token.
 
-    Only the handful of paths Google's auth libraries actually read are served;
-    everything else is a 404, so this cannot be mistaken for (or used as) a
-    general metadata proxy. The token is minted when the emulator is handed
-    out, so a bad grant fails before the agent starts, and refilled in place.
+    Serves only the paths the auth libraries read; everything else is a 404, so
+    it is never a general metadata proxy. The token is minted up front and
+    refilled in place.
     """
 
     def __init__(self, service_account: str, project: str) -> None:
@@ -428,11 +368,7 @@ class _VertexMetadataEmulator:
         )
 
     def stop(self) -> None:
-        """Shut the server down.
-
-        The harness never calls this: the thread is a daemon and dies with the
-        process. The tests use it to release the port between cases.
-        """
+        """Shut the server down; only the tests call this (the thread is a daemon)."""
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -449,13 +385,7 @@ class _VertexMetadataEmulator:
             return self._token, int(remaining)
 
     def _mint(self) -> str:
-        """Mint a fresh access token by impersonating the scoped service account.
-
-        Shelling out to ``gcloud`` rather than importing ``google.auth`` keeps
-        this module's "pulls no provider SDK" property intact, and matches how
-        the rest of the benchmark reaches GCP
-        (:mod:`devops_bench.providers.gcp`, the antigravity harness).
-        """
+        """Mint a token by impersonating the scoped SA via ``gcloud`` (no SDK import)."""
         try:
             completed = run(
                 [
@@ -472,10 +402,7 @@ class _VertexMetadataEmulator:
         except SubprocessError as exc:
             raise ConfigError(
                 f"could not mint a Vertex access token by impersonating "
-                f"{self.service_account}: {exc}. The mint is bounded at "
-                f"{_MINT_TIMEOUT_SEC}s so a wedged gcloud (a prompting credential "
-                "helper, a dead network) cannot hold the emulator's lock and block "
-                "every request behind it"
+                f"{self.service_account}: {exc} (the mint is bounded at {_MINT_TIMEOUT_SEC}s)"
             ) from exc
         token = (completed.stdout or "").strip()
         if completed.returncode != 0 or not token:
@@ -483,9 +410,7 @@ class _VertexMetadataEmulator:
                 f"could not mint a Vertex access token by impersonating "
                 f"{self.service_account}: gcloud exited {completed.returncode}: "
                 f"{(completed.stderr or '').strip() or '<no stderr>'}. The host identity "
-                "needs roles/iam.serviceAccountTokenCreator on that service account "
-                "(if this worked before, verify the binding still exists — some "
-                "organizations expire or strip IAM grants)"
+                "needs roles/iam.serviceAccountTokenCreator on that service account"
             )
         return token
 
@@ -494,23 +419,20 @@ def _handler_factory(emulator: _VertexMetadataEmulator) -> type[BaseHTTPRequestH
     """Build the request handler class bound to ``emulator``."""
 
     class _MetadataHandler(BaseHTTPRequestHandler):
-        # HTTP/1.1 so the auth libraries' keep-alive connections are honoured
-        # rather than being closed under them after every request.
+        # HTTP/1.1 keeps the auth libraries' keep-alive connections open.
         protocol_version = "HTTP/1.1"
         server_version = "devops-bench-metadata-emulator"
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
             if self.headers.get(_METADATA_FLAVOR_HEADER) != _METADATA_FLAVOR:
-                # The real server enforces this too; here it also means a
-                # stray probe on the host's network cannot lift a token.
+                # As the real server does; also keeps a stray probe from lifting a token.
                 self._respond(403, "text/plain", "Missing Metadata-Flavor:Google header.")
                 return
             path = urlsplit(self.path).path
             try:
                 body = _route(emulator, path)
             except ConfigError as exc:
-                # A refill can fail mid-run (grant revoked); answer with the
-                # remedy rather than dropping the socket on the SDK.
+                # A refill can fail mid-run; return the remedy, not a dropped socket.
                 _log.error("metadata emulator: %s", exc)
                 self._respond(500, "text/plain", str(exc))
                 return
@@ -530,8 +452,7 @@ def _handler_factory(emulator: _VertexMetadataEmulator) -> type[BaseHTTPRequestH
             self.wfile.write(payload)
 
         def log_message(self, format: str, *args: object) -> None:
-            # BaseHTTPRequestHandler writes to stderr by default, which would
-            # interleave with the harness's own output on every token fetch.
+            # Keep per-request logging off the harness's stderr.
             _log.debug("metadata emulator: " + format, *args)
 
     return _MetadataHandler
@@ -540,13 +461,10 @@ def _handler_factory(emulator: _VertexMetadataEmulator) -> type[BaseHTTPRequestH
 def _route(emulator: _VertexMetadataEmulator, path: str) -> tuple[str, str] | None:
     """Map a metadata path to ``(content_type, body)``, or ``None`` for a 404.
 
-    Both the ``default`` alias and the account's own email are accepted as the
-    service-account segment, because the libraries use each in different code
-    paths.
+    ``default`` and the account's email are both accepted as the account segment.
     """
     if path in ("/", _METADATA_PREFIX):
-        # The residency ping. The Metadata-Flavor response header is the whole
-        # answer; the body is ignored.
+        # Residency ping; the response header is the whole answer.
         return "text/plain", "computeMetadata/\n"
     if not path.startswith(_METADATA_PREFIX):
         return None
