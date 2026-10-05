@@ -156,18 +156,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Everything that reads the environment runs inside the try, so a
-    # malformed value (a non-integer EVAL_LIMIT, an unknown BENCH_LOG_LEVEL)
-    # exits 2 like every other configuration error, not as a traceback.
+    # Everything that reads the env sits inside the try so a malformed value exits 2.
     try:
-        # Attach the stderr handler for the package logger. Without this every
-        # _log call in the library is silent in a real run: the package root
-        # carries a NullHandler (so library use stays quiet by default), which
-        # also suppresses logging's last-resort fallback. The harness makes
-        # operator-facing promises through warnings — e.g. "task X declares
-        # requires_unsandboxed; running it OUTSIDE the agent sandbox" — and a
-        # promise nobody can see is not kept. Idempotent, honours
-        # BENCH_LOG_LEVEL. After parse_args so --help never depends on it.
+        # The package logger carries a NullHandler, so without this every library
+        # warning is silent. After parse_args so --help never depends on the env.
         try:
             configure_logging()
         except ValueError as exc:

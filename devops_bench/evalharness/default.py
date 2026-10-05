@@ -886,12 +886,8 @@ class DefaultEvalHarness(Harness):
                     "the sandbox seam; refusing the whole batch rather than "
                     "provisioning a cluster per task just to fail each one"
                 )
-            # A container the harness starts is normally reaped around its
-            # own run, but a harness process killed outright (Ctrl-C, OOM, a
-            # host reboot) never gets to run that ``finally``. Sweeping once
-            # here, before this batch's own containers exist, catches exactly
-            # that leak. The sweep itself decides whether BENCH_PARALLEL makes
-            # the match too broad to be safe.
+            # Reap containers a killed harness never got to reap, before this
+            # batch's own exist; the sweep itself applies the BENCH_PARALLEL gate.
             try:
                 agent_sandbox.sweep_stray_containers(
                     owner=self._agent_config.sandbox.owner, parallel=self.parallel
@@ -903,10 +899,8 @@ class DefaultEvalHarness(Harness):
 
         # Snapshot the home once before anything runs, purely to record which
         # leftovers predate the batch. Those are genuine prior-run artifacts
-        # and may always fingerprint. Skipped when no task will see the
-        # operator home: a sandboxed task sees its own, but a
-        # ``requires_unsandboxed`` task inside a sandboxed batch still runs
-        # against the real one.
+        # and may always fingerprint. Skipped unless some task runs ambient
+        # (a ``requires_unsandboxed`` task does, even in a sandboxed batch).
         pre_existing: frozenset[str] = frozenset()
         if not sandboxed or any(task.requires_unsandboxed for task in tasks):
             pre_existing = frozenset(rule.source for rule in self._inventory_home() if rule.source)
@@ -916,8 +910,7 @@ class DefaultEvalHarness(Harness):
         # rules come from re-scanning the operator home before each agent
         # runs; a sandboxed task's home does not exist until ``_run_one``
         # builds the workspace, so its rules come back from that call. Decided
-        # per task, not per batch: a ``requires_unsandboxed`` task runs
-        # ambient inside a sandboxed batch and needs the ambient inventory.
+        # per task: a ``requires_unsandboxed`` task runs ambient in a sandboxed batch.
         created_by: dict[str, str] = {}
         prev_task_name: str | None = None
         task_inventories: list[tuple[SensitiveAccessRule, ...]] = []

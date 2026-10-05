@@ -660,8 +660,7 @@ def test_executor_run_rejects_stdin_input(tmp_path: Path) -> None:
 def test_executor_run_accepts_an_empty_stdin_payload(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``input=""`` is how a host-side harness closes stdin; the container has
-    no stdin anyway, so the executor must treat it as equivalent, not refuse."""
+    """``input=""`` means closed stdin, which the container already has; not a refusal."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     seen: list[list[str]] = []
 
@@ -1237,8 +1236,7 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
 
 
 def test_remap_chowns_are_time_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Both chown containers run under the housekeeping timeout: a wedged
-    daemon must not hang the harness, least of all from the post-run finally."""
+    """A wedged daemon must not hang the harness from either chown pass."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
@@ -1258,8 +1256,7 @@ def test_remap_chowns_are_time_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path
 def test_executor_run_handback_oserror_does_not_mask_a_successful_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A docker binary that vanishes mid-run raises OSError, not SubprocessError;
-    from inside the finally that would replace the agent's real result."""
+    """An OSError from the finally-block chown must not replace the agent's result."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
@@ -1309,8 +1306,7 @@ def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
 
 
 def test_unscoped_sweep_is_skipped_under_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Without an owner the prefix match could reap a sibling harness's live
-    container, so a parallel batch must not sweep at all."""
+    """An unscoped prefix match could reap a sibling harness's live container."""
     monkeypatch.setattr(sandbox, "run", lambda *a, **kw: pytest.fail("unscoped docker call"))
     sandbox.sweep_stray_containers(parallel=True)
 
@@ -1318,8 +1314,7 @@ def test_unscoped_sweep_is_skipped_under_parallel(monkeypatch: pytest.MonkeyPatc
 def test_unscoped_sweep_reaps_every_prefixed_container_when_serial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A serial host with no owner id is the crash-recovery case the sweep
-    exists for: every container carrying the benchmark prefix is a stray."""
+    """Serial, no owner: every prefixed container is a stray (the crash-recovery case)."""
     calls: list[list[str]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
@@ -1375,8 +1370,7 @@ def test_spec_from_env_carries_a_valid_owner() -> None:
 
 @pytest.mark.parametrize("owner", ["bad-owner", "a" * 129, "sp ace"])
 def test_spec_from_env_rejects_a_malformed_owner(owner: str) -> None:
-    """Validated at opt-in, before any cluster exists: raised from inside the
-    executor it would be converted into an errored agent result per task."""
+    """Refused at opt-in; from inside the executor it would score as an errored agent."""
     with pytest.raises(SandboxError, match="BENCH_AGENT_SANDBOX_OWNER"):
         sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": "1", "BENCH_AGENT_SANDBOX_OWNER": owner})
 

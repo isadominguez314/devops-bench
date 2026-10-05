@@ -1479,8 +1479,7 @@ def test_inventory_covers_fixture_mounts_at_their_container_paths(
 def test_stray_container_sweep_is_told_about_parallel(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parallel: bool
 ) -> None:
-    """The sweep always runs once per batch and is handed BENCH_PARALLEL; it
-    decides itself whether an unscoped prefix match is too broad to act on."""
+    """The sweep runs once per batch and is handed BENCH_PARALLEL to apply itself."""
     if parallel:
         monkeypatch.setenv("BENCH_PARALLEL", "1")
     else:
@@ -1692,10 +1691,7 @@ def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -
 def test_sandbox_exempt_task_gets_the_ambient_inventory(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``requires_unsandboxed`` task in a sandboxed batch runs against the
-    operator's real home, so it must get the ambient inventory, not the empty
-    sandbox one: the one task that can reach the home is the one the detector
-    would otherwise have no rules for."""
+    """An exempt task runs against the real home, so it needs the ambient inventory."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     (fake_home / "old-notes.txt").write_text("leftover from a previous run\n", encoding="utf-8")

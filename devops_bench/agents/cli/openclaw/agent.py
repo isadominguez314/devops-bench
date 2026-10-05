@@ -136,11 +136,8 @@ _OPENCLAW_STATE_DIRNAME = "state"
 _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
-# Bare model ids (the part after ``provider/``) absent from openclaw's built-in
-# catalog, per oc provider; the harness registers these per-run (see
-# :func:`_build_model_override`). Keyed by provider because the override
-# replaces oc's provider entry: the same id on a provider not listed here must
-# keep passing through to oc's own catalog untouched.
+# Bare model ids absent from oc's built-in catalog, per oc provider; registered
+# per-run by :func:`_build_model_override`. Other providers pass through to oc.
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
 _GEMINI_CATALOG_OVERRIDES = frozenset({"gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.8-flash"})
 _CATALOG_OVERRIDES: dict[str, frozenset[str]] = {
@@ -169,10 +166,8 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
         "apiKey": "gcp-vertex-credentials",
     },
 }
-# Per-run layout of the node-fetch->native-fetch ESM loader shim (see
-# :func:`_write_node_fetch_shim`), written under the run's state dir: inside
-# the workspace so the sandboxed container can see it, but not a new top-level
-# workspace entry, which the harness's artifact diff would attribute to the agent.
+# node-fetch->native-fetch loader shim (see :func:`_write_node_fetch_shim`), under
+# the state dir so the artifact diff does not attribute it to the agent.
 _NODE_FETCH_SHIM_DIRNAME = "node-fetch-shim"
 
 _NODE_FETCH_REGISTER_MJS = (
@@ -298,7 +293,7 @@ def _build_model_override(config: AgentConfig) -> dict:
     # A per-run provider entry *replaces* oc's built-in one, so it must pin a
     # transport; without one oc falls back to the OpenAI transport and 401s. Fail
     # loud rather than ship a broken (transport-less) entry for a provider we have
-    # not pinned (a consistency check between the two tables above).
+    # not pinned.
     if provider not in _PROVIDER_TRANSPORT:
         raise ConfigError(
             f"openclaw catalog override {model_id!r} has no pinned transport for "
@@ -335,8 +330,7 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
     Each MCP server entry inherits the run's ``KUBECONFIG`` (set by ``RunEnv``) as
     an explicit ``env`` so the MCP server (e.g. gke-mcp) reads the run-scoped
     cluster credentials directly instead of forcing the agent to re-fetch them.
-    Sandboxed, that is the container-side bind path: the host path is meaningless
-    inside the container, which is where the MCP server runs.
+    Sandboxed, that is the container-side bind path, where the MCP server runs.
     """
     payload: dict = {}
     servers = build_mcp_servers(mcp_servers)
@@ -395,17 +389,11 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
 
 
 def _sandbox_provider_env(config: AgentConfig, state_dir: Path) -> dict[str, str]:
-    """Forward explicit provider routing and give the container a model credential.
+    """Forward provider routing and give the container a model credential.
 
-    Sandbox-only: ``config.sandbox`` must be the task-completed spec, since the
-    shim path crosses the boundary in its container spelling.
-
-    A keyless Vertex run (``google-vertex`` or ``anthropic-vertex``) cannot see
-    the host's ADC, so it gets the shared metadata-emulator recipe from
-    :func:`~devops_bench.core.model_providers.sandbox_credential_env`, as
-    gemini_cli does: the metadata-host vars point the SDK at a host-side server
-    serving a narrowly scoped impersonated token, never at the VM's own
-    identity. A keyed run's key already crosses by value.
+    Needs the task-completed ``config.sandbox``. A keyless Vertex run gets the
+    metadata-emulator recipe (``sandbox_credential_env``, as gemini_cli does); a
+    key crosses by value.
     """
     overlay = {
         name: os.environ[name]
@@ -452,8 +440,7 @@ def _oc_model_flag(config: AgentConfig) -> str:
 def _oc_provider_or_none(config: AgentConfig) -> str | None:
     """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
 
-    Tolerant on purpose: :func:`_needs_anthropic_vertex_auth_profile` runs
-    before :func:`_build_env` has had its chance to fail loud on a typo.
+    Tolerant on purpose: its caller runs before :func:`_build_env` fails loud on a typo.
     """
     try:
         return resolve_provider(config.provider).oc_provider

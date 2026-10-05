@@ -68,8 +68,7 @@ _log = get_logger("agents.sandbox")
 # Opt-in so sandboxed runs can be A/B'd against ambient; unset is the pre-sandbox behavior.
 SANDBOX_ENV = "BENCH_AGENT_SANDBOX"
 IMAGE_ENV = "BENCH_SANDBOX_IMAGE"
-# Optional attempt id an orchestrator sets so parallel harnesses can tell their
-# own containers (and strays) apart; validated once, at opt-in time.
+# Optional attempt id scoping container names and the stray sweep; validated at opt-in.
 OWNER_ENV = "BENCH_AGENT_SANDBOX_OWNER"
 _OWNER_PATTERN = re.compile(r"[A-Za-z0-9_]{1,128}")
 CONTAINER_RUNTIME = "docker"
@@ -154,10 +153,10 @@ def _overlaps_bench_checkout(path: Path) -> bool:
 class SandboxSpec:
     """Everything the executor needs to wrap one run's agent in ``docker run``.
 
-    :func:`spec_from_env` yields the image and owner only; the eval harness
-    fills in the rest per task. ``fixture_mounts`` maps host path -> container
-    path (RW); ``env_allowlist`` lets named vars cross despite a deny rule;
-    ``owner`` scopes container names (and the stray sweep) to one attempt.
+    :func:`spec_from_env` yields the image and owner; the eval harness fills in
+    the rest per task. ``fixture_mounts`` maps host path -> container path (RW);
+    ``env_allowlist`` lets named vars cross despite a deny rule; ``owner`` scopes
+    container names and the stray sweep to one attempt.
     """
 
     image: str = ""
@@ -170,19 +169,13 @@ class SandboxSpec:
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
-    """Read the sandbox opt-in; ``None`` when off, :class:`SandboxError` on a typo.
-
-    A malformed owner id is a typo too, and fails here rather than per task:
-    raised from inside the executor it would be scored as an errored agent.
-    """
+    """Read the sandbox opt-in and owner; ``None`` when off, :class:`SandboxError` on a typo."""
     raw = (get_env(SANDBOX_ENV, env=env) or "").strip().lower()
     if raw in _SANDBOX_ENABLED_VALUES:
         owner = (get_env(OWNER_ENV, env=env) or "").strip()
+        # Checked here so a typo refuses the batch instead of erroring every task.
         if owner and not _OWNER_PATTERN.fullmatch(owner):
-            raise SandboxError(
-                f"{OWNER_ENV}={owner!r} must be 1-128 characters of [A-Za-z0-9_]; it names "
-                "this attempt's containers, so refusing rather than guess a spelling"
-            )
+            raise SandboxError(f"{OWNER_ENV}={owner!r} must be 1-128 characters of [A-Za-z0-9_]")
         return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip(), owner=owner)
     if raw in _SANDBOX_DISABLED_VALUES:
         return None
@@ -569,9 +562,8 @@ class SandboxExecutor:
     ) -> CompletedProcess:
         """Run ``cmd`` in the sandbox container; mirrors ``core.subprocess.run``.
 
-        ``env`` is rejected (credential-inheritance channel), as is any non-empty
-        ``input``: the container runs without ``-i``, so an empty payload is
-        already what it gets and passes through, but a real one would be lost.
+        ``env`` is rejected (credential-inheritance channel), as is a non-empty
+        ``input`` (no ``-i``, so it would be lost; an empty one is a no-op).
         Docker's own launch failures raise :class:`SandboxError` rather
         than masquerading as an agent exit code. The container is reaped by name
         on every exit path, since ``--rm`` does not fire when the client is
@@ -636,9 +628,7 @@ class SandboxExecutor:
 def container_name_for_workspace(workspace: Path, owner: str = "") -> str:
     """Deterministic container name tied 1:1 to the run's workspace directory.
 
-    ``owner`` (:attr:`SandboxSpec.owner`, already validated) adds a segment
-    that scopes the name to one attempt so parallel harnesses can sweep only
-    their own strays.
+    ``owner`` (:attr:`SandboxSpec.owner`) adds a segment scoping the name to one attempt.
     """
     return f"{_CONTAINER_NAME_PREFIX}{owner + '-' if owner else ''}{workspace.name}"
 
@@ -659,11 +649,8 @@ def kill_container(name: str) -> None:
 def sweep_stray_containers(*, owner: str = "", parallel: bool = False) -> None:
     """Best-effort reap of containers a prior crashed run left behind. Never raises.
 
-    With an ``owner`` (:attr:`SandboxSpec.owner`) only that attempt's containers
-    are swept, which is safe alongside other harnesses. Without one the match
-    is the shared name prefix, which cannot tell a crashed run's stray from a
-    sibling harness's live container, so ``parallel`` skips the sweep and
-    leaves the strays for the operator.
+    An ``owner`` scopes the sweep to that attempt. Without one the shared prefix
+    cannot tell a stray from a sibling harness's live container, so ``parallel`` skips it.
     """
     if not owner and parallel:
         _log.info(
