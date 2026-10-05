@@ -264,8 +264,10 @@ _EMULATOR_BIND_HOST = "0.0.0.0"
 # the narrowing is done by the service account's IAM role, not by the scope.
 _TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
-# Impersonated tokens last an hour. Refill once less than this is left, so a
-# request never gets a token that expires mid-generation.
+# gcloud mints an impersonated token fresh on every call (it never caches
+# them) with exactly this lifetime, pinned via --lifetime, so the countdown the
+# emulator serves from its own clock is the token's real expiry. Refill once
+# less than the margin is left, so no request gets a token that dies mid-call.
 _TOKEN_LIFETIME_SEC = 3600
 _TOKEN_REFRESH_MARGIN_SEC = 300
 
@@ -351,6 +353,9 @@ def _vertex_metadata_env(*, project: str | None, service_account: str | None) ->
             "metadata emulator serves it to the agent's SDK as the run's project"
         )
     emulator = _get_emulator(account, project.strip())
+    # Mint up front: a missing IAM grant fails the run here, before the agent
+    # starts, with the remedy — not mid-run as a dropped connection.
+    emulator.token()
     return {
         # Both spellings: the Python auth library reads GCE_METADATA_HOST for
         # the base URL and GCE_METADATA_IP for its reachability probe; the
@@ -382,9 +387,8 @@ class _VertexMetadataEmulator:
 
     Only the handful of paths Google's auth libraries actually read are served;
     everything else is a 404, so this cannot be mistaken for (or used as) a
-    general metadata proxy. The token is minted lazily on the first request and
-    refilled in place, which means a run that never calls the model never mints
-    a credential at all.
+    general metadata proxy. The token is minted when the emulator is handed
+    out, so a bad grant fails before the agent starts, and refilled in place.
     """
 
     def __init__(self, service_account: str, project: str) -> None:
@@ -424,7 +428,11 @@ class _VertexMetadataEmulator:
         )
 
     def stop(self) -> None:
-        """Shut the server down. Not needed for process exit (the thread is a daemon)."""
+        """Shut the server down.
+
+        The harness never calls this: the thread is a daemon and dies with the
+        process. The tests use it to release the port between cases.
+        """
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -456,6 +464,7 @@ class _VertexMetadataEmulator:
                     "print-access-token",
                     f"--impersonate-service-account={self.service_account}",
                     f"--scopes={_TOKEN_SCOPE}",
+                    f"--lifetime={_TOKEN_LIFETIME_SEC}s",
                 ],
                 check=False,
                 timeout=_MINT_TIMEOUT_SEC,
@@ -497,7 +506,14 @@ def _handler_factory(emulator: _VertexMetadataEmulator) -> type[BaseHTTPRequestH
                 self._respond(403, "text/plain", "Missing Metadata-Flavor:Google header.")
                 return
             path = urlsplit(self.path).path
-            body = _route(emulator, path)
+            try:
+                body = _route(emulator, path)
+            except ConfigError as exc:
+                # A refill can fail mid-run (grant revoked); answer with the
+                # remedy rather than dropping the socket on the SDK.
+                _log.error("metadata emulator: %s", exc)
+                self._respond(500, "text/plain", str(exc))
+                return
             if body is None:
                 self._respond(404, "text/plain", "Not Found")
                 return
