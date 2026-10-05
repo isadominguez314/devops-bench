@@ -1237,6 +1237,65 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
         executor.run(["gemini"])
 
 
+def test_remap_chowns_are_time_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Both chown containers run under the housekeeping timeout: a wedged
+    daemon must not hang the harness, least of all from the post-run finally."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+    timeouts: list[object] = []
+
+    def fake_run(argv, **kwargs):
+        if "chown" in argv:
+            timeouts.append(kwargs.get("timeout"))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    executor.run(["gemini"], check=False)
+    assert timeouts == [sandbox._HOUSEKEEPING_TIMEOUT_SEC] * 2
+
+
+def test_executor_run_handback_oserror_does_not_mask_a_successful_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A docker binary that vanishes mid-run raises OSError, not SubprocessError;
+    from inside the finally that would replace the agent's real result."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+
+    def fake_run(argv, **kwargs):
+        if "chown" in argv and "3998470835:1000" in argv:
+            raise FileNotFoundError("docker")
+        return SimpleNamespace(returncode=0, stdout="agent output", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with caplog.at_level("ERROR"):
+        result = executor.run(["gemini"], check=False)
+    assert result.stdout == "agent output"
+    assert "chown" in caplog.text
+
+
+def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_cannot_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+
+    def fake_run(argv, **kwargs):
+        if "chown" in argv:
+            raise FileNotFoundError("docker")
+        raise AssertionError("the agent container must not run when the pre-run chown fails")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with pytest.raises(SandboxError, match="chown"):
+        executor.run(["gemini"])
+
+
 def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -445,7 +445,7 @@ class SandboxExecutor:
         chown arbitrary ids either direction (including up past int32, which
         plain ``chown`` has no restriction on, unlike docker's ``--user``).
         """
-        argv = ["docker", "run", "--rm"]
+        argv = [CONTAINER_RUNTIME, "run", "--rm"]
         targets: list[str] = []
         for host_path, mount_path in self._remap_mounts():
             argv += ["-v", f"{host_path}:{mount_path}"]
@@ -463,8 +463,8 @@ class SandboxExecutor:
         """
         argv = self._chown_argv(_REMAP_UID, _REMAP_GID)
         try:
-            run(argv, check=True)
-        except SubprocessError as exc:
+            run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+        except (OSError, SubprocessError) as exc:
             raise SandboxError(
                 f"could not chown the workspace/fixtures to {_REMAP_UID}:{_REMAP_GID} "
                 "before starting the id-remapped agent container; running on would "
@@ -485,8 +485,8 @@ class SandboxExecutor:
         uid, gid = os.getuid(), os.getgid()
         argv = self._chown_argv(uid, gid)
         try:
-            run(argv, check=True)
-        except SubprocessError:
+            run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+        except (OSError, SubprocessError):
             _log.error(
                 "could not chown the workspace/fixtures back to %s:%s after the "
                 "id-remapped agent container exited; the artifacts are left owned "
