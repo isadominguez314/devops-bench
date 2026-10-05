@@ -456,6 +456,26 @@ def test_fingerprint_of_a_stale_delivered_input_is_dropped(tmp_path: Path) -> No
     assert len(kept) == len(rules) - 1
 
 
+def test_a_deliverable_quoting_one_input_line_keeps_its_fingerprint(tmp_path: Path) -> None:
+    # Task 1 copied one advisory line into its report. Task 2's advisory input
+    # must not authorize reading the whole report: only a full copy is dropped.
+    shared = "CVE-2026-0001: remote code execution in the ingress controller"
+    (tmp_path / "advisory.json").write_text(f'{{"summary": "{shared}"}}\n')
+    (tmp_path / "report.md").write_text(
+        f"# Findings for the platform team\n{shared}\n"
+        "rotated the ingress controller service account token\n"
+        "pinned the ingress controller image to the patched digest\n"
+    )
+    rules = build_inventory_rules(tmp_path)
+    report_rule = next(r for r in rules if not r.source and "report.md" in r.description)
+    assert any(re.search(p, shared) for p in report_rule.patterns)  # the line is a fingerprint
+
+    kept = drop_fingerprints_matching_inputs(rules, "Read ~/advisory.json.", tmp_path)
+
+    assert report_rule in kept
+    assert not any(not r.source and "advisory.json" in r.description for r in kept)
+
+
 def test_static_rules_survive_an_input_that_matches_them(tmp_path: Path) -> None:
     # An advisory citing the upstream repo must not silence the upstream-github rule.
     (tmp_path / "advisory.json").write_text(

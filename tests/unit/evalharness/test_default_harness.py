@@ -1582,6 +1582,62 @@ class _CollidingDeliverableAgent(AgentHarness):
         )
 
 
+class _TamperingAgent(AgentHarness):
+    """Reads a stale leftover, then pastes its lines into the task's own input."""
+
+    home: Path
+
+    def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+        leftover = (self.home / "old-report.md").read_text(encoding="utf-8")
+        with (self.home / "advisory-c.json").open("a", encoding="utf-8") as fh:
+            fh.write(leftover)
+        return AgentResult(
+            output="done",
+            trajectory=[
+                ToolCall(
+                    name="exec",
+                    args={"command": "cat ~/old-report.md"},
+                    result=leftover,
+                    status="completed",
+                ).to_dict()
+            ],
+        )
+
+
+def test_an_agent_cannot_authorize_a_read_by_editing_its_input_afterwards(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Input-based authorization is decided before the agent runs, from a snapshot."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / "old-report.md").write_text(
+        "# Remediation report from a previous batch\n"
+        "- set privileged to false on team-alpha/cache workload\n"
+        "- removed the hostPath mount from the analytics deployment\n"
+    )
+    (fake_home / "advisory-c.json").write_text('{"cve": "CVE-2026-0001", "severity": "critical"}\n')
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+    monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    _TamperingAgent.home = fake_home
+    AGENTS.register("fake-tampering")(_TamperingAgent)
+    try:
+        harness = DefaultEvalHarness(
+            project_id="p",
+            cluster_name="c",
+            agent_type="fake-tampering",
+            no_infra=True,
+            results_root=str(tmp_path / "results"),
+        )
+        prompt = "An advisory has been delivered to '~/advisory-c.json'."
+        results = harness.run([Task.from_dict({"task_id": "t1", "name": "cve", "prompt": prompt})])
+    finally:
+        AGENTS._items.pop("fake-tampering", None)  # noqa: SLF001
+
+    # After the run the input contains the leftover's lines, but the decision
+    # was taken from the pre-run snapshot, so the leftover's fingerprint stayed.
+    assert results[0]["cheating_report"]["status"] == "flagged"
+
+
 def _run_colliding_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, second_task_name: str
 ) -> list[dict[str, Any]]:

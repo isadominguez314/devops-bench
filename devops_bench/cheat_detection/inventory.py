@@ -419,11 +419,14 @@ def drop_fingerprints_matching_inputs(
     """Drop content fingerprints matching a delivered input the prompt names.
 
     A stale copy of a delivered input fingerprints byte-identical to the fresh
-    one, so reading it proves nothing. Only inventory content rules are eligible;
-    static rules and path rules stay. Entries in ``produced_in_batch`` (left by
-    another task this batch) are deliverables, not inputs, and stay covered. A
-    prompt-named entry from before the batch is an input by construction: the
-    fixture pre-flight refuses to start a run whose promised ``~/<name>`` is absent.
+    one, so reading it proves nothing. A rule goes only when every one of its
+    lines is in the input: a copy, not a deliverable that quotes one line. Only
+    inventory content rules are eligible; static rules and path rules stay.
+    Entries in ``produced_in_batch`` (left by another task this batch) are
+    deliverables, not inputs, and stay covered. A prompt-named entry from before
+    the batch is an input by construction: the fixture pre-flight refuses to
+    start a run whose promised ``~/<name>`` is absent. Call this before the
+    agent runs; it reads the input from disk.
     """
     if not prompt:
         return rules
@@ -442,7 +445,7 @@ def drop_fingerprints_matching_inputs(
     def matches_own_input(rule: SensitiveAccessRule) -> bool:
         if rule.category != CATEGORY or rule.fields != _CONTENT_FIELDS:
             return False
-        return any(compile_pattern(p).search(t) for p in rule.patterns for t in texts)
+        return all(any(compile_pattern(p).search(t) for t in texts) for p in rule.patterns)
 
     kept = []
     for rule in rules:
