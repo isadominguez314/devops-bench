@@ -978,6 +978,13 @@ _FAKE_EMULATOR_ENV = {
 }
 
 
+def _sandboxed(tmp_path: Path, **fields: Any) -> AgentConfig:
+    """An AgentConfig carrying a task-completed sandbox spec rooted at ``tmp_path``."""
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    return AgentConfig(sandbox=sandbox_mod.SandboxSpec(image="img", workspace=tmp_path), **fields)
+
+
 def _install_fake_emulator(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """Stub the shared Vertex credential recipe; returns the calls it received."""
     calls: list[dict[str, Any]] = []
@@ -999,14 +1006,43 @@ def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/host.json")
     calls = _install_fake_emulator(monkeypatch)
-    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="anthropic-vertex"), tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    overlay = oc_mod._sandbox_provider_env(
+        _sandboxed(tmp_path, provider="anthropic-vertex"), state_dir
+    )
     assert overlay["GOOGLE_CLOUD_PROJECT"] == "test-project"
     assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
     assert overlay["GOOGLE_CLOUD_API_KEY"] == "gcp-vertex-credentials"
     assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in overlay
-    assert (tmp_path / "node-fetch-shim" / "register.mjs").is_file()
     assert calls == [{"backend": "vertex", "project": "test-project"}]
+
+
+def test_sandbox_overlay_keeps_the_shim_out_of_the_artifact_diff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The shim is harness-owned. It lives under the state dir (an entry the
+    run already creates) rather than as a new top-level workspace entry the
+    harness's before/after diff would collect as agent output, and the
+    container is pointed at it by its container spelling, never a literal."""
+    _install_fake_emulator(monkeypatch)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    before = set(p.name for p in tmp_path.iterdir())
+    overlay = oc_mod._sandbox_provider_env(
+        _sandboxed(tmp_path, provider="google-vertex"), state_dir
+    )
+    assert set(p.name for p in tmp_path.iterdir()) == before
+    assert (state_dir / "node-fetch-shim" / "register.mjs").is_file()
+    assert overlay["NODE_OPTIONS"] == "--import=/workspace/state/node-fetch-shim/register.mjs"
+
+
+def test_sandbox_overlay_refuses_to_run_without_a_completed_spec(tmp_path: Path) -> None:
+    from devops_bench.core import SandboxError
+
+    with pytest.raises(SandboxError):
+        oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
 
 
 def test_sandbox_google_vertex_overlay_gets_the_same_credential_recipe(
@@ -1014,25 +1050,22 @@ def test_sandbox_google_vertex_overlay_gets_the_same_credential_recipe(
 ) -> None:
     monkeypatch.setenv("GCP_PROJECT_ID", "p-from-repo-var")
     calls = _install_fake_emulator(monkeypatch)
-    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    overlay = oc_mod._sandbox_provider_env(_sandboxed(tmp_path, provider="google-vertex"), tmp_path)
     assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
     assert "ANTHROPIC_VERTEX_USE_GCP_METADATA" not in overlay
     assert calls == [{"backend": "vertex", "project": "p-from-repo-var"}]
 
 
 @pytest.mark.parametrize(
-    "config",
-    [
-        AgentConfig(provider="google-vertex", api_key="express-key"),
-        AgentConfig(provider="google", api_key="k"),
-        AgentConfig(provider="anthropic", api_key="k"),
-    ],
+    "provider,api_key",
+    [("google-vertex", "express-key"), ("google", "k"), ("anthropic", "k")],
 )
 def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: AgentConfig
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: str, api_key: str
 ) -> None:
     """A key crosses by value; the emulator is only for keyless Vertex."""
     calls = _install_fake_emulator(monkeypatch)
+    config = _sandboxed(tmp_path, provider=provider, api_key=api_key)
     overlay = oc_mod._sandbox_provider_env(config, tmp_path)
     assert "GCE_METADATA_HOST" not in overlay
     assert calls == []

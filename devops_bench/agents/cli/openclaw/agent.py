@@ -77,7 +77,7 @@ from devops_bench.agents.shared.cli_capabilities import (
 )
 from devops_bench.agents.shared.vertex_env import vertex_project
 from devops_bench.core import SubprocessError, get_logger
-from devops_bench.core.errors import ConfigError
+from devops_bench.core.errors import ConfigError, SandboxError
 from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
@@ -170,8 +170,9 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
     },
 }
 # Per-run layout of the node-fetch->native-fetch ESM loader shim (see
-# :func:`_write_node_fetch_shim`), written under the run's own workdir so it
-# is visible inside the sandboxed container at ``/workspace/node-fetch-shim``.
+# :func:`_write_node_fetch_shim`), written under the run's state dir: inside
+# the workspace so the sandboxed container can see it, but not a new top-level
+# workspace entry, which the harness's artifact diff would attribute to the agent.
 _NODE_FETCH_SHIM_DIRNAME = "node-fetch-shim"
 
 _NODE_FETCH_REGISTER_MJS = (
@@ -196,8 +197,8 @@ _NODE_FETCH_FETCH_MJS = (
 )
 
 
-def _write_node_fetch_shim(workdir: Path) -> None:
-    """Write the node-fetch->native-fetch ESM loader shim into ``workdir``.
+def _write_node_fetch_shim(state_dir: Path) -> Path:
+    """Write the node-fetch->native-fetch ESM loader shim under ``state_dir``.
 
     Works around a gaxios (7.3.1, google-auth-library's HTTP layer) bug inside
     the agent-sandbox image: with no ``window`` global, gaxios does
@@ -213,7 +214,7 @@ def _write_node_fetch_shim(workdir: Path) -> None:
     ``--user`` may not match whichever uid this (possibly privileged) process
     runs as, so permission bits do the work instead of a chown.
     """
-    shim_dir = workdir / _NODE_FETCH_SHIM_DIRNAME
+    shim_dir = state_dir / _NODE_FETCH_SHIM_DIRNAME
     shim_dir.mkdir(exist_ok=True)
     shim_dir.chmod(0o755)
     for name, content in (
@@ -224,6 +225,7 @@ def _write_node_fetch_shim(workdir: Path) -> None:
         path = shim_dir / name
         path.write_text(content)
         path.chmod(0o644)
+    return shim_dir
 
 
 def _oc_model_id(config: AgentConfig) -> str:
@@ -392,8 +394,11 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     return overlay
 
 
-def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
+def _sandbox_provider_env(config: AgentConfig, state_dir: Path) -> dict[str, str]:
     """Forward explicit provider routing and give the container a model credential.
+
+    Sandbox-only: ``config.sandbox`` must be the task-completed spec, since the
+    shim path crosses the boundary in its container spelling.
 
     A keyless Vertex run (``google-vertex`` or ``anthropic-vertex``) cannot see
     the host's ADC, so it gets the shared metadata-emulator recipe from
@@ -414,8 +419,11 @@ def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
         )
         if name in os.environ
     }
-    _write_node_fetch_shim(workdir)
-    overlay["NODE_OPTIONS"] = "--import=/workspace/node-fetch-shim/register.mjs"
+    sandbox_spec = config.sandbox
+    if sandbox_spec is None or sandbox_spec.workspace is None:
+        raise SandboxError("_sandbox_provider_env needs the task-completed sandbox spec")
+    register = _write_node_fetch_shim(state_dir) / "register.mjs"
+    overlay["NODE_OPTIONS"] = f"--import={sandbox.container_path(sandbox_spec.workspace, register)}"
     spec = resolve_provider(config.provider)
     if spec.backend == "vertex" and not config.api_key:
         overlay.update(sandbox_credential_env(spec, project=vertex_project()))
@@ -631,7 +639,7 @@ class OpenClawAgent(AgentHarness):
             agent_oc_bin = oc_bin
             spec = self.config.sandbox
             if spec is not None and spec.workspace is not None:
-                agent_env = {**_sandbox_provider_env(self.config, workdir), **agent_env}
+                agent_env = {**_sandbox_provider_env(self.config, state_dir), **agent_env}
                 agent_env["OPENCLAW_STATE_DIR"] = sandbox.container_path(spec.workspace, state_dir)
                 if "OPENCLAW_CONFIG_PATH" in agent_env:
                     agent_env["OPENCLAW_CONFIG_PATH"] = sandbox.container_path(
