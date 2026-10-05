@@ -30,12 +30,12 @@ is reachable by IP (``host.docker.internal`` only *names* that address); what
 it may reach is governed by host-side ``DOCKER-USER`` rules (bastion setup),
 not by this module.
 
-Known limits of this seam, closed by follow-ups in the same stack: the
-kubeconfig still carries the operator's cluster-admin certificate (the
-credential-scoping follow-up replaces it with a namespace-scoped
-ServiceAccount token), and on a cloud VM the link-local metadata endpoint is
-still routable from the container (the metadata-credential follow-up removes
-the reason to reach it).
+Two earlier limits of this seam are closed elsewhere in the stack: the
+kubeconfig carries a namespace-scoped ServiceAccount token
+(:mod:`devops_bench.k8s.agent_credentials`), not the operator's cluster-admin
+certificate, and on a cloud VM the bastion rules block the link-local metadata
+endpoint while the model credential comes from the emulator in
+:mod:`devops_bench.core.model_providers`.
 """
 
 from __future__ import annotations
@@ -188,10 +188,10 @@ def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
 def build_network_plan(provider: Provider | None, cluster_info: ClusterInfo) -> NetworkPlan:
     """Build the :class:`NetworkPlan` for this run's cluster.
 
-    The provider contributes what only it knows (network, hostname, context
-    pin); this module then applies the one provider-agnostic rewrite: a host
-    loopback server is remapped to ``host.docker.internal``, which is why
-    most providers need no override.
+    The provider contributes what only it knows: the context pin every
+    provider must supply, plus a Docker network or in-network hostname when it
+    has one. This module then applies the one provider-agnostic rewrite: a
+    host loopback server is remapped to ``host.docker.internal``.
 
     Args:
         provider: ``None`` (no-op deployer) yields the default plan against
@@ -245,7 +245,12 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     """
     if plan.rewrite_server:
         return plan
-    server = kubectl.config_value("{.clusters[0].cluster.server}", context=plan.kubectl_context)
+    # One kubectl read for both fields; the tls-server-name line is empty when undeclared.
+    server, _, declared = kubectl.config_value(
+        '{.clusters[0].cluster.server}{"\\n"}{.clusters[0].cluster.tls-server-name}',
+        context=plan.kubectl_context,
+    ).partition("\n")
+    declared = declared.strip()
     if not server:
         raise SandboxError(
             "could not read the cluster server URL from the run's kubectl context; "
@@ -255,9 +260,6 @@ def _rewrite_loopback_server(plan: NetworkPlan) -> NetworkPlan:
     if parsed.hostname not in _LOOPBACK_HOSTS:
         return plan
     port = f":{parsed.port}" if parsed.port else ""
-    declared = kubectl.config_value(
-        "{.clusters[0].cluster.tls-server-name}", context=plan.kubectl_context
-    )
     _log.info(
         "cluster apiserver is published on loopback (%s); the container will reach it "
         "at host.docker.internal%s",

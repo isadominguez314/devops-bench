@@ -257,9 +257,8 @@ def _patch_plan_reads(
             return SimpleNamespace(returncode=0, stdout="\n".join(contexts) + "\n", stderr="")
         # ``--context`` sits right after the binary, so match the subcommand.
         assert "view" in argv
-        if any("tls-server-name" in str(part) for part in argv):
-            return SimpleNamespace(returncode=0, stdout=tls_server_name, stderr="")
-        return SimpleNamespace(returncode=0, stdout=server, stderr="")
+        # Server and tls-server-name come back from one jsonpath read, newline-separated.
+        return SimpleNamespace(returncode=0, stdout=f"{server}\n{tls_server_name}", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
     monkeypatch.setattr(kubectl, "run", fake_run)

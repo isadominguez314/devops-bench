@@ -355,6 +355,46 @@ def test_build_env_sandboxed_vertex_injects_the_metadata_emulator_vars(
     assert env["GOOGLE_CLOUD_PROJECT"] == "proj-a"
 
 
+def test_build_env_sandboxed_vertex_with_a_key_skips_the_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The key is routed across the boundary; demanding an impersonation SA for
+    # a run that never touches ADC would refuse a perfectly good configuration.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(
+        gemini_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called with a key in play"),
+    )
+    cfg = AgentConfig(
+        model="gemini-2.5-pro",
+        provider="google-vertex",
+        api_key="abc",
+        sandbox=SandboxSpec(image="img"),
+    )
+    env = _build_env(cfg)
+    assert env["GOOGLE_CLOUD_API_KEY"] == "abc"
+    assert "GCE_METADATA_HOST" not in env
+
+
+def test_build_env_sandboxed_vertex_express_mode_skips_the_recipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Express mode has no project by design; the recipe would reject that.
+    monkeypatch.setenv("GOOGLE_API_KEY", "express-key")
+    monkeypatch.setattr(
+        gemini_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called in express mode"),
+    )
+    cfg = AgentConfig(
+        model="gemini-2.5-pro", provider="google-vertex", sandbox=SandboxSpec(image="img")
+    )
+    env = _build_env(cfg)
+    assert env["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
+    assert "GOOGLE_CLOUD_PROJECT" not in env
+
+
 def test_build_env_sandboxed_non_vertex_asks_for_no_model_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
