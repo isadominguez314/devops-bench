@@ -207,9 +207,7 @@ class AgentHarness(ABC):
                 overlaid on the process env; in the sandbox it is the *only*
                 environment that crosses, by value, after the deny filter.
             check / capture / text / timeout / input: As in
-                ``core.subprocess.run``. A non-empty ``input`` is rejected in
-                the sandbox (the container runs without stdin, by design); an
-                empty one, i.e. "closed stdin", passes through.
+                ``core.subprocess.run``; the sandbox rejects a non-empty ``input``.
             host_run: Callable used on the unsandboxed path. When omitted,
                 the concrete harness module's own ``run`` import is used (the
                 symbol its unit tests patch), falling back to
