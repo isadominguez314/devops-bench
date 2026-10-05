@@ -893,7 +893,9 @@ class DefaultEvalHarness(Harness):
             # that leak. The sweep itself decides whether BENCH_PARALLEL makes
             # the match too broad to be safe.
             try:
-                agent_sandbox.sweep_stray_containers(parallel=self.parallel)
+                agent_sandbox.sweep_stray_containers(
+                    owner=self._agent_config.sandbox.owner, parallel=self.parallel
+                )
             except Exception:  # noqa: BLE001 - a sweep failure must not block the run
                 _log.exception("stray sandbox container sweep failed; continuing")
 

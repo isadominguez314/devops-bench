@@ -1388,7 +1388,7 @@ def test_stray_container_sweep_is_told_about_parallel(
     monkeypatch.setattr(
         harness_default.agent_sandbox,
         "sweep_stray_containers",
-        lambda *, parallel: swept.append(parallel),
+        lambda *, owner, parallel: swept.append(parallel),
     )
     harness.run([])
     assert swept == [parallel]
@@ -1600,7 +1600,7 @@ def test_sandbox_exempt_task_gets_the_ambient_inventory(
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
     monkeypatch.delenv("BENCH_PARALLEL", raising=False)
-    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda: None)
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
 
     class _SandboxAwareLeftoverReader(_LeftoverReadingAgent):
         supports_sandbox = True

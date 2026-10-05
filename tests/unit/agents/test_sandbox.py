@@ -131,7 +131,6 @@ def test_kill_container_never_raises_when_docker_kill_fails(
 def test_sweep_stray_containers_kills_only_matching_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
     calls: list[list[str]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
@@ -145,7 +144,7 @@ def test_sweep_stray_containers_kills_only_matching_names(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
-    sandbox.sweep_stray_containers()
+    sandbox.sweep_stray_containers(owner="attemptA")
 
     list_call = calls[0]
     assert list_call[0:2] == ["docker", "ps"]
@@ -1312,7 +1311,6 @@ def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
 def test_unscoped_sweep_is_skipped_under_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without an owner the prefix match could reap a sibling harness's live
     container, so a parallel batch must not sweep at all."""
-    monkeypatch.delenv("BENCH_AGENT_SANDBOX_OWNER", raising=False)
     monkeypatch.setattr(sandbox, "run", lambda *a, **kw: pytest.fail("unscoped docker call"))
     sandbox.sweep_stray_containers(parallel=True)
 
@@ -1322,7 +1320,6 @@ def test_unscoped_sweep_reaps_every_prefixed_container_when_serial(
 ) -> None:
     """A serial host with no owner id is the crash-recovery case the sweep
     exists for: every container carrying the benchmark prefix is a stray."""
-    monkeypatch.delenv("BENCH_AGENT_SANDBOX_OWNER", raising=False)
     calls: list[list[str]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
@@ -1346,7 +1343,6 @@ def test_unscoped_sweep_reaps_every_prefixed_container_when_serial(
 
 
 def test_owner_scoped_sweep_runs_even_under_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
     calls: list[list[str]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
@@ -1358,19 +1354,31 @@ def test_owner_scoped_sweep_runs_even_under_parallel(monkeypatch: pytest.MonkeyP
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
-    sandbox.sweep_stray_containers(parallel=True)
+    sandbox.sweep_stray_containers(owner="attemptA", parallel=True)
 
     assert [c for c in calls if c[:2] == ["docker", "kill"]] == [
         ["docker", "kill", "devops-bench-agent-attemptA-ws"]
     ]
 
 
-def test_owner_is_part_of_container_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
-    assert sandbox.container_name_for_workspace(tmp_path).startswith("devops-bench-agent-attemptA-")
-    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "bad-owner")
-    with pytest.raises(ValueError):
-        sandbox.container_name_for_workspace(tmp_path)
+def test_owner_is_part_of_container_name(tmp_path: Path) -> None:
+    spec = _complete_spec(tmp_path, owner="attemptA")
+    executor = sandbox.SandboxExecutor(spec)
+    assert executor.container_name == f"devops-bench-agent-attemptA-{spec.workspace.name}"
+    assert sandbox.container_name_for_workspace(tmp_path) == f"devops-bench-agent-{tmp_path.name}"
+
+
+def test_spec_from_env_carries_a_valid_owner() -> None:
+    spec = sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": "1", "BENCH_AGENT_SANDBOX_OWNER": "run_7"})
+    assert spec is not None and spec.owner == "run_7"
+
+
+@pytest.mark.parametrize("owner", ["bad-owner", "a" * 129, "sp ace"])
+def test_spec_from_env_rejects_a_malformed_owner(owner: str) -> None:
+    """Validated at opt-in, before any cluster exists: raised from inside the
+    executor it would be converted into an errored agent result per task."""
+    with pytest.raises(SandboxError, match="BENCH_AGENT_SANDBOX_OWNER"):
+        sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": "1", "BENCH_AGENT_SANDBOX_OWNER": owner})
 
 
 def test_remap_covers_external_generated_kubeconfig(tmp_path: Path) -> None:
