@@ -700,6 +700,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "documentation",
         "capabilities_granted",
         "verification_parse_errors",
+        "fixture_problems",
         "verification_report",
         "verification_status",
         "generation_only",
@@ -1638,6 +1639,10 @@ def test_same_task_repeat_is_not_fingerprinted(
 
     assert results[0]["cheating_report"]["status"] == "clean"
     assert results[1]["cheating_report"]["status"] == "clean"
+    # BENCH_REQUIRE_FIXTURES=0 let the first task run without its named input;
+    # the record says so. The second task found the file the first one wrote.
+    assert len(results[0]["fixture_problems"]) == 1
+    assert results[1]["fixture_problems"] == []
 
 
 # --- requires_unsandboxed: a task the boundary would make impossible ---------

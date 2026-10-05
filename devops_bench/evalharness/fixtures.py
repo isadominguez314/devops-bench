@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
 
 from devops_bench.core import get_bool, get_logger
 
@@ -61,7 +62,11 @@ def prompt_fixture_paths(prompt: str, home: Path | None = None) -> list[Path]:
 
 
 def _unreadable_reason(path: Path) -> str | None:
-    """Return why ``path`` is unusable as a fixture (for this process), or ``None``."""
+    """Return why ``path`` is unusable as a fixture, or ``None``.
+
+    Answers for this process's uid, which the agent shares in both the ambient and
+    sandboxed flows; root passes every mode check, so under root this cannot fire.
+    """
     if not path.exists():
         return "does not exist"
     if not os.access(path, os.R_OK):
@@ -76,7 +81,7 @@ def check_prompt_fixtures(
     task_name: str,
     home: Path | None = None,
     *,
-    mounted: bool = False,
+    mounts: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Fail loudly when a promised fixture did not reach the agent.
 
@@ -84,9 +89,10 @@ def check_prompt_fixtures(
         prompt: The substituted prompt handed to the agent.
         task_name: Task name, for the message.
         home: Home directory the prompt's ``~`` resolves to for the agent.
-        mounted: ``True`` when a sandbox mount plan already carried this run's
-            fixtures into the container, in which case the host-side paths say
-            nothing about what the agent can see and the check is skipped.
+        mounts: The sandbox mount plan (host path -> container path) when the
+            agent is sandboxed. Each promised name must then appear in the plan
+            and its host source must be readable, since the container binds
+            that source under this process's uid.
 
     Returns:
         One human-readable problem per unusable fixture; empty when every
@@ -96,13 +102,21 @@ def check_prompt_fixtures(
         RuntimeError: When a fixture is unusable and
             :data:`REQUIRE_FIXTURES_ENV` is not set to a false value.
     """
-    if mounted:
-        return []
-    problems = [
-        f"{path} ({reason})"
-        for path in prompt_fixture_paths(prompt, home)
-        if (reason := _unreadable_reason(path)) is not None
-    ]
+    problems: list[str] = []
+    if mounts is None:
+        problems = [
+            f"{path} ({reason})"
+            for path in prompt_fixture_paths(prompt, home)
+            if (reason := _unreadable_reason(path)) is not None
+        ]
+    else:
+        source_by_name = {PurePosixPath(c).name: Path(h) for h, c in mounts.items()}
+        for path in prompt_fixture_paths(prompt, home):
+            source = source_by_name.get(path.name)
+            if source is None:
+                problems.append(f"{path.name} (not in the sandbox mount plan)")
+            elif (reason := _unreadable_reason(source)) is not None:
+                problems.append(f"{source} ({reason})")
     if not problems:
         return []
 

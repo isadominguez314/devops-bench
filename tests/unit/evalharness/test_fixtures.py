@@ -110,10 +110,33 @@ def test_the_env_escape_hatch_downgrades_to_a_warning(
     assert len(problems) == 1
 
 
-def test_a_mounted_sandbox_skips_the_host_side_check(tmp_path: Path) -> None:
-    # The fixtures went in through a bind mount, so host paths say nothing
-    # about what the agent can see.
-    assert check_prompt_fixtures(_SPOT_PROMPT, "spot", tmp_path, mounted=True) == []
+def test_a_mounted_fixture_is_checked_at_its_host_source(tmp_path: Path) -> None:
+    # Sandboxed: the plan binds the operator's copy into the container home.
+    source = tmp_path / "operator" / "rightsizing-report-c1.json"
+    source.parent.mkdir()
+    source.write_text("{}")
+    mounts = {str(source): "/workspace/home/rightsizing-report-c1.json"}
+    assert check_prompt_fixtures(_SPOT_PROMPT, "spot", tmp_path / "home", mounts=mounts) == []
+
+
+def test_a_promised_fixture_missing_from_the_mount_plan_fails(tmp_path: Path) -> None:
+    # One of two promised fixtures was discovered; the other never made the plan.
+    repo = tmp_path / "operator" / "cve-repo-c1.git"
+    repo.mkdir(parents=True)
+    mounts = {str(repo): "/workspace/home/cve-repo-c1.git"}
+    with pytest.raises(RuntimeError, match="cve-advisory-c1.json \\(not in the sandbox mount plan"):
+        check_prompt_fixtures(_CVE_PROMPT, "cve-remediation", tmp_path / "home", mounts=mounts)
+
+
+def test_a_mounted_fixture_with_a_missing_host_source_fails(tmp_path: Path) -> None:
+    mounts = {str(tmp_path / "gone.json"): "/workspace/home/rightsizing-report-c1.json"}
+    with pytest.raises(RuntimeError, match="does not exist"):
+        check_prompt_fixtures(_SPOT_PROMPT, "spot", tmp_path / "home", mounts=mounts)
+
+
+def test_an_empty_mount_plan_fails_every_promised_fixture(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="not in the sandbox mount plan"):
+        check_prompt_fixtures(_SPOT_PROMPT, "spot", tmp_path / "home", mounts={})
 
 
 def test_an_unsubstituted_placeholder_is_not_reported_as_missing(tmp_path: Path) -> None:

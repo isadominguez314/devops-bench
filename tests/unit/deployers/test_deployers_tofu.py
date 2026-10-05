@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -208,6 +209,60 @@ def test_down_isolates_state_beside_tf_data_dir(mocker, monkeypatch, tmp_path, t
     destroy_argv = mock_run.call_args_list[1].args[0]
     expected_state = str((tmp_path / "tf-data").resolve().parent / "terraform.tfstate")
     assert destroy_argv[destroy_argv.index("-state") + 1] == expected_state
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_up_holds_default_state_private(mocker, monkeypatch, tf_deployer):
+    # No TF_DATA_DIR: tofu writes its default in-directory state. A stale
+    # world-readable state from an older run must be tightened too.
+    monkeypatch.delenv("TF_DATA_DIR", raising=False)
+    state = Path(tf_deployer.work_dir) / "terraform.tfstate"
+    state.write_text("{}")
+    state.chmod(0o644)
+    mocker.patch("devops_bench.deployers.tofu.run")
+
+    tf_deployer.up()
+
+    assert _mode(state) == 0o600
+    assert _mode(state.with_suffix(".tfstate.backup")) == 0o600
+
+
+def test_up_precreates_isolated_state_private_before_apply(
+    mocker, monkeypatch, tmp_path, tf_deployer
+):
+    monkeypatch.setenv("TF_DATA_DIR", str(tmp_path / "tf-data"))
+    state = tmp_path / "terraform.tfstate"
+    seen: list[int] = []
+    mocker.patch(
+        "devops_bench.deployers.tofu.run",
+        side_effect=lambda cmd, **_: seen.append(_mode(state)) if "apply" in cmd else None,
+    )
+
+    tf_deployer.up()
+
+    # The file already existed, private, when apply ran.
+    assert seen == [0o600]
+    assert _mode(state.with_suffix(".tfstate.backup")) == 0o600
+
+
+def test_down_holds_state_private_even_when_destroy_fails(mocker, monkeypatch, tf_deployer):
+    monkeypatch.delenv("TF_DATA_DIR", raising=False)
+    state = Path(tf_deployer.work_dir) / "terraform.tfstate"
+
+    def fail_destroy(cmd, **_):
+        if "destroy" in cmd:
+            raise RuntimeError("boom")
+
+    mocker.patch("devops_bench.deployers.tofu.run", side_effect=fail_destroy)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        tf_deployer.down()
+
+    assert _mode(state) == 0o600
+    assert _mode(state.with_suffix(".tfstate.backup")) == 0o600
 
 
 def _output_process(location):
