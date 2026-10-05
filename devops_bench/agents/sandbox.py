@@ -70,6 +70,10 @@ _log = get_logger("agents.sandbox")
 # Opt-in so sandboxed runs can be A/B'd against ambient; unset is the pre-sandbox behavior.
 SANDBOX_ENV = "BENCH_AGENT_SANDBOX"
 IMAGE_ENV = "BENCH_SANDBOX_IMAGE"
+# Optional attempt id an orchestrator sets so parallel harnesses can tell their
+# own containers (and strays) apart; validated once, at opt-in time.
+OWNER_ENV = "BENCH_AGENT_SANDBOX_OWNER"
+_OWNER_PATTERN = re.compile(r"[A-Za-z0-9_]{1,128}")
 CONTAINER_RUNTIME = "docker"
 _SANDBOX_ENABLED_VALUES = frozenset({CONTAINER_RUNTIME, "1", "true"})
 # Anything outside these two sets raises rather than silently running ambient.
@@ -152,9 +156,10 @@ def _overlaps_bench_checkout(path: Path) -> bool:
 class SandboxSpec:
     """Everything the executor needs to wrap one run's agent in ``docker run``.
 
-    :func:`spec_from_env` yields the image only; the eval harness fills in the
-    rest per task. ``fixture_mounts`` maps host path -> container path (RW);
-    ``env_allowlist`` lets named vars cross despite a deny rule.
+    :func:`spec_from_env` yields the image and owner only; the eval harness
+    fills in the rest per task. ``fixture_mounts`` maps host path -> container
+    path (RW); ``env_allowlist`` lets named vars cross despite a deny rule;
+    ``owner`` scopes container names (and the stray sweep) to one attempt.
     """
 
     image: str = ""
@@ -163,13 +168,24 @@ class SandboxSpec:
     kubeconfig: Path | None = None
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
+    owner: str = ""
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
-    """Read the sandbox opt-in; ``None`` when off, :class:`SandboxError` on a typo."""
+    """Read the sandbox opt-in; ``None`` when off, :class:`SandboxError` on a typo.
+
+    A malformed owner id is a typo too, and fails here rather than per task:
+    raised from inside the executor it would be scored as an errored agent.
+    """
     raw = (get_env(SANDBOX_ENV, env=env) or "").strip().lower()
     if raw in _SANDBOX_ENABLED_VALUES:
-        return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip())
+        owner = (get_env(OWNER_ENV, env=env) or "").strip()
+        if owner and not _OWNER_PATTERN.fullmatch(owner):
+            raise SandboxError(
+                f"{OWNER_ENV}={owner!r} must be 1-128 characters of [A-Za-z0-9_]; it names "
+                "this attempt's containers, so refusing rather than guess a spelling"
+            )
+        return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip(), owner=owner)
     if raw in _SANDBOX_DISABLED_VALUES:
         return None
     raise SandboxError(
@@ -408,7 +424,7 @@ class SandboxExecutor:
             )
         self.spec = spec
         self._workspace = Path(spec.workspace)
-        self.container_name = container_name_for_workspace(self._workspace)
+        self.container_name = container_name_for_workspace(self._workspace, spec.owner)
 
     def map_host_path(self, path: str | os.PathLike[str]) -> str:
         """Map a host path under this executor's workspace to its container path."""
@@ -447,7 +463,7 @@ class SandboxExecutor:
         chown arbitrary ids either direction (including up past int32, which
         plain ``chown`` has no restriction on, unlike docker's ``--user``).
         """
-        argv = ["docker", "run", "--rm"]
+        argv = [CONTAINER_RUNTIME, "run", "--rm"]
         targets: list[str] = []
         for host_path, mount_path in self._remap_mounts():
             argv += ["-v", f"{host_path}:{mount_path}"]
@@ -465,8 +481,8 @@ class SandboxExecutor:
         """
         argv = self._chown_argv(_REMAP_UID, _REMAP_GID)
         try:
-            run(argv, check=True)
-        except SubprocessError as exc:
+            run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+        except (OSError, SubprocessError) as exc:
             raise SandboxError(
                 f"could not chown the workspace/fixtures to {_REMAP_UID}:{_REMAP_GID} "
                 "before starting the id-remapped agent container; running on would "
@@ -487,8 +503,8 @@ class SandboxExecutor:
         uid, gid = os.getuid(), os.getgid()
         argv = self._chown_argv(uid, gid)
         try:
-            run(argv, check=True)
-        except SubprocessError:
+            run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+        except (OSError, SubprocessError):
             _log.error(
                 "could not chown the workspace/fixtures back to %s:%s after the "
                 "id-remapped agent container exited; the artifacts are left owned "
@@ -555,8 +571,10 @@ class SandboxExecutor:
     ) -> CompletedProcess:
         """Run ``cmd`` in the sandbox container; mirrors ``core.subprocess.run``.
 
-        ``env`` and ``input`` are rejected (credential-inheritance channel; no
-        stdin). Docker's own launch failures raise :class:`SandboxError` rather
+        ``env`` is rejected (credential-inheritance channel), as is any non-empty
+        ``input``: the container runs without ``-i``, so an empty payload is
+        already what it gets and passes through, but a real one would be lost.
+        Docker's own launch failures raise :class:`SandboxError` rather
         than masquerading as an agent exit code. The container is reaped by name
         on every exit path, since ``--rm`` does not fire when the client is
         killed by the host-side timeout.
@@ -571,9 +589,10 @@ class SandboxExecutor:
                 "SandboxExecutor never forwards a full environment; pass the "
                 "resolved overlay via extra_env"
             )
-        if input is not None:
+        if input:
             raise SandboxError(
-                "the sandboxed agent runs without stdin (no -i, by design); input= is unsupported"
+                "the sandboxed agent runs without stdin (no -i, by design); a non-empty "
+                "input= would be silently dropped"
             )
         # Filter once so the client env matches the names wrap_argv emits.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
@@ -616,15 +635,13 @@ class SandboxExecutor:
                     self._chown_after_remap()
 
 
-def container_name_for_workspace(workspace: Path) -> str:
+def container_name_for_workspace(workspace: Path, owner: str = "") -> str:
     """Deterministic container name tied 1:1 to the run's workspace directory.
 
-    An optional ``BENCH_AGENT_SANDBOX_OWNER`` segment scopes the name to one
-    attempt so parallel harnesses can sweep only their own strays.
+    ``owner`` (:attr:`SandboxSpec.owner`, already validated) adds a segment
+    that scopes the name to one attempt so parallel harnesses can sweep only
+    their own strays.
     """
-    owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
-    if owner and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
-        raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
     return f"{_CONTAINER_NAME_PREFIX}{owner + '-' if owner else ''}{workspace.name}"
 
 
@@ -680,20 +697,26 @@ def kill_container(name: str) -> None:
         _log.info("reaped sandbox container %s", name)
 
 
-def sweep_stray_containers() -> None:
-    """Reap only the current attempt's leftovers; best-effort against docker failures.
+def sweep_stray_containers(*, owner: str = "", parallel: bool = False) -> None:
+    """Best-effort reap of containers a prior crashed run left behind. Never raises.
 
-    A shared name prefix is not proof another process has exited: without an
-    owner id (``BENCH_AGENT_SANDBOX_OWNER``) a stray cannot be told apart from
-    a parallel harness's live container, so unscoped containers are left for
-    explicit operator recovery rather than swept here.
+    With an ``owner`` (:attr:`SandboxSpec.owner`) only that attempt's containers
+    are swept, which is safe alongside other harnesses. Without one the match
+    is the shared name prefix, which cannot tell a crashed run's stray from a
+    sibling harness's live container, so ``parallel`` skips the sweep and
+    leaves the strays for the operator.
     """
-    owner = os.environ.get("BENCH_AGENT_SANDBOX_OWNER", "")
-    if not owner:
+    if not owner and parallel:
+        _log.info(
+            "BENCH_PARALLEL set and no %s: skipping the stray sandbox-container "
+            "sweep; reap leftovers manually with `%s ps --filter name=%s` once no "
+            "benchmark is running",
+            OWNER_ENV,
+            CONTAINER_RUNTIME,
+            _CONTAINER_NAME_PREFIX,
+        )
         return
-    if not re.fullmatch(r"[A-Za-z0-9_]{1,128}", owner):
-        raise ValueError("BENCH_AGENT_SANDBOX_OWNER must be a unique alphanumeric attempt ID")
-    prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-"
+    prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-" if owner else _CONTAINER_NAME_PREFIX
     try:
         listed = run(
             [CONTAINER_RUNTIME, "ps", "--format", "{{.Names}}"],
