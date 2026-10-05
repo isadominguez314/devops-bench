@@ -18,7 +18,13 @@ from __future__ import annotations
 
 import pytest
 
-from devops_bench.core.model_identity import driver_identity, judge_identity
+from devops_bench.core.model_identity import canonical_provider, driver_identity, judge_identity
+
+
+def test_canonical_provider_never_raises() -> None:
+    assert canonical_provider("gemini") == "google"
+    assert canonical_provider(None) == "google"  # the contract's default
+    assert canonical_provider("no-such-provider") == "no-such-provider"
 
 
 def test_driver_identity_prefers_chaos_env_and_canonicalizes(
