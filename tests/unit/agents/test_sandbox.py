@@ -131,7 +131,6 @@ def test_kill_container_never_raises_when_docker_kill_fails(
 def test_sweep_stray_containers_kills_only_matching_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
     calls: list[list[str]] = []
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
@@ -145,7 +144,7 @@ def test_sweep_stray_containers_kills_only_matching_names(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(sandbox, "run", fake_run)
-    sandbox.sweep_stray_containers()
+    sandbox.sweep_stray_containers(owner="attemptA")
 
     list_call = calls[0]
     assert list_call[0:2] == ["docker", "ps"]
@@ -656,6 +655,25 @@ def test_executor_run_rejects_stdin_input(tmp_path: Path) -> None:
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     with pytest.raises(SandboxError, match="stdin"):
         executor.run(["gemini"], input="data")
+
+
+def test_executor_run_accepts_an_empty_stdin_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``input=""`` is how a host-side harness closes stdin; the container has
+    no stdin anyway, so the executor must treat it as equivalent, not refuse."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    seen: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        seen.append(argv)
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    result = executor.run(["claude", "-p", "hi"], check=False, input="")
+
+    assert result.stdout == "ok"
+    assert seen[0][:2] == ["docker", "run"]
 
 
 def test_executor_run_reaps_the_container_on_timeout(
@@ -1218,6 +1236,65 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
         executor.run(["gemini"])
 
 
+def test_remap_chowns_are_time_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Both chown containers run under the housekeeping timeout: a wedged
+    daemon must not hang the harness, least of all from the post-run finally."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+    timeouts: list[object] = []
+
+    def fake_run(argv, **kwargs):
+        if "chown" in argv:
+            timeouts.append(kwargs.get("timeout"))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    executor.run(["gemini"], check=False)
+    assert timeouts == [sandbox._HOUSEKEEPING_TIMEOUT_SEC] * 2
+
+
+def test_executor_run_handback_oserror_does_not_mask_a_successful_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A docker binary that vanishes mid-run raises OSError, not SubprocessError;
+    from inside the finally that would replace the agent's real result."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+
+    def fake_run(argv, **kwargs):
+        if "chown" in argv and "3998470835:1000" in argv:
+            raise FileNotFoundError("docker")
+        return SimpleNamespace(returncode=0, stdout="agent output", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with caplog.at_level("ERROR"):
+        result = executor.run(["gemini"], check=False)
+    assert result.stdout == "agent output"
+    assert "chown" in caplog.text
+
+
+def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_cannot_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
+
+    def fake_run(argv, **kwargs):
+        if "chown" in argv:
+            raise FileNotFoundError("docker")
+        raise AssertionError("the agent container must not run when the pre-run chown fails")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    with pytest.raises(SandboxError, match="chown"):
+        executor.run(["gemini"])
+
+
 def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1231,18 +1308,77 @@ def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
     assert "--user" not in executor.wrap_argv(["gemini"])
 
 
-def test_unscoped_sweep_never_touches_other_runs(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("BENCH_AGENT_SANDBOX_OWNER", raising=False)
+def test_unscoped_sweep_is_skipped_under_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without an owner the prefix match could reap a sibling harness's live
+    container, so a parallel batch must not sweep at all."""
     monkeypatch.setattr(sandbox, "run", lambda *a, **kw: pytest.fail("unscoped docker call"))
-    sandbox.sweep_stray_containers()
+    sandbox.sweep_stray_containers(parallel=True)
 
 
-def test_owner_is_part_of_container_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "attemptA")
-    assert sandbox.container_name_for_workspace(tmp_path).startswith("devops-bench-agent-attemptA-")
-    monkeypatch.setenv("BENCH_AGENT_SANDBOX_OWNER", "bad-owner")
-    with pytest.raises(ValueError):
-        sandbox.container_name_for_workspace(tmp_path)
+def test_unscoped_sweep_reaps_every_prefixed_container_when_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serial host with no owner id is the crash-recovery case the sweep
+    exists for: every container carrying the benchmark prefix is a stray."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="devops-bench-agent-ws1\ndevops-bench-agent-attemptA-ws2\nunrelated\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers(parallel=False)
+
+    kill_calls = [c for c in calls if c[:2] == ["docker", "kill"]]
+    assert kill_calls == [
+        ["docker", "kill", "devops-bench-agent-ws1"],
+        ["docker", "kill", "devops-bench-agent-attemptA-ws2"],
+    ]
+
+
+def test_owner_scoped_sweep_runs_even_under_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(argv)
+        if argv[:2] == ["docker", "ps"]:
+            return SimpleNamespace(
+                returncode=0, stdout="devops-bench-agent-attemptA-ws\n", stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.sweep_stray_containers(owner="attemptA", parallel=True)
+
+    assert [c for c in calls if c[:2] == ["docker", "kill"]] == [
+        ["docker", "kill", "devops-bench-agent-attemptA-ws"]
+    ]
+
+
+def test_owner_is_part_of_container_name(tmp_path: Path) -> None:
+    spec = _complete_spec(tmp_path, owner="attemptA")
+    executor = sandbox.SandboxExecutor(spec)
+    assert executor.container_name == f"devops-bench-agent-attemptA-{spec.workspace.name}"
+    assert sandbox.container_name_for_workspace(tmp_path) == f"devops-bench-agent-{tmp_path.name}"
+
+
+def test_spec_from_env_carries_a_valid_owner() -> None:
+    spec = sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": "1", "BENCH_AGENT_SANDBOX_OWNER": "run_7"})
+    assert spec is not None and spec.owner == "run_7"
+
+
+@pytest.mark.parametrize("owner", ["bad-owner", "a" * 129, "sp ace"])
+def test_spec_from_env_rejects_a_malformed_owner(owner: str) -> None:
+    """Validated at opt-in, before any cluster exists: raised from inside the
+    executor it would be converted into an errored agent result per task."""
+    with pytest.raises(SandboxError, match="BENCH_AGENT_SANDBOX_OWNER"):
+        sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": "1", "BENCH_AGENT_SANDBOX_OWNER": owner})
 
 
 def test_remap_covers_external_generated_kubeconfig(tmp_path: Path) -> None:

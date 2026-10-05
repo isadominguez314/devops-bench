@@ -624,6 +624,31 @@ def test_build_openclaw_config_merges_mcp_and_model_override() -> None:
     assert cfg["agents"]["defaults"]["models"] == {"google/gemini-3.5-flash": {}}
 
 
+def test_build_openclaw_config_threads_host_kubeconfig_into_mcp_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBECONFIG", "/home/op/.devops-bench/runs/r1/kubeconfig")
+    cfg = _build_openclaw_config(AgentConfig(), (McpBinding(name="gke", command=("gke-mcp",)),))
+    assert cfg["mcp"]["servers"]["gke"]["env"] == {
+        "KUBECONFIG": "/home/op/.devops-bench/runs/r1/kubeconfig"
+    }
+
+
+def test_build_openclaw_config_uses_container_kubeconfig_when_sandboxed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP server runs inside the container, where the credential lives at
+    the read-only bind path, not wherever RunEnv put it on the host."""
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    monkeypatch.setenv("KUBECONFIG", "/home/op/.devops-bench/runs/r1/kubeconfig")
+    cfg = _build_openclaw_config(
+        AgentConfig(sandbox=sandbox_mod.SandboxSpec(image="img")),
+        (McpBinding(name="gke", command=("gke-mcp",)),),
+    )
+    assert cfg["mcp"]["servers"]["gke"]["env"] == {"KUBECONFIG": sandbox_mod.CONTAINER_KUBECONFIG}
+
+
 # ---------------------------------------------------------------------------
 # Model catalog override: models oc doesn't ship by default get registered in
 # the per-run isolated config, for both google-genai and google-vertex.
@@ -711,12 +736,22 @@ def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
         _build_env(AgentConfig(provider="google-vertyx"))
 
 
-def test_model_override_raises_for_unpinned_transport() -> None:
+def test_model_override_raises_for_unpinned_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     """A catalog-override model whose provider has no pinned transport fails loud
     rather than shipping a transport-less entry (which would 401 via the OpenAI
-    fallback). A full-id with an unknown wire reaches this path."""
+    fallback). Only reachable when the two tables disagree, so force that."""
+    monkeypatch.setitem(oc_mod._CATALOG_OVERRIDES, "mystery", frozenset({"gemini-3.5-flash"}))
     with pytest.raises(ConfigError):
         _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash"))
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "anthropic-bedrock"])
+def test_model_override_leaves_other_providers_catalog_alone(provider: str) -> None:
+    """An id overridden for anthropic-vertex is not overridden for plain anthropic
+    or bedrock: those have no transport pin and resolve through oc's own catalog,
+    as they did before the Claude ids were added."""
+    assert _build_model_override(AgentConfig(model="claude-opus-5", provider=provider)) == {}
+    assert _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash")) == {}
 
 
 def _empty_sessions_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
@@ -936,16 +971,104 @@ def test_vertex_auth_profile_seeded_for_headless_run() -> None:
     assert "models auth paste-api-key" in command
 
 
+_FAKE_EMULATOR_ENV = {
+    "GCE_METADATA_HOST": "host.docker.internal:41234",
+    "GCE_METADATA_IP": "host.docker.internal:41234",
+    "METADATA_SERVER_DETECTION": "assume-present",
+}
+
+
+def _sandboxed(tmp_path: Path, **fields: Any) -> AgentConfig:
+    """An AgentConfig carrying a task-completed sandbox spec rooted at ``tmp_path``."""
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    return AgentConfig(sandbox=sandbox_mod.SandboxSpec(image="img", workspace=tmp_path), **fields)
+
+
+def _install_fake_emulator(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Stub the shared Vertex credential recipe; returns the calls it received."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_credential_env(spec: Any, *, project: str | None = None, **kw: Any) -> dict[str, str]:
+        calls.append({"backend": spec.backend, "project": project})
+        return dict(_FAKE_EMULATOR_ENV)
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", fake_credential_env)
+    return calls
+
+
 def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """anthropic-vertex: the SDK is switched to metadata auth AND pointed at the
+    host-side emulator; without the second half it would walk to the real
+    link-local endpoint and the VM's own service account."""
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/host.json")
-    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="anthropic-vertex"), tmp_path)
+    calls = _install_fake_emulator(monkeypatch)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    overlay = oc_mod._sandbox_provider_env(
+        _sandboxed(tmp_path, provider="anthropic-vertex"), state_dir
+    )
     assert overlay["GOOGLE_CLOUD_PROJECT"] == "test-project"
     assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
+    assert overlay["GOOGLE_CLOUD_API_KEY"] == "gcp-vertex-credentials"
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in overlay
-    assert (tmp_path / "node-fetch-shim" / "register.mjs").is_file()
+    assert calls == [{"backend": "vertex", "project": "test-project"}]
+
+
+def test_sandbox_overlay_keeps_the_shim_out_of_the_artifact_diff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The shim is harness-owned. It lives under the state dir (an entry the
+    run already creates) rather than as a new top-level workspace entry the
+    harness's before/after diff would collect as agent output, and the
+    container is pointed at it by its container spelling, never a literal."""
+    _install_fake_emulator(monkeypatch)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    before = set(p.name for p in tmp_path.iterdir())
+    overlay = oc_mod._sandbox_provider_env(
+        _sandboxed(tmp_path, provider="google-vertex"), state_dir
+    )
+    assert set(p.name for p in tmp_path.iterdir()) == before
+    assert (state_dir / "node-fetch-shim" / "register.mjs").is_file()
+    assert overlay["NODE_OPTIONS"] == "--import=/workspace/state/node-fetch-shim/register.mjs"
+
+
+def test_sandbox_overlay_refuses_to_run_without_a_completed_spec(tmp_path: Path) -> None:
+    from devops_bench.core import SandboxError
+
+    with pytest.raises(SandboxError):
+        oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+
+
+def test_sandbox_google_vertex_overlay_gets_the_same_credential_recipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GCP_PROJECT_ID", "p-from-repo-var")
+    calls = _install_fake_emulator(monkeypatch)
+    overlay = oc_mod._sandbox_provider_env(_sandboxed(tmp_path, provider="google-vertex"), tmp_path)
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
+    assert "ANTHROPIC_VERTEX_USE_GCP_METADATA" not in overlay
+    assert calls == [{"backend": "vertex", "project": "p-from-repo-var"}]
+
+
+@pytest.mark.parametrize(
+    "provider,api_key",
+    [("google-vertex", "express-key"), ("google", "k"), ("anthropic", "k")],
+)
+def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: str, api_key: str
+) -> None:
+    """A key crosses by value; the emulator is only for keyless Vertex."""
+    calls = _install_fake_emulator(monkeypatch)
+    config = _sandboxed(tmp_path, provider=provider, api_key=api_key)
+    overlay = oc_mod._sandbox_provider_env(config, tmp_path)
+    assert "GCE_METADATA_HOST" not in overlay
+    assert calls == []
 
 
 @pytest.mark.parametrize(

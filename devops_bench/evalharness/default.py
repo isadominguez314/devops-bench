@@ -886,55 +886,51 @@ class DefaultEvalHarness(Harness):
                     "the sandbox seam; refusing the whole batch rather than "
                     "provisioning a cluster per task just to fail each one"
                 )
-            if self.parallel:
-                # The sweep matches on the shared name prefix and cannot tell a
-                # crashed run's stray from a sibling harness's *live* agent
-                # container, so under BENCH_PARALLEL it would reap a concurrent
-                # run mid-task.
-                _log.info(
-                    "BENCH_PARALLEL set: skipping the stray sandbox-container "
-                    "sweep; reap leftovers manually with `docker ps --filter "
-                    "name=devops-bench-agent-` once no benchmark is running"
+            # A container the harness starts is normally reaped around its
+            # own run, but a harness process killed outright (Ctrl-C, OOM, a
+            # host reboot) never gets to run that ``finally``. Sweeping once
+            # here, before this batch's own containers exist, catches exactly
+            # that leak. The sweep itself decides whether BENCH_PARALLEL makes
+            # the match too broad to be safe.
+            try:
+                agent_sandbox.sweep_stray_containers(
+                    owner=self._agent_config.sandbox.owner, parallel=self.parallel
                 )
-            else:
-                # A container the harness starts is normally reaped around its
-                # own run, but a harness process killed outright (Ctrl-C, OOM,
-                # a host reboot) never gets to run that ``finally``. Sweeping
-                # once here, before this batch's own containers exist, catches
-                # exactly that leak without risking a live container from the
-                # run in progress.
-                try:
-                    agent_sandbox.sweep_stray_containers()
-                except Exception:  # noqa: BLE001 - a sweep failure must not block the run
-                    _log.exception("stray sandbox container sweep failed; continuing")
+            except Exception:  # noqa: BLE001 - a sweep failure must not block the run
+                _log.exception("stray sandbox container sweep failed; continuing")
 
         run_dir = self.reporter.new_run_dir()
 
         # Snapshot the home once before anything runs, purely to record which
         # leftovers predate the batch. Those are genuine prior-run artifacts
-        # and may always fingerprint. Skipped entirely when sandboxed: the
-        # operator home is not what the agent sees.
+        # and may always fingerprint. Skipped when no task will see the
+        # operator home: a sandboxed task sees its own, but a
+        # ``requires_unsandboxed`` task inside a sandboxed batch still runs
+        # against the real one.
         pre_existing: frozenset[str] = frozenset()
-        if not sandboxed:
+        if not sandboxed or any(task.requires_unsandboxed for task in tasks):
             pre_existing = frozenset(rule.source for rule in self._inventory_home() if rule.source)
 
         # One inventory per task iteration, paired positionally with
         # ``detailed_results`` (a batch may run the same task twice). Ambient
         # rules come from re-scanning the operator home before each agent
         # runs; a sandboxed task's home does not exist until ``_run_one``
-        # builds the workspace, so its rules come back from that call.
+        # builds the workspace, so its rules come back from that call. Decided
+        # per task, not per batch: a ``requires_unsandboxed`` task runs
+        # ambient inside a sandboxed batch and needs the ambient inventory.
         created_by: dict[str, str] = {}
         prev_task_name: str | None = None
         task_inventories: list[tuple[SensitiveAccessRule, ...]] = []
         detailed_results: list[dict[str, Any]] = []
         for task in tasks:
+            task_sandboxed = sandboxed and not task.requires_unsandboxed
             ambient_rules: tuple[SensitiveAccessRule, ...] = ()
-            if not sandboxed:
+            if not task_sandboxed:
                 ambient_rules = self._ambient_inventory_rules(
                     task.name, pre_existing, created_by, prev_task_name
                 )
             record, sandbox_rules = self._run_one(task, run_dir)
-            task_inventories.append(sandbox_rules if sandboxed else ambient_rules)
+            task_inventories.append(sandbox_rules if task_sandboxed else ambient_rules)
             detailed_results.append(record)
             prev_task_name = task.name
 

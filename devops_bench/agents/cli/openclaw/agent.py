@@ -75,9 +75,10 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.vertex_env import vertex_project
 from devops_bench.core import SubprocessError, get_logger
-from devops_bench.core.errors import ConfigError
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core.errors import ConfigError, SandboxError
+from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
@@ -136,19 +137,19 @@ _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
-# catalog; the harness registers these per-run (see :func:`_build_model_override`).
+# catalog, per oc provider; the harness registers these per-run (see
+# :func:`_build_model_override`). Keyed by provider because the override
+# replaces oc's provider entry: the same id on a provider not listed here must
+# keep passing through to oc's own catalog untouched.
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
-_CATALOG_OVERRIDES: frozenset[str] = frozenset(
-    {
-        "gemini-3.5-flash",
-        "gemini-3.7-flash",
-        "gemini-3.8-flash",
-        "claude-fable-5-1",
-        "claude-sonnet-5",
-        "claude-fable-5",
-        "claude-opus-5",
-    }
-)
+_GEMINI_CATALOG_OVERRIDES = frozenset({"gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.8-flash"})
+_CATALOG_OVERRIDES: dict[str, frozenset[str]] = {
+    "google": _GEMINI_CATALOG_OVERRIDES,
+    "google-vertex": _GEMINI_CATALOG_OVERRIDES,
+    "anthropic-vertex": frozenset(
+        {"claude-fable-5-1", "claude-sonnet-5", "claude-fable-5", "claude-opus-5"}
+    ),
+}
 
 # Transport each per-run provider entry must pin: such an entry *replaces* oc's
 # built-in provider rather than merging, so without ``api`` oc falls back to the
@@ -169,8 +170,9 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
     },
 }
 # Per-run layout of the node-fetch->native-fetch ESM loader shim (see
-# :func:`_write_node_fetch_shim`), written under the run's own workdir so it
-# is visible inside the sandboxed container at ``/workspace/node-fetch-shim``.
+# :func:`_write_node_fetch_shim`), written under the run's state dir: inside
+# the workspace so the sandboxed container can see it, but not a new top-level
+# workspace entry, which the harness's artifact diff would attribute to the agent.
 _NODE_FETCH_SHIM_DIRNAME = "node-fetch-shim"
 
 _NODE_FETCH_REGISTER_MJS = (
@@ -195,8 +197,8 @@ _NODE_FETCH_FETCH_MJS = (
 )
 
 
-def _write_node_fetch_shim(workdir: Path) -> None:
-    """Write the node-fetch->native-fetch ESM loader shim into ``workdir``.
+def _write_node_fetch_shim(state_dir: Path) -> Path:
+    """Write the node-fetch->native-fetch ESM loader shim under ``state_dir``.
 
     Works around a gaxios (7.3.1, google-auth-library's HTTP layer) bug inside
     the agent-sandbox image: with no ``window`` global, gaxios does
@@ -212,7 +214,7 @@ def _write_node_fetch_shim(workdir: Path) -> None:
     ``--user`` may not match whichever uid this (possibly privileged) process
     runs as, so permission bits do the work instead of a chown.
     """
-    shim_dir = workdir / _NODE_FETCH_SHIM_DIRNAME
+    shim_dir = state_dir / _NODE_FETCH_SHIM_DIRNAME
     shim_dir.mkdir(exist_ok=True)
     shim_dir.chmod(0o755)
     for name, content in (
@@ -223,6 +225,7 @@ def _write_node_fetch_shim(workdir: Path) -> None:
         path = shim_dir / name
         path.write_text(content)
         path.chmod(0o644)
+    return shim_dir
 
 
 def _oc_model_id(config: AgentConfig) -> str:
@@ -290,12 +293,12 @@ def _build_model_override(config: AgentConfig) -> dict:
     if not model_id:
         return {}
     provider, _, bare = model_id.partition("/")
-    if bare not in _CATALOG_OVERRIDES:
+    if bare not in _CATALOG_OVERRIDES.get(provider, frozenset()):
         return {}
     # A per-run provider entry *replaces* oc's built-in one, so it must pin a
     # transport; without one oc falls back to the OpenAI transport and 401s. Fail
     # loud rather than ship a broken (transport-less) entry for a provider we have
-    # not pinned.
+    # not pinned (a consistency check between the two tables above).
     if provider not in _PROVIDER_TRANSPORT:
         raise ConfigError(
             f"openclaw catalog override {model_id!r} has no pinned transport for "
@@ -332,11 +335,15 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
     Each MCP server entry inherits the run's ``KUBECONFIG`` (set by ``RunEnv``) as
     an explicit ``env`` so the MCP server (e.g. gke-mcp) reads the run-scoped
     cluster credentials directly instead of forcing the agent to re-fetch them.
+    Sandboxed, that is the container-side bind path: the host path is meaningless
+    inside the container, which is where the MCP server runs.
     """
     payload: dict = {}
     servers = build_mcp_servers(mcp_servers)
     if servers:
         kubeconfig = os.environ.get("KUBECONFIG")
+        if config.sandbox is not None:
+            kubeconfig = sandbox.CONTAINER_KUBECONFIG
         if kubeconfig:
             for entry in servers.values():
                 entry.setdefault("env", {})["KUBECONFIG"] = kubeconfig
@@ -387,8 +394,19 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     return overlay
 
 
-def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
-    """Forward explicit provider routing and enable metadata auth in the image."""
+def _sandbox_provider_env(config: AgentConfig, state_dir: Path) -> dict[str, str]:
+    """Forward explicit provider routing and give the container a model credential.
+
+    Sandbox-only: ``config.sandbox`` must be the task-completed spec, since the
+    shim path crosses the boundary in its container spelling.
+
+    A keyless Vertex run (``google-vertex`` or ``anthropic-vertex``) cannot see
+    the host's ADC, so it gets the shared metadata-emulator recipe from
+    :func:`~devops_bench.core.model_providers.sandbox_credential_env`, as
+    gemini_cli does: the metadata-host vars point the SDK at a host-side server
+    serving a narrowly scoped impersonated token, never at the VM's own
+    identity. A keyed run's key already crosses by value.
+    """
     overlay = {
         name: os.environ[name]
         for name in (
@@ -401,9 +419,15 @@ def _sandbox_provider_env(config: AgentConfig, workdir: Path) -> dict[str, str]:
         )
         if name in os.environ
     }
-    _write_node_fetch_shim(workdir)
-    overlay["NODE_OPTIONS"] = "--import=/workspace/node-fetch-shim/register.mjs"
-    if _oc_provider_or_none(config) == "anthropic-vertex":
+    sandbox_spec = config.sandbox
+    if sandbox_spec is None or sandbox_spec.workspace is None:
+        raise SandboxError("_sandbox_provider_env needs the task-completed sandbox spec")
+    register = _write_node_fetch_shim(state_dir) / "register.mjs"
+    overlay["NODE_OPTIONS"] = f"--import={sandbox.container_path(sandbox_spec.workspace, register)}"
+    spec = resolve_provider(config.provider)
+    if spec.backend == "vertex" and not config.api_key:
+        overlay.update(sandbox_credential_env(spec, project=vertex_project()))
+    if spec.oc_provider == "anthropic-vertex":
         overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
         overlay.setdefault("GOOGLE_CLOUD_API_KEY", "gcp-vertex-credentials")
     return overlay
@@ -428,9 +452,8 @@ def _oc_model_flag(config: AgentConfig) -> str:
 def _oc_provider_or_none(config: AgentConfig) -> str | None:
     """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
 
-    Shared by :func:`_needs_anthropic_vertex_auth_profile` and the sandboxed
-    anthropic-vertex env passthrough in :meth:`OpenClawAgent._execute`, so the
-    "is this run on anthropic-vertex" check has exactly one implementation.
+    Tolerant on purpose: :func:`_needs_anthropic_vertex_auth_profile` runs
+    before :func:`_build_env` has had its chance to fail loud on a typo.
     """
     try:
         return resolve_provider(config.provider).oc_provider
@@ -616,7 +639,7 @@ class OpenClawAgent(AgentHarness):
             agent_oc_bin = oc_bin
             spec = self.config.sandbox
             if spec is not None and spec.workspace is not None:
-                agent_env = {**_sandbox_provider_env(self.config, workdir), **agent_env}
+                agent_env = {**_sandbox_provider_env(self.config, state_dir), **agent_env}
                 agent_env["OPENCLAW_STATE_DIR"] = sandbox.container_path(spec.workspace, state_dir)
                 if "OPENCLAW_CONFIG_PATH" in agent_env:
                     agent_env["OPENCLAW_CONFIG_PATH"] = sandbox.container_path(
