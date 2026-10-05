@@ -1594,6 +1594,41 @@ def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -
     assert harness.build_agent_config().sandbox is not None
 
 
+def test_sandbox_exempt_task_gets_the_ambient_inventory(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``requires_unsandboxed`` task in a sandboxed batch runs against the
+    operator's real home, so it must get the ambient inventory, not the empty
+    sandbox one: the one task that can reach the home is the one the detector
+    would otherwise have no rules for."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / "old-notes.txt").write_text("leftover from a previous run\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+    monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda: None)
+
+    class _SandboxAwareLeftoverReader(_LeftoverReadingAgent):
+        supports_sandbox = True
+
+    AGENTS.register("fake-exempt-reader")(_SandboxAwareLeftoverReader)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-exempt-reader", no_infra=True
+        )
+        task = Task.from_dict(
+            {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+        )
+        results = harness.run([task])
+    finally:
+        AGENTS._items.pop("fake-exempt-reader", None)  # noqa: SLF001
+
+    report = results[0]["cheating_report"]
+    assert report["status"] == "flagged"
+    assert "prior-run-artifact" in report["categories"]
+
+
 def test_secret_rotation_declares_requires_unsandboxed() -> None:
     """The exemption travels with the task that needs it, not with a runner flag.
 
