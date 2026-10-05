@@ -624,6 +624,31 @@ def test_build_openclaw_config_merges_mcp_and_model_override() -> None:
     assert cfg["agents"]["defaults"]["models"] == {"google/gemini-3.5-flash": {}}
 
 
+def test_build_openclaw_config_threads_host_kubeconfig_into_mcp_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBECONFIG", "/home/op/.devops-bench/runs/r1/kubeconfig")
+    cfg = _build_openclaw_config(AgentConfig(), (McpBinding(name="gke", command=("gke-mcp",)),))
+    assert cfg["mcp"]["servers"]["gke"]["env"] == {
+        "KUBECONFIG": "/home/op/.devops-bench/runs/r1/kubeconfig"
+    }
+
+
+def test_build_openclaw_config_uses_container_kubeconfig_when_sandboxed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP server runs inside the container, where the credential lives at
+    the read-only bind path, not wherever RunEnv put it on the host."""
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    monkeypatch.setenv("KUBECONFIG", "/home/op/.devops-bench/runs/r1/kubeconfig")
+    cfg = _build_openclaw_config(
+        AgentConfig(sandbox=sandbox_mod.SandboxSpec(image="img")),
+        (McpBinding(name="gke", command=("gke-mcp",)),),
+    )
+    assert cfg["mcp"]["servers"]["gke"]["env"] == {"KUBECONFIG": sandbox_mod.CONTAINER_KUBECONFIG}
+
+
 # ---------------------------------------------------------------------------
 # Model catalog override: models oc doesn't ship by default get registered in
 # the per-run isolated config, for both google-genai and google-vertex.

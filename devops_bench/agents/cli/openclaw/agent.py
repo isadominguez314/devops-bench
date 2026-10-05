@@ -332,11 +332,15 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
     Each MCP server entry inherits the run's ``KUBECONFIG`` (set by ``RunEnv``) as
     an explicit ``env`` so the MCP server (e.g. gke-mcp) reads the run-scoped
     cluster credentials directly instead of forcing the agent to re-fetch them.
+    Sandboxed, that is the container-side bind path: the host path is meaningless
+    inside the container, which is where the MCP server runs.
     """
     payload: dict = {}
     servers = build_mcp_servers(mcp_servers)
     if servers:
         kubeconfig = os.environ.get("KUBECONFIG")
+        if config.sandbox is not None:
+            kubeconfig = sandbox.CONTAINER_KUBECONFIG
         if kubeconfig:
             for entry in servers.values():
                 entry.setdefault("env", {})["KUBECONFIG"] = kubeconfig
