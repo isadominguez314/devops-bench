@@ -1209,7 +1209,12 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
     monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
 
+    calls: list[list[str]] = []
+
     def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "kill"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
         if "chown" in argv:
             raise SubprocessError(argv, returncode=1, stdout="", stderr="boom")
         raise AssertionError("the agent container must not run when the pre-run chown fails")
@@ -1217,6 +1222,8 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
     monkeypatch.setattr(sandbox, "run", fake_run)
     with pytest.raises(SandboxError, match="chown"):
         executor.run(["gemini"])
+    # A partial pre-run chown still gets the handback attempt.
+    assert len([c for c in calls if "chown" in c]) == 2
 
 
 def test_remap_chowns_are_time_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1267,6 +1274,8 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_cannot_start(
     monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
 
     def fake_run(argv, **kwargs):
+        if argv[:2] == ["docker", "kill"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
         if "chown" in argv:
             raise FileNotFoundError("docker")
         raise AssertionError("the agent container must not run when the pre-run chown fails")
@@ -1356,6 +1365,30 @@ def test_spec_from_env_rejects_a_malformed_owner(owner: str) -> None:
     """Refused at opt-in; from inside the executor it would score as an errored agent."""
     with pytest.raises(SandboxError, match="BENCH_AGENT_SANDBOX_OWNER"):
         sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": "1", "BENCH_AGENT_SANDBOX_OWNER": owner})
+
+
+def test_chown_helper_is_named_and_killed_before_the_handback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timed-out chown helper must not keep changing ownership during the handback."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    executor.run(["agent"], check=False)
+
+    helper = f"{executor.container_name}-chown"
+    pre = calls[0]
+    assert "chown" in pre and pre[pre.index("--name") + 1] == helper
+    killed = calls.index(["docker", "kill", helper])
+    handback = next(i for i, c in enumerate(calls) if "3998470835:1000" in c)
+    assert killed < handback
 
 
 def test_remap_covers_external_generated_kubeconfig(tmp_path: Path) -> None:

@@ -407,10 +407,14 @@ class SandboxExecutor:
             *spec.fixture_mounts.items(),
         ]
 
+    @property
+    def _chown_container_name(self) -> str:
+        return f"{self.container_name}-chown"
+
     def _chown_argv(self, uid: int, gid: int) -> list[str]:
         """``docker run`` argv for a root container (same image, no ``--user``) that
         chowns every remap mount to ``uid:gid``; only root can chown ids past int32."""
-        argv = [CONTAINER_RUNTIME, "run", "--rm"]
+        argv = [CONTAINER_RUNTIME, "run", "--rm", "--name", self._chown_container_name]
         targets: list[str] = []
         for host_path, mount_path in self._remap_mounts():
             argv += ["-v", f"{host_path}:{mount_path}"]
@@ -533,9 +537,10 @@ class SandboxExecutor:
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
         remap = sys.platform.startswith("linux") and self._needs_id_remap()
-        if remap:
-            self._chown_before_remap()
         try:
+            # Inside the try so a partial or timed-out chown still gets the handback.
+            if remap:
+                self._chown_before_remap()
             try:
                 completed = run(
                     wrapped,
@@ -567,6 +572,8 @@ class SandboxExecutor:
                 kill_container(self.container_name)
             finally:
                 if remap:
+                    # A timed-out chown helper must not keep running during the handback.
+                    kill_container(self._chown_container_name)
                     self._chown_after_remap()
 
 
