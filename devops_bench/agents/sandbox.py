@@ -87,28 +87,14 @@ CONTAINER_WORKSPACE = "/workspace"
 CONTAINER_HOME = f"{CONTAINER_WORKSPACE}/home"
 CONTAINER_KUBECONFIG = "/creds/kubeconfig"
 
-# Docker rejects ``--user`` ids above int32 max ("uids and gids must be in
-# range 0-2147483647") and refuses to start the container AT ALL: no ``start``
-# event, exit code 125. Identities minted by an external IdP (GCP Cloud
-# Identity, Workspace external users, most LDAP setups) routinely exceed this,
-# so it is not an exotic case to guard against.
-#
-# Dropping ``--user`` when this happens (running the agent container as its
-# image's default user, root) was considered and rejected: it trades a
-# boundary failure for a silent containment downgrade. The untrusted agent
-# under test would gain root inside the very boundary this module exists to
-# enforce, and it would leave root-owned files in the operator's home and
-# workspace that teardown cannot remove without sudo (observed live). So when
-# an id is out of range we remap instead of degrading; see ``_REMAP_UID`` /
-# ``_REMAP_GID`` and ``SandboxExecutor._needs_id_remap``.
+# Docker refuses ``--user`` ids above int32 max outright (exit 125, no start
+# event); IdP-minted ids routinely exceed it. Dropping ``--user`` would run the
+# agent as root inside the boundary and leave root-owned files teardown cannot
+# remove (observed live), so out-of-range ids are remapped; see _needs_id_remap.
 _MAX_CONTAINER_ID = 2**31 - 1
 
-# The unprivileged, in-range id the agent container runs as when the caller's
-# real uid or gid cannot be passed to ``--user``. 1000 is not arbitrary: it is
-# the ``node`` user baked into the ``node:22-slim`` base these sandbox images
-# build on, so the remap lands on a real named unprivileged user rather than
-# an anonymous id. The agent stays unprivileged either way, which is the
-# property this module protects; only the specific id changes.
+# In-range unprivileged id for the remap: the ``node`` user of the node:22-slim
+# base the sandbox images build on.
 _REMAP_UID = 1000
 _REMAP_GID = 1000
 
@@ -327,26 +313,10 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
 def container_path(workspace: str | os.PathLike[str], path: str | os.PathLike[str]) -> str:
     """Map a host path under ``workspace`` to the path the container sees.
 
-    Module-level, not just a method, because a harness has to translate paths
-    *before* it hands them over: a value like ``OPENCLAW_STATE_DIR`` crosses the
-    boundary inside the env overlay, and the host spelling means nothing on the
-    other side. The executor's ``cwd`` mapping and these value translations must
-    agree, so they share one implementation.
-
-    Anything outside the workspace raises: the alternative would be to grow the
-    mount set to make the path exist, and the mount set is the boundary — it
-    only ever widens through an explicit spec field, never as a side effect of a
-    call site's ``cwd`` or an env value.
-
-    Args:
-        workspace: The run's host workspace, mounted at ``/workspace``.
-        path: A host path expected to live under it.
-
-    Returns:
-        The container-side absolute path.
-
-    Raises:
-        SandboxError: When ``path`` is not under ``workspace``.
+    Module-level because harnesses translate env values (e.g. ``OPENCLAW_STATE_DIR``)
+    before handing them over, and must agree with the executor's ``cwd`` mapping.
+    Raises :class:`SandboxError` outside the workspace: the mount set is the
+    boundary and only widens through an explicit spec field.
     """
     resolved = Path(path).resolve()
     root = Path(workspace).resolve()
@@ -424,21 +394,13 @@ class SandboxExecutor:
         return container_path(self._workspace, path)
 
     def _needs_id_remap(self) -> bool:
-        """Whether the caller's uid/gid must be remapped for ``--user``.
-
-        Only asked on Linux (macOS never passes ``--user`` at all). ``True``
-        when either id exceeds Docker's int32 ``--user`` limit, which is
-        exactly the case docker itself would otherwise refuse to start a
-        container over.
-        """
+        """Linux only: whether either host id exceeds Docker's int32 ``--user`` limit."""
         return os.getuid() > _MAX_CONTAINER_ID or os.getgid() > _MAX_CONTAINER_ID
 
     def _remap_mounts(self) -> list[tuple[str, str]]:
-        """Host path -> container path for every mount a chown pass must cover.
+        """Host -> container path for every mount a chown pass must cover.
 
-        The workspace, the generated kubeconfig, and every fixture mount (see ``discover_fixture_mounts``):
-        fixtures live outside the workspace, in the operator's home, so a chown
-        of the workspace alone would strand them exactly as un-owned as before.
+        Fixtures live outside the workspace, so the workspace alone is not enough.
         """
         spec = self.spec
         return [
@@ -448,14 +410,8 @@ class SandboxExecutor:
         ]
 
     def _chown_argv(self, uid: int, gid: int) -> list[str]:
-        """``docker run`` argv for a throwaway root container that chowns every
-        remap mount to ``uid:gid``.
-
-        Runs from the same sandbox image as the agent container (no extra pull)
-        and carries no ``--user``, so it runs as root, the only user that can
-        chown arbitrary ids either direction (including up past int32, which
-        plain ``chown`` has no restriction on, unlike docker's ``--user``).
-        """
+        """``docker run`` argv for a root container (same image, no ``--user``) that
+        chowns every remap mount to ``uid:gid``; only root can chown ids past int32."""
         argv = [CONTAINER_RUNTIME, "run", "--rm"]
         targets: list[str] = []
         for host_path, mount_path in self._remap_mounts():
@@ -465,33 +421,24 @@ class SandboxExecutor:
         return argv
 
     def _chown_before_remap(self) -> None:
-        """Chown the workspace and fixtures to ``_REMAP_UID:_REMAP_GID`` before
-        the agent container starts.
+        """Chown workspace and fixtures to the remap id before the agent starts.
 
-        Fatal on failure: running on without it means the remapped, unprivileged
-        agent container cannot write a workspace it does not own, and the run
-        would produce a misleading result instead of an honest refusal.
+        Fatal: an unprivileged agent cannot write a workspace it does not own.
         """
         argv = self._chown_argv(_REMAP_UID, _REMAP_GID)
         try:
             run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
         except (OSError, SubprocessError) as exc:
             raise SandboxError(
-                f"could not chown the workspace/fixtures to {_REMAP_UID}:{_REMAP_GID} "
-                "before starting the id-remapped agent container; running on would "
-                "hand an unprivileged agent a workspace it cannot write, so refusing "
-                "rather than produce a misleading result"
+                f"could not chown the workspace/fixtures to {_REMAP_UID}:{_REMAP_GID} before "
+                "the id-remapped agent container; refusing to hand it a workspace it cannot write"
             ) from exc
 
     def _chown_after_remap(self) -> None:
-        """Chown the workspace and fixtures back to the real host uid/gid after
-        the agent container exits.
+        """Chown workspace and fixtures back to the host uid/gid after the agent exits.
 
-        Best-effort and never raises: a failure here must not mask a real agent
-        result, but it does leave the artifacts owned by the remap id rather
-        than the operator, who then cannot read or delete them without root. So
-        it is logged as an error carrying the exact repair command to run by
-        hand.
+        Best-effort: a failure must not mask the agent result, so it is logged with
+        the exact repair command.
         """
         uid, gid = os.getuid(), os.getgid()
         argv = self._chown_argv(uid, gid)
@@ -499,10 +446,8 @@ class SandboxExecutor:
             run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
         except (OSError, SubprocessError):
             _log.error(
-                "could not chown the workspace/fixtures back to %s:%s after the "
-                "id-remapped agent container exited; the artifacts are left owned "
-                "by the remap id and the operator cannot read or delete them "
-                "without root. Repair manually: %s",
+                "could not chown the workspace/fixtures back to %s:%s; they stay owned by "
+                "the remap id. Repair manually: %s",
                 uid,
                 gid,
                 " ".join(argv),

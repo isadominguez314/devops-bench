@@ -1732,12 +1732,7 @@ def test_same_task_repeat_is_not_fingerprinted(
 
 
 def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -> None:
-    """secret-rotation drives Secret Manager through ADC, which the sandbox strips.
-
-    Clearing the field matters rather than merely skipping spec completion: the
-    agent's own gate reads ``config.sandbox is not None``, so a leftover
-    skeletal spec would refuse the run or hand the executor half a boundary.
-    """
+    """The field is cleared, not merely left skeletal: the agent's gate reads it."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
     from dataclasses import replace as _replace
 
@@ -1783,14 +1778,8 @@ def test_sandbox_exempt_task_gets_the_ambient_inventory(
 
 
 def test_secret_rotation_declares_requires_unsandboxed() -> None:
-    """The exemption travels with the task that needs it, not with a runner flag.
-
-    Loaded through the real loader, not read as raw YAML: ``Task.from_dict``
-    builds an explicit field mapping and ``Task`` ignores unknown keys, so a key
-    missing from that mapping is dropped silently — a raw-YAML assertion stays
-    green while the harness sees the ``False`` default. The raw-YAML check stays
-    alongside as a spec-content check, but the loader path is the coverage.
-    """
+    """Checked through the real loader: ``Task`` drops unknown keys silently, so a
+    raw-YAML assertion alone would stay green while the harness saw ``False``."""
     import pathlib
 
     import yaml as _yaml

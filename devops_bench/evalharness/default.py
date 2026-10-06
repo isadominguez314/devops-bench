@@ -346,11 +346,8 @@ class DefaultEvalHarness(Harness):
         it instead. Everything else is unchanged.
         """
         if sandbox_exempt:
-            # A task that declared ``requires_unsandboxed``. Clearing the field
-            # rather than leaving the skeletal spec in place is the whole point:
-            # the agent's own gate reads ``config.sandbox is not None``, so a
-            # leftover spec would either refuse the run or hand the executor an
-            # incomplete boundary.
+            # Clear the field rather than leave the skeletal spec: the agent's
+            # own gate reads ``config.sandbox is not None``.
             return replace(self._agent_config, sandbox=None)
         if sandbox_spec is not None:
             return replace(self._agent_config, sandbox=sandbox_spec)
@@ -378,11 +375,8 @@ class DefaultEvalHarness(Harness):
             max_turns=base.max_turns,
             capabilities=capabilities,
             extra_env=base.extra_env,
-            # Rebuilding field-by-field silently drops anything not named
-            # here. Omitting extra_flags meant AGENT_EXTRA_FLAGS parsed fine
-            # and then never reached the binary, so agy kept its 5m default
-            # --print-timeout and every run longer than that died mid-task
-            # with "timeout waiting for response".
+            # Rebuilding field-by-field drops anything not named here; omitting
+            # extra_flags once left agy on its 5m default --print-timeout.
             extra_flags=base.extra_flags,
             sandbox=base.sandbox,
         )
@@ -1132,12 +1126,8 @@ class DefaultEvalHarness(Harness):
             # working directory), not the harness process's launch cwd.
             workspace_path = Path(tempfile.mkdtemp(prefix="devops-bench-workspace-"))
             if self._agent_config.sandbox is not None and task.requires_unsandboxed:
-                # The task declared that it cannot run behind the boundary —
-                # secret-rotation drives Secret Manager through ADC, and ADC is
-                # exactly what the sandbox strips. Skip the sandbox for this
-                # task instead of failing it, and say so: an operator who asked
-                # for a sandboxed matrix must be able to see which tasks did not
-                # get one, rather than discovering it in the manifest later.
+                # The task cannot run behind the boundary (secret-rotation needs
+                # ADC); skip the sandbox for it and say so loudly.
                 _log.warning(
                     "task %s declares requires_unsandboxed; running it OUTSIDE the "
                     "agent sandbox even though a sandbox was requested",

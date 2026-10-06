@@ -1086,9 +1086,7 @@ def test_gemini_declares_sandbox_support() -> None:
 
 
 def test_container_path_maps_a_workspace_child(tmp_path) -> None:
-    # An env value like OPENCLAW_STATE_DIR crosses the boundary inside the
-    # overlay, so the harness has to translate it before handing it over; the
-    # host spelling means nothing on the other side.
+    # Env values like OPENCLAW_STATE_DIR cross in the overlay and need the container spelling.
     assert sandbox.container_path(tmp_path, tmp_path / "state") == "/workspace/state"
 
 
@@ -1097,20 +1095,14 @@ def test_container_path_maps_the_workspace_root(tmp_path) -> None:
 
 
 def test_container_path_refuses_a_path_outside_the_workspace(tmp_path) -> None:
-    # Widening the mount set is the only way to make such a path exist, and the
-    # mount set is the boundary.
+    # The mount set is the boundary; it never widens to make a path exist.
     outside = tmp_path.parent / "elsewhere"
     with pytest.raises(SandboxError, match="outside the sandbox workspace"):
         sandbox.container_path(tmp_path, outside)
 
 
 def test_every_cli_harness_declares_sandbox_support() -> None:
-    """All four CLI harnesses route their agent turn through the seam.
-
-    A harness that does not is refused outright by ``AgentHarness.run`` when the
-    sandbox flag is on, so this is what stops a "sandboxed" matrix from silently
-    skipping an arm.
-    """
+    """All four CLI harnesses declare the seam; an undeclared one is refused when sandboxed."""
     from devops_bench.agents.cli.antigravity.agent import AgyCliAgent
     from devops_bench.agents.cli.claude_code.agent import ClaudeCodeAgent
     from devops_bench.agents.cli.gemini_cli.agent import GeminiCliAgent
@@ -1123,8 +1115,7 @@ def test_every_cli_harness_declares_sandbox_support() -> None:
 def test_wrap_argv_remaps_user_when_uid_exceeds_dockers_limit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An external IdP can hand out a uid past docker's int32 ``--user``
-    limit; docker would otherwise refuse to start the container at all."""
+    """An IdP-minted uid past docker's int32 ``--user`` limit is remapped, not refused."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
@@ -1153,9 +1144,7 @@ def test_wrap_argv_remaps_user_when_gid_exceeds_dockers_limit(
 def test_executor_run_skips_chown_containers_when_ids_are_in_range(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No new containers, no chowns, when both host ids fit docker's ``--user``
-    range: the in-range path is unchanged, and a caller already running as
-    root (uid 0) is in range and so takes this existing path untouched."""
+    """In-range ids (root included) take the old path: no chown containers."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 1000)
@@ -1177,10 +1166,7 @@ def test_executor_run_skips_chown_containers_when_ids_are_in_range(
 def test_executor_run_chowns_workspace_and_fixtures_around_a_remapped_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """When the caller's uid is out of docker's ``--user`` range, a pre-run
-    chown to the remap id and a post-run chown back to the real id must
-    bracket the agent container, covering the workspace AND every fixture
-    mount (fixtures live outside the workspace, in the operator's home)."""
+    """Out-of-range uid: chown to the remap id and back brackets the run, fixtures included."""
     fixture = tmp_path / "fixture-repo"
     fixture.mkdir()
     spec = _complete_spec(tmp_path, fixture_mounts={str(fixture): "/workspace/home/fixture-repo"})
@@ -1240,8 +1226,7 @@ def test_executor_run_chowns_workspace_and_fixtures_when_only_the_gid_is_out_of_
 def test_executor_run_chowns_back_even_when_the_agent_container_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The handback runs in a ``finally``: an agent crash must not strand the
-    remapped, root-owned artifacts."""
+    """The handback runs in a ``finally``, so an agent crash cannot strand the artifacts."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
@@ -1266,9 +1251,7 @@ def test_executor_run_chowns_back_even_when_the_agent_container_raises(
 def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Fatal, not best-effort: without the pre-run chown the remapped,
-    unprivileged agent could not write its own workspace, so the run must
-    refuse rather than produce a misleading result."""
+    """Fatal: without the pre-run chown the remapped agent cannot write its workspace."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
@@ -1344,8 +1327,7 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_cannot_start(
 def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Non-Linux still omits ``--user`` entirely, as before; the remap only
-    exists to keep ``--user`` usable on Linux."""
+    """Non-Linux still omits ``--user`` entirely; the remap is Linux-only."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "darwin")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
@@ -1488,8 +1470,7 @@ def test_invalid_wrap_never_changes_mount_ownership(
 def test_executor_run_handback_failure_does_not_mask_a_successful_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failed handback chown is logged with the literal repair command, but
-    a real agent result must still come back to the caller."""
+    """A failed handback is logged with the repair command; the agent result still returns."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     monkeypatch.setattr(sandbox.sys, "platform", "linux")
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
