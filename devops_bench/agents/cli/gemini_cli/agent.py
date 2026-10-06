@@ -52,7 +52,7 @@ from devops_bench.agents.shared.vertex_env import (
     vertex_location,
     vertex_project,
 )
-from devops_bench.core import ConfigError, SandboxError, SubprocessError, get_logger
+from devops_bench.core import ConfigError, SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
@@ -72,6 +72,9 @@ _GEMINI_SETTINGS_FILE = "settings.json"
 _GEMINI_SKILLS_DIR = "skills"
 
 _log = get_logger("agents.cli.gemini_cli")
+
+# The image ships its own gemini on PATH; a host binary path cannot exec inside.
+_CONTAINER_GEMINI_BIN = "gemini"
 
 
 def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool) -> dict:
@@ -258,16 +261,9 @@ class GeminiCliAgent(AgentHarness):
         ``workspace_path`` is left for the harness to collect and clean up.
         """
         caps = self.config.capabilities
-        raw_target = self.config.target or "gemini"
-        if self.config.sandbox is not None and raw_target.startswith("~"):
-            # expanduser resolves against the HOST home; the resulting path
-            # cannot exist in the container image.
-            raise SandboxError(
-                f"AGENT_TARGET={raw_target!r} resolves against the host home; a "
-                "sandboxed run needs the binary's in-image path (or the bare "
-                "name on the image's PATH)"
-            )
-        target = os.path.expanduser(raw_target)
+        target = os.path.expanduser(self.config.target or "gemini")
+        if self.config.sandbox is not None:
+            target = _CONTAINER_GEMINI_BIN
         argv = _build_argv(target, prompt, caps.allowed_tools, self.config.extra_flags)
         env_overlay = _build_env(self.config)
         rules_text = caps.rules.text

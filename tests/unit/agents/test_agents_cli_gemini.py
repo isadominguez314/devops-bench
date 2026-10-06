@@ -435,6 +435,22 @@ def test_execute_returns_typed_result_with_trajectory(monkeypatch: pytest.Monkey
     assert captured["argv"][-2:] == ["-p", "ping"]
 
 
+def test_execute_sandboxed_uses_the_in_image_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sandboxed, argv[0] is the image's gemini even when AGENT_TARGET is a host path."""
+    captured: dict = {}
+
+    def fake_cmd(self: GeminiCliAgent, argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["argv"] = argv
+        return SimpleNamespace(stdout=SAMPLE_STREAM, stderr="", returncode=0)
+
+    monkeypatch.setattr(GeminiCliAgent, "run_agent_cmd", fake_cmd)
+    agent = GeminiCliAgent(
+        AgentConfig(target="/opt/host/bin/gemini", sandbox=SandboxSpec(image="img"))
+    )
+    agent.run("ping")
+    assert captured["argv"][0] == "gemini"
+
+
 def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         return SimpleNamespace(stdout="", stderr="boom", returncode=2)
@@ -835,17 +851,6 @@ def test_execute_does_not_seed_folder_trust_when_unsandboxed(
     )
     agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
     assert not (tmp_path / "home" / ".gemini").exists()
-
-
-def test_execute_refuses_a_host_home_target_when_sandboxed(tmp_path: Path) -> None:
-    """expanduser resolves ~ against the HOST home; the resulting path cannot
-    exist in the image, so refuse loudly instead of a confusing exec failure."""
-    from devops_bench.agents.sandbox import SandboxSpec
-    from devops_bench.core import SandboxError
-
-    agent = GeminiCliAgent(AgentConfig(target="~/bin/gemini", sandbox=SandboxSpec(image="img")))
-    with pytest.raises(SandboxError, match="host home"):
-        agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
 
 
 def test_build_settings_combines_mcp_servers_and_skills_flag() -> None:
