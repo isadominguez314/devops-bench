@@ -194,9 +194,9 @@ class Task(BaseModel):
             ``title`` and ``description`` on every verification entry), because
             the leaderboard renders validated tasks and nothing else.
         requires_unsandboxed: Opt this task out of the agent sandbox even when the
-            run asks for one, for a task whose objective needs the credential the
-            sandbox withholds (``secret-rotation`` needs ADC). Declared on the
-            task so the exemption travels with it.
+            run asks for one, for a task whose objective needs an ambient cloud
+            credential the sandbox withholds (``gcp/secret-rotation``). Declared on
+            the task so the exemption travels with it.
     """
 
     model_config = _STRICT
@@ -293,10 +293,7 @@ class Task(BaseModel):
             group = entry.get("group")
             if group is None:
                 continue
-            # Raw mappings, so the value can be anything YAML produced. A
-            # non-string is unhashable or meaningless as a key, and would be
-            # rejected by parse_entries anyway; say so here instead of raising
-            # a TypeError from the membership test.
+            # Raw YAML value: reject a non-string here rather than TypeError on the lookup.
             if not isinstance(group, str):
                 raise ValueError(f"verification entry {label!r}: group must be a string")
             # Stripped here as VerificationEntry strips it, so the two agree.

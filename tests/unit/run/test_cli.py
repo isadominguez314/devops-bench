@@ -60,11 +60,7 @@ def test_build_parser_parses_flags() -> None:
 def test_infra_flag_forces_provisioning_over_truthy_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--infra`` overrides a truthy ``BENCH_NO_INFRA`` env back to False.
-
-    The previous ``store_true`` flag could only ever skip infra; the tri-state
-    pair lets the CLI force provisioning back on regardless of the env.
-    """
+    """``--infra`` overrides a truthy ``BENCH_NO_INFRA`` back to False (tri-state pair)."""
     monkeypatch.setenv("BENCH_NO_INFRA", "true")
     parser = build_parser()
     args = parser.parse_args(["src", "--infra"])
@@ -141,11 +137,7 @@ def test_main_exit_two_on_config_error(
 def test_main_exit_two_on_missing_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A nonexistent source is a config error (exit 2), distinct from task failures.
-
-    No ``FileNotFoundError`` handler is needed in the CLI: the task loader
-    normalizes missing paths and parse failures into ``ConfigError``.
-    """
+    """A nonexistent source is a config error (exit 2); the loader normalizes it to ConfigError."""
     monkeypatch.delenv("BENCH_PARALLEL", raising=False)
     missing = tmp_path / "does-not-exist.yaml"
     assert main([str(missing), "--no-infra"]) == 2
@@ -157,12 +149,7 @@ def test_main_exit_two_on_missing_source(
 def test_main_exit_two_on_malformed_env(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A config error raised while building the config (not just running) exits 2.
-
-    ``BenchmarkConfig.from_env`` raises ``ConfigError`` on a malformed env
-    value, so ``args_to_config`` must sit inside ``main``'s try — otherwise
-    the error escapes as a traceback with the wrong exit code.
-    """
+    """A config error while building the config exits 2; ``args_to_config`` sits inside the try."""
     monkeypatch.setenv("EVAL_LIMIT", "abc")
     assert main(["src", "--no-infra"]) == 2
     err = capsys.readouterr().err
