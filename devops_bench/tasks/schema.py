@@ -193,14 +193,10 @@ class Task(BaseModel):
             the display metadata (``title``, ``summary``, ``category``, and a
             ``title`` and ``description`` on every verification entry), because
             the leaderboard renders validated tasks and nothing else.
-        requires_unsandboxed: Opt this task out of the agent sandbox even when
-            the run asks for one. For a task whose objective *is* the credential
-            the sandbox withholds: ``secret-rotation`` drives Secret Manager
-            through Application Default Credentials, and ADC is exactly what the
-            boundary strips, so a sandboxed run cannot do the task at all.
-            Declared on the task rather than passed per-run so the exemption
-            travels with the thing that needs it and is visible to anyone
-            reading the spec.
+        requires_unsandboxed: Opt this task out of the agent sandbox even when the
+            run asks for one, for a task whose objective needs the credential the
+            sandbox withholds (``secret-rotation`` needs ADC). Declared on the
+            task so the exemption travels with it.
     """
 
     model_config = _STRICT

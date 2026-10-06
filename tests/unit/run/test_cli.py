@@ -28,14 +28,8 @@ from devops_bench.run import BenchmarkResult
 
 @pytest.fixture(autouse=True)
 def _restore_devops_bench_logger() -> Iterator[None]:
-    """Undo ``main``'s ``configure_logging`` side effects after each test.
-
-    ``main`` attaches a real handler, sets ``propagate = False`` and sets the
-    level on the package logger — correct in production, but ``caplog`` in
-    later tests relies on propagation to the root logger and on the default
-    threshold, so leak-through here fails unrelated tests depending on
-    execution order.
-    """
+    """Undo ``main``'s ``configure_logging`` side effects (handlers, propagation,
+    level), which otherwise break ``caplog`` in later tests."""
     import logging
 
     root = logging.getLogger("devops_bench")
@@ -197,14 +191,7 @@ def test_help_works_even_with_an_unknown_log_level(monkeypatch: pytest.MonkeyPat
 
 
 def test_main_attaches_a_real_log_handler(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """``main`` must configure logging, or every library warning is silent.
-
-    The package root logger carries a ``NullHandler`` (library etiquette),
-    which also suppresses logging's last-resort stderr fallback — so without
-    ``configure_logging()`` in the entry point, operator-facing warnings
-    (e.g. the ``requires_unsandboxed`` exemption notice) never appear in a
-    real run's output.
-    """
+    """The package logger's ``NullHandler`` silences every warning unless ``main`` configures logging."""
     import logging
 
     monkeypatch.setattr(

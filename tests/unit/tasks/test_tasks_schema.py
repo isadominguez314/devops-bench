@@ -275,8 +275,7 @@ def test_requires_unsandboxed_defaults_false():
 
 
 def test_requires_unsandboxed_parsed_from_spec():
-    # from_dict builds an explicit field mapping and Task ignores unknown keys,
-    # so a key absent from that mapping is dropped silently; this pins the wiring.
+    # Task drops unknown keys silently, so this pins the from_dict wiring.
     assert Task.from_dict({"name": "n", "requires_unsandboxed": True}).requires_unsandboxed is True
 
 

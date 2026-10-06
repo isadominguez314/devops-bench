@@ -129,8 +129,7 @@ _log = get_logger("agents.cli.openclaw.agent")
 # Per-run layout under the temp working dir. ``state`` is openclaw's state root
 # (sessions + the managed skills tree); ``openclaw.json`` is the isolated config
 # carrying ``mcp.servers``.
-# The image ships its own oc on PATH; the host binary path is meaningless
-# inside the container.
+# The image ships its own oc on PATH; a host binary path means nothing inside.
 _CONTAINER_OC_BIN = "oc"
 _OPENCLAW_STATE_DIRNAME = "state"
 _OPENCLAW_SKILLS_DIRNAME = "skills"
@@ -195,19 +194,10 @@ _NODE_FETCH_FETCH_MJS = (
 def _write_node_fetch_shim(state_dir: Path) -> Path:
     """Write the node-fetch->native-fetch ESM loader shim under ``state_dir``.
 
-    Works around a gaxios (7.3.1, google-auth-library's HTTP layer) bug inside
-    the agent-sandbox image: with no ``window`` global, gaxios does
-    ``(await import('node-fetch')).default`` to reach the compute-SA metadata
-    server, and that dynamic import throws ("Cannot convert undefined or null
-    to object") because node-fetch is not installed in the image. A Node
-    module-customization hook (registered via ``NODE_OPTIONS``, see the
-    sandboxed branch of :meth:`OpenClawAgent._execute`) intercepts only the
-    bare ``node-fetch`` specifier and resolves it to a tiny shim built on
-    Node's native ``fetch``; every other import passes through unchanged.
-
-    Files are written world-readable (0o644, dir 0o755): the container's own
-    ``--user`` may not match whichever uid this (possibly privileged) process
-    runs as, so permission bits do the work instead of a chown.
+    gaxios 7.3.1 (google-auth-library) dynamically imports ``node-fetch`` to reach
+    the metadata server and throws because the image lacks it; a module hook
+    (``NODE_OPTIONS``) resolves that one specifier to a shim over native ``fetch``.
+    World-readable because the container's ``--user`` may not match this process.
     """
     shim_dir = state_dir / _NODE_FETCH_SHIM_DIRNAME
     shim_dir.mkdir(exist_ok=True)
@@ -449,25 +439,13 @@ def _oc_provider_or_none(config: AgentConfig) -> str | None:
 
 
 def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
-    """Return whether this run must register a headless anthropic-vertex auth profile.
+    """Whether a keyless anthropic-vertex run must register a headless auth profile.
 
-    Confirmed live against openclaw 2026.9.1-beta.1 + anthropic-vertex-provider
-    2026.9.1-beta.1 (the first pairing where the plugin is correctly discovered
-    as a stock plugin -- see the Dockerfile comment): even with valid ADC
-    credentials on disk and the ``gcp-vertex-credentials`` marker pinned on
-    ``models.providers.anthropic-vertex.apiKey`` (see :data:`_PROVIDER_TRANSPORT`),
-    a bare run still aborts with ``ProviderAuthError: No API key found for
-    provider "anthropic-vertex"``. This version introduced a per-agent SQLite
-    auth-profile store that gates model auth *before* the plugin's own
-    ADC-detecting ``resolveSyntheticAuth`` hook is consulted, so the marker in
-    config is no longer sufficient on its own -- an explicit profile entry must
-    exist in that store too.
-
-    ``oc models auth paste-api-key --provider anthropic-vertex`` registers
-    that entry non-interactively (it reads the key from stdin, no TTY
-    required), so it is safe to run unattended before every keyless
-    anthropic-vertex turn (see :func:`_build_local_command`). It is a no-op
-    correctness-wise for a run that already carries an explicit API key.
+    openclaw 2026.9.1-beta.1 gates model auth on a per-agent SQLite profile store
+    before the plugin's ADC-detecting hook runs, so the ``gcp-vertex-credentials``
+    marker alone aborts with ``ProviderAuthError`` (observed live). ``oc models
+    auth paste-api-key`` registers the entry non-interactively, so it runs before
+    every keyless turn (see :func:`_build_local_command`).
     """
     return _oc_provider_or_none(config) == "anthropic-vertex" and not config.api_key
 
@@ -557,12 +535,9 @@ class OpenClawAgent(AgentHarness):
             per-run isolated one written for MCP).
     """
 
-    # The agent turn goes through run_agent_cmd, so it is contained. The
-    # post-run ``oc sessions`` / ``export-trajectory`` calls stay on the host
-    # by design: session state lives in ``<workspace>/state``, which is the
-    # bind mount itself, so the host reads exactly the bytes the container
-    # wrote — with the host spelling of the path, and without keeping a
-    # container alive past the agent's turn just to read a directory.
+    # The agent turn goes through run_agent_cmd. The post-run ``oc sessions`` /
+    # export calls stay on the host: the state dir is on the bind mount, so the
+    # host reads the same bytes without keeping a container alive.
     supports_sandbox = True
 
     def __init__(self, config: AgentConfig | None = None, *, agent_name: str = "main") -> None:
@@ -614,14 +589,9 @@ class OpenClawAgent(AgentHarness):
                 config_path.write_text(json.dumps(config_payload, indent=2))
                 env_overlay["OPENCLAW_CONFIG_PATH"] = str(config_path)
 
-            # Two overlays, because the agent turn and the post-run extraction
-            # run on opposite sides of the boundary. The agent needs the
-            # container spelling of every path that crosses in its env; the
-            # extraction runs on the host afterwards and needs the host
-            # spelling. They read the same bytes either way: the state dir
-            # lives under the workspace, which IS the bind mount, so whatever
-            # the agent writes inside the container is on the host when it
-            # exits. Unsandboxed the two overlays are identical.
+            # Two overlays: the agent needs container spellings of the paths in
+            # its env, the host-side extraction needs host spellings; same bytes,
+            # the state dir is on the bind mount. Unsandboxed they are identical.
             agent_env = dict(env_overlay)
             agent_oc_bin = oc_bin
             spec = self.config.sandbox
@@ -632,8 +602,6 @@ class OpenClawAgent(AgentHarness):
                     agent_env["OPENCLAW_CONFIG_PATH"] = sandbox.container_path(
                         spec.workspace, agent_env["OPENCLAW_CONFIG_PATH"]
                     )
-                # The host binary path means nothing inside the image, which
-                # ships its own oc on PATH.
                 agent_oc_bin = _CONTAINER_OC_BIN
 
             command = _build_local_command(self.config, final_prompt, self.agent_name, agent_oc_bin)

@@ -404,14 +404,7 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
 
 @mock.patch.object(pathlib.Path, "home")
 def test_agy_cli_agent_sandboxed_argv_uses_container_spellings(mock_home, tmp_path, monkeypatch):
-    """Sandboxed, argv[0] must be the image's agy, never a host path.
-
-    _resolve_binary answers with a host spelling (config.target, or the
-    ~/.local/bin fallback when the operator has agy installed), and argv
-    crosses the boundary verbatim — so without the _CONTAINER_AGY_BIN swap
-    the container execs a path that only exists on the host. Same idiom as
-    openclaw's oc swap; --gemini_dir gets the same treatment.
-    """
+    """Sandboxed, argv[0] and --gemini_dir must be container spellings, never host paths."""
     from devops_bench.agents import sandbox as sandbox_mod
 
     mock_home.return_value = tmp_path
