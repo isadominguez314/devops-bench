@@ -286,9 +286,13 @@ class ClaudeCodeAgent(AgentHarness):
     arm needs a keyed credential to run sandboxed.
     """
 
-    # All agent subprocesses go through run_agent_cmd; the --version probe stays
-    # a host call since it runs before any sandbox exists.
-    supports_sandbox = True
+    # The agent turn goes through run_agent_cmd, but three host paths still cross
+    # the boundary verbatim (argv[0], --mcp-config, CLAUDE_CONFIG_DIR), so a
+    # sandboxed run is refused at preflight rather than failing inside the container.
+    # TODO(sandbox): swap argv[0] for an in-image binary name, translate the MCP
+    # config path with sandbox.container_path, keep the config dir under the
+    # workspace, validate live, then flip this to True.
+    supports_sandbox = False
 
     def __init__(self, config: AgentConfig | None = None) -> None:
         AgentHarness.__init__(self, config)

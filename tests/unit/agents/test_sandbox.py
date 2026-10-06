@@ -1052,15 +1052,16 @@ def test_container_path_refuses_a_path_outside_the_workspace(tmp_path) -> None:
         sandbox.container_path(tmp_path, outside)
 
 
-def test_every_cli_harness_declares_sandbox_support() -> None:
-    """All four CLI harnesses declare the seam; an undeclared one is refused when sandboxed."""
+def test_cli_harness_sandbox_support_is_declared_deliberately() -> None:
+    """Three harnesses declare the seam; claude_code opts out until its host paths are ported."""
     from devops_bench.agents.cli.antigravity.agent import AgyCliAgent
     from devops_bench.agents.cli.claude_code.agent import ClaudeCodeAgent
     from devops_bench.agents.cli.gemini_cli.agent import GeminiCliAgent
     from devops_bench.agents.cli.openclaw.agent import OpenClawAgent
 
-    for cls in (AgyCliAgent, ClaudeCodeAgent, GeminiCliAgent, OpenClawAgent):
+    for cls in (AgyCliAgent, GeminiCliAgent, OpenClawAgent):
         assert cls.supports_sandbox is True, f"{cls.__name__} is not wired onto the seam"
+    assert ClaudeCodeAgent.supports_sandbox is False
 
 
 def test_wrap_argv_remaps_user_when_uid_exceeds_dockers_limit(
