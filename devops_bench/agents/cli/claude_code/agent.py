@@ -212,8 +212,8 @@ class ClaudeCodeAgent(AgentHarness):
     The binary comes from ``config.target``, else ``claude`` on ``PATH``; model
     via ``--model``, key via the env overlay. ``__init__`` assigns
     ``mcp_servers``/``skills``/``rules`` so the agent satisfies the ``Supports*``
-    protocols. Sandboxed, only a keyed credential crosses; ambient cloud
-    credentials never do.
+    protocols. Sandboxed runs are refused until the host paths are ported (see
+    ``supports_sandbox``).
     """
 
     # Refused at preflight: argv[0], --mcp-config and CLAUDE_CONFIG_DIR still cross

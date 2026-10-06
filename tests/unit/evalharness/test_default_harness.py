@@ -1081,10 +1081,37 @@ def test_run_fails_fast_on_an_unmigrated_agent_when_sandboxed(
     AGENTS.register("fake-unmigrated")(_UnmigratedAgent)
     try:
         harness = _sandboxed_harness(monkeypatch, tmp_path, agent_type="fake-unmigrated")
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
         with pytest.raises(SandboxError, match="not been migrated"):
-            harness.run([])
+            harness.run([task])
     finally:
         AGENTS._items.pop("fake-unmigrated", None)  # noqa: SLF001
+
+
+def test_exempt_only_batch_skips_the_sandbox_preflight(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch of only requires_unsandboxed tasks runs ambient, so an agent without
+    sandbox support must not be refused for it."""
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
+
+    class _UnmigratedAgent(AgentHarness):
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            return AgentResult(output="done", trajectory=[])
+
+    AGENTS.register("fake-unmigrated-exempt")(_UnmigratedAgent)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-unmigrated-exempt", no_infra=True
+        )
+        task = Task.from_dict(
+            {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+        )
+        results = harness.run([task])
+    finally:
+        AGENTS._items.pop("fake-unmigrated-exempt", None)  # noqa: SLF001
+    assert len(results) == 1
+    assert results[0]["status"] != "failed"
 
 
 def test_agent_config_snapshot_carries_the_sandbox_opt_in(

@@ -751,8 +751,9 @@ class DefaultEvalHarness(Harness):
             ``results.json`` schema.
         """
         sandboxed = self._agent_config.sandbox is not None
-        if sandboxed:
-            # Fail before any cluster exists rather than once per provisioned task.
+        if sandboxed and any(not task.requires_unsandboxed for task in tasks):
+            # Fail before any cluster exists rather than once per provisioned task;
+            # a batch of only exempt tasks never needs the seam.
             _ensure_builtin_agents_registered()
             agent_cls = AGENTS.get(_canonical_agent_type(self.agent_type))
             if agent_cls is not None and not getattr(agent_cls, "supports_sandbox", False):
@@ -761,6 +762,7 @@ class DefaultEvalHarness(Harness):
                     "the sandbox seam; refusing the whole batch rather than "
                     "provisioning a cluster per task just to fail each one"
                 )
+        if sandboxed:
             # Reap containers a killed harness never got to reap, before this
             # batch's own exist; the sweep itself applies the BENCH_PARALLEL gate.
             try:
