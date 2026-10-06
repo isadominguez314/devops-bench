@@ -343,8 +343,10 @@ class DefaultEvalHarness(Harness):
         ``sandbox_spec`` (the task-completed spec ``_run_one`` prepared)
         replaces the snapshot's skeletal ``sandbox`` field for that one
         agent; ``sandbox_exempt`` (a ``requires_unsandboxed`` task) clears
-        it instead. Everything else is unchanged.
+        it instead. Passing both is a caller bug and raises.
         """
+        if sandbox_exempt and sandbox_spec is not None:
+            raise ValueError("sandbox_exempt and sandbox_spec are mutually exclusive")
         if sandbox_exempt:
             # Clear the field rather than leave the skeletal spec: the agent's
             # own gate reads ``config.sandbox is not None``.

@@ -1615,6 +1615,14 @@ def test_sandbox_exempt_task_gets_the_ambient_inventory(
     assert "prior-run-artifact" in report["categories"]
 
 
+def test_build_agent_config_rejects_a_spec_together_with_exempt(isolated_env: None) -> None:
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        harness.build_agent_config(
+            harness_default.agent_sandbox.SandboxSpec(image="img"), sandbox_exempt=True
+        )
+
+
 def test_secret_rotation_declares_requires_unsandboxed() -> None:
     """Checked through the real loader: ``Task`` drops unknown keys silently, so a
     raw-YAML assertion alone would stay green while the harness saw ``False``."""
