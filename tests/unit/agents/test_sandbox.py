@@ -1118,6 +1118,8 @@ def test_executor_run_chowns_workspace_and_fixtures_around_a_remapped_run(
     assert len(chown_calls) == 2
     pre, post = chown_calls
     assert "1000:1000" in pre
+    assert "--from=3998470835" in pre  # only the operator's entries move to the remap id
+    assert "--from=1000" in post  # and only remap-owned entries come back
     assert f"{spec.workspace}:/workspace" in pre
     assert f"{fixture}:/workspace/home/fixture-repo" in pre
     assert "3998470835:3998470835" in post
