@@ -392,7 +392,9 @@ class SandboxExecutor:
         return container_path(self._workspace, path)
 
     def _needs_id_remap(self) -> bool:
-        """Linux only: whether either host id exceeds Docker's int32 ``--user`` limit."""
+        """Whether either host id exceeds Docker's int32 ``--user`` limit; always False off Linux."""
+        if not sys.platform.startswith("linux"):
+            return False
         return os.getuid() > _MAX_CONTAINER_ID or os.getgid() > _MAX_CONTAINER_ID
 
     def _remap_mounts(self) -> list[tuple[str, str]]:
@@ -536,7 +538,7 @@ class SandboxExecutor:
         # Filter once so the client env matches the names wrap_argv emits.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
-        remap = sys.platform.startswith("linux") and self._needs_id_remap()
+        remap = self._needs_id_remap()
         try:
             # Inside the try so a partial or timed-out chown still gets the handback.
             if remap:

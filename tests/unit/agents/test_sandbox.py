@@ -1285,6 +1285,15 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_cannot_start(
         executor.run(["gemini"])
 
 
+def test_needs_id_remap_is_false_off_linux(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    assert executor._needs_id_remap() is False
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    assert executor._needs_id_remap() is True
+
+
 def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
