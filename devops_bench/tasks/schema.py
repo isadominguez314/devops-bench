@@ -194,9 +194,9 @@ class Task(BaseModel):
             ``title`` and ``description`` on every verification entry), because
             the leaderboard renders validated tasks and nothing else.
         requires_unsandboxed: Opt this task out of the agent sandbox even when the
-            run asks for one, for a task whose objective needs the credential the
-            sandbox withholds (``secret-rotation`` needs ADC). Declared on the
-            task so the exemption travels with it.
+            run asks for one, for a task whose objective needs an ambient cloud
+            credential the sandbox withholds (``gcp/secret-rotation``). Declared on
+            the task so the exemption travels with it.
     """
 
     model_config = _STRICT

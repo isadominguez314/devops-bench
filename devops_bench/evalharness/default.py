@@ -1110,8 +1110,8 @@ class DefaultEvalHarness(Harness):
             # working directory), not the harness process's launch cwd.
             workspace_path = Path(tempfile.mkdtemp(prefix="devops-bench-workspace-"))
             if self._agent_config.sandbox is not None and task.requires_unsandboxed:
-                # The task cannot run behind the boundary (secret-rotation needs
-                # ADC); skip the sandbox for it and say so loudly.
+                # The task needs an ambient cloud credential the boundary withholds;
+                # skip the sandbox for it and say so loudly.
                 _log.warning(
                     "task %s declares requires_unsandboxed; running it OUTSIDE the "
                     "agent sandbox even though a sandbox was requested",
