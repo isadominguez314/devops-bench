@@ -14,18 +14,14 @@
 
 """Run the agent-under-test inside a container with a scoped view of the world.
 
-Ambient CLI agents inherit the operator's filesystem and environment: the
-benchmark's answer material, cloud credentials, admin kubeconfig. This module
-is the boundary. The container sees the per-run workspace at ``/workspace``
-(``HOME`` under it), the task's seeded fixtures, a single-cluster kubeconfig
-read-only at ``/creds/kubeconfig``, and a deny-filtered env overlay passed as
-name-only ``-e`` flags. A sandbox that cannot be built raises
-:class:`~devops_bench.core.errors.SandboxError` rather than running ambient.
-
-The container is bridge-attached; what it may reach on the host is governed by
-the host's ``DOCKER-USER`` rules (bastion setup), not here. The kubeconfig's
-credential is the scoped ServiceAccount token from
-:mod:`devops_bench.k8s.agent_credentials`; the model credential comes from
+The container sees the per-run workspace at ``/workspace`` (``HOME`` under it),
+the task's seeded fixtures, a single-cluster kubeconfig read-only at
+``/creds/kubeconfig``, and a deny-filtered env overlay passed as name-only ``-e``
+flags; never the operator's filesystem, cloud credentials or admin kubeconfig. A
+sandbox that cannot be built raises :class:`~devops_bench.core.errors.SandboxError`
+rather than running ambient. Host reachability is the host setup's
+``DOCKER-USER`` rules, not this module's; the cluster credential comes from
+:mod:`devops_bench.k8s.agent_credentials`, the model credential from
 :mod:`devops_bench.core.model_providers`.
 """
 
@@ -85,10 +81,8 @@ CONTAINER_WORKSPACE = "/workspace"
 CONTAINER_HOME = f"{CONTAINER_WORKSPACE}/home"
 CONTAINER_KUBECONFIG = "/creds/kubeconfig"
 
-# Docker refuses ``--user`` ids above int32 max outright (exit 125, no start
-# event); IdP-minted ids routinely exceed it. Dropping ``--user`` would run the
-# agent as root inside the boundary and leave root-owned files teardown cannot
-# remove (observed live), so out-of-range ids are remapped; see _needs_id_remap.
+# Docker refuses ``--user`` ids above int32 max (exit 125); IdP-minted ids can exceed it.
+# Dropping ``--user`` would run the agent as root, so such ids are remapped (_needs_id_remap).
 _MAX_CONTAINER_ID = 2**31 - 1
 
 # In-range unprivileged id for the remap: the ``node`` user of the node:22-slim
@@ -392,7 +386,9 @@ class SandboxExecutor:
         return container_path(self._workspace, path)
 
     def _needs_id_remap(self) -> bool:
-        """Linux only: whether either host id exceeds Docker's int32 ``--user`` limit."""
+        """Whether either host id exceeds Docker's int32 ``--user`` limit; always False off Linux."""
+        if not sys.platform.startswith("linux"):
+            return False
         return os.getuid() > _MAX_CONTAINER_ID or os.getgid() > _MAX_CONTAINER_ID
 
     def _remap_mounts(self) -> list[tuple[str, str]]:
@@ -407,10 +403,14 @@ class SandboxExecutor:
             *spec.fixture_mounts.items(),
         ]
 
+    @property
+    def _chown_container_name(self) -> str:
+        return f"{self.container_name}-chown"
+
     def _chown_argv(self, uid: int, gid: int) -> list[str]:
         """``docker run`` argv for a root container (same image, no ``--user``) that
         chowns every remap mount to ``uid:gid``; only root can chown ids past int32."""
-        argv = [CONTAINER_RUNTIME, "run", "--rm"]
+        argv = [CONTAINER_RUNTIME, "run", "--rm", "--name", self._chown_container_name]
         targets: list[str] = []
         for host_path, mount_path in self._remap_mounts():
             argv += ["-v", f"{host_path}:{mount_path}"]
@@ -532,10 +532,11 @@ class SandboxExecutor:
         # Filter once so the client env matches the names wrap_argv emits.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
-        remap = sys.platform.startswith("linux") and self._needs_id_remap()
-        if remap:
-            self._chown_before_remap()
+        remap = self._needs_id_remap()
         try:
+            # Inside the try so a partial or timed-out chown still gets the handback.
+            if remap:
+                self._chown_before_remap()
             try:
                 completed = run(
                     wrapped,
@@ -567,6 +568,8 @@ class SandboxExecutor:
                 kill_container(self.container_name)
             finally:
                 if remap:
+                    # A timed-out chown helper must not keep running during the handback.
+                    kill_container(self._chown_container_name)
                     self._chown_after_remap()
 
 

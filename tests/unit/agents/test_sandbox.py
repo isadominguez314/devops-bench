@@ -267,9 +267,8 @@ def test_build_network_plan_rewrites_a_loopback_server(
 def test_build_network_plan_preserves_a_declared_tls_server_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A cluster that needed a ``tls-server-name`` override outside the sandbox
-    (a cert with no ``localhost`` SAN) needs the same one inside; hardcoding
-    ``localhost`` over it would turn a working config into a TLS failure."""
+    """A cluster that needs a ``tls-server-name`` override outside the sandbox needs the
+    same one inside; hardcoding ``localhost`` would break TLS."""
     _patch_plan_reads(
         monkeypatch,
         contexts=("kind-c1",),
@@ -288,7 +287,7 @@ def test_build_network_plan_preserves_a_declared_tls_server_name(
 def test_build_network_plan_leaves_a_routable_server_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A routable (e.g. GKE) endpoint must not be rewritten."""
+    """A routable endpoint must not be rewritten."""
     provider = _FakeProvider(NetworkPlan(kubectl_context="gke_p_us-central1_c1"))
     _patch_plan_reads(monkeypatch, contexts=("gke_p_us-central1_c1",), server="https://34.10.0.1")
 
@@ -333,9 +332,8 @@ def test_build_network_plan_refuses_an_unreadable_server(
 def test_build_network_plan_refuses_a_provider_backed_plan_without_a_pin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A provider that answers with an unpinned plan would mint the agent's
-    credential on the ambient current-context — the exact state the ambient
-    escape hatch waives only for runs with no provider at all."""
+    """An unpinned plan from a provider would mint the credential on the ambient
+    current-context, which only a provider-less run may waive."""
     _patch_plan_reads(monkeypatch, server="https://34.10.0.1")
 
     with pytest.raises(SandboxError, match="no\\s+kubectl context pin"):
@@ -426,9 +424,8 @@ def test_discover_fixture_mounts_honours_the_explicit_env_override(
 def test_discover_fixture_mounts_refuses_duplicate_fixture_basenames(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Two same-named fixtures would emit two ``-v`` flags onto one container
-    destination, which docker aborts on with a cryptic 'Duplicate mount
-    point' — refuse up front, naming both host paths."""
+    """Two same-named fixtures would map onto one container destination (a docker
+    'Duplicate mount point' abort); refuse up front, naming both host paths."""
     first = tmp_path / "a" / "fix.git"
     second = tmp_path / "b" / "fix.git"
     first.mkdir(parents=True)
@@ -480,9 +477,8 @@ def test_filter_boundary_env_allowlist_overrides_a_denial() -> None:
 
 
 def test_filter_boundary_env_never_admits_container_owned_vars() -> None:
-    """HOME/KUBECONFIG/PATH are the executor's own inside the container;
-    docker's last ``-e`` wins, so even an explicit allowlist must not let an
-    overlay value repoint them."""
+    """HOME/KUBECONFIG/PATH are container-owned; docker's last ``-e`` wins, so even an
+    allowlist must not let an overlay value repoint them."""
     overlay = {"HOME": "/home/op", "KUBECONFIG": "/home/op/.kube/config", "PATH": "/evil/bin"}
     kept = sandbox.filter_boundary_env(overlay, allowlist=("HOME", "KUBECONFIG", "PATH"))
     assert kept == {}
@@ -510,9 +506,7 @@ def test_executor_refuses_a_spec_whose_paths_do_not_exist(tmp_path: Path) -> Non
 
 
 def test_executor_refuses_an_incomplete_spec(tmp_path: Path) -> None:
-    """The skeletal from_env spec must never run: no workspace/kubeconfig means
-    the harness has not completed it, and running anyway would improvise a
-    boundary."""
+    """The skeletal from_env spec (no workspace/kubeconfig) must never run."""
     with pytest.raises(SandboxError, match="incomplete"):
         sandbox.SandboxExecutor(sandbox.SandboxSpec(image="img"))
 
@@ -529,9 +523,8 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     assert argv[:3] == ["docker", "run", "--rm"]
     assert argv[argv.index("--name") + 1] == "devops-bench-agent-workspace-abc123"
     assert argv[argv.index("--network") + 1] == "kind"
-    # Boundary invariants: no stdin, host-gateway alias always present, no
-    # capabilities and no setuid re-escalation — the latter pair is what
-    # contains the macOS case, where the process runs as root (no --user).
+    # Boundary invariants: no stdin, host-gateway alias, no capabilities, no setuid
+    # re-escalation (the latter pair contains the no-``--user`` case).
     assert "-i" not in argv
     assert "host.docker.internal:host-gateway" in argv
     assert "--cap-drop=ALL" in argv
@@ -539,10 +532,8 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     # Mount set: workspace RW, kubeconfig RO.
     assert f"{spec.workspace}:/workspace" in argv
     assert f"{spec.kubeconfig}:/creds/kubeconfig:ro" in argv
-    # Env: container-owned vars inline (non-secret constants), the overlay
-    # as name-only -e flags — the secret value must never appear in the
-    # argv, which is world-readable in /proc and rendered into error
-    # messages on timeout.
+    # Container-owned vars inline, the overlay as name-only -e flags: a secret value
+    # must never appear in the argv (world-readable in /proc, rendered into errors).
     assert "HOME=/workspace/home" in argv
     assert "KUBECONFIG=/creds/kubeconfig" in argv
     assert "GEMINI_API_KEY" in argv
@@ -553,9 +544,8 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
 
 
 def test_wrap_argv_container_owned_env_flags_come_last(tmp_path: Path) -> None:
-    """Defense in depth against a filter regression: the executor's own
-    ``-e HOME``/``-e KUBECONFIG`` trail every overlay flag, so docker's
-    last-one-wins keeps them authoritative no matter what crossed."""
+    """Defense in depth: the executor's own ``-e HOME``/``-e KUBECONFIG`` trail every
+    overlay flag, so last-one-wins keeps them authoritative."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     argv = executor.wrap_argv(["gemini"], extra_env={"GEMINI_API_KEY": "k"})
     assert argv.index("HOME=/workspace/home") > argv.index("GEMINI_API_KEY")
@@ -741,10 +731,8 @@ def test_executor_run_passes_through_check_and_timeout(
 def test_executor_run_raises_sandbox_error_on_docker_launch_failures(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
-    """125/126/127 are docker's own launch failures (missing image/network,
-    binary not invocable / absent from the image — e.g. a pre-expanded
-    $HOME AGENT_TARGET); with check=False they must not be scored as the
-    agent's exit code."""
+    """125/126/127 are docker's own launch failures; with check=False they must not be
+    scored as the agent's exit code."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
 
     def fake_run(argv, **kwargs):
@@ -810,10 +798,8 @@ def test_sweep_stray_containers_never_raises_when_docker_is_missing(
 def test_executor_run_raises_sandbox_error_on_launch_failures_under_check(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
 ) -> None:
-    """With check=True the host run raises before the returncode test, so the
-    translation must also cover the exception path — otherwise the next
-    harness migrated with default check=True scores docker failures as its
-    agent's."""
+    """With check=True the host run raises before the returncode test, so the translation
+    must cover the exception path too."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
 
     def fake_run(argv, **kwargs):
@@ -844,8 +830,7 @@ def test_executor_run_propagates_non_docker_failures_under_check(
 def test_discover_fixture_mounts_never_mounts_the_bench_checkout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No token rule can exclude the checkout for a cluster named "bench" or
-    "dev" — the exclusion is by path: glob hits are skipped, an explicit
+    """The checkout is excluded by path, not token: glob hits are skipped and an explicit
     override is refused loudly."""
     home = tmp_path / "home"
     home.mkdir()
@@ -867,11 +852,8 @@ def test_discover_fixture_mounts_never_mounts_the_bench_checkout(
 def test_executor_run_keeps_secret_values_out_of_the_argv(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The overlay's values ride the docker client's environment (extra_env
-    on the host run), never the ``docker run`` command line: the argv is
-    world-readable in /proc for the whole run and is rendered into
-    SubprocessError messages — which the harness embeds in errored results —
-    so an inline key would leak on every timeout."""
+    """Overlay values ride the docker client's environment, never the ``docker run`` argv,
+    which is world-readable in /proc and rendered into error messages."""
     executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
     seen: dict = {}
 
@@ -902,9 +884,8 @@ def test_executor_run_keeps_secret_values_out_of_the_argv(
 def test_run_agent_cmd_defaults_to_the_harness_modules_run_symbol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without host_run=, the seam resolves the concrete harness module's own
-    ``run`` import — the symbol its unit tests patch — so forgetting the
-    parameter cannot silently bypass test patches and hit a real subprocess."""
+    """Without host_run= the seam resolves the harness module's own ``run`` import, the
+    symbol its tests patch, so test patches cannot be bypassed."""
     import sys as _sys
 
     called: dict = {}
@@ -990,10 +971,8 @@ def test_run_agent_cmd_dispatches_to_the_executor_when_sandbox_is_set(
 
 
 def test_sandbox_error_from_the_executor_propagates_out_of_run(tmp_path: Path) -> None:
-    """An incomplete spec raises in the executor and the base safety net
-    deliberately re-raises it: converted to an errored result it would score
-    a broken boundary as a badly-performing agent, when the eval harness
-    should record a failed, unscored run instead."""
+    """An incomplete spec raises SandboxError and the safety net re-raises it: a broken
+    boundary must record a failed, unscored run, not a badly-performing agent."""
 
     class _Boomy(AgentHarness):
         supports_sandbox = True
@@ -1017,9 +996,8 @@ def test_run_still_converts_non_sandbox_crashes_to_errored_results() -> None:
 
 
 def test_run_refuses_a_sandboxed_config_on_an_unmigrated_agent(tmp_path: Path) -> None:
-    """A harness that never routed its subprocesses through run_agent_cmd
-    would run on the host with the operator's ambient credentials while the
-    flag says 'contained'. Refusal must be loud, before _execute ever runs."""
+    """A harness that never routed its subprocesses through run_agent_cmd would run
+    ambient while flagged contained; the refusal is loud and before _execute."""
     agent = _DummyAgent(AgentConfig(sandbox=_complete_spec(tmp_path)))
     with pytest.raises(SandboxError, match="not been migrated"):
         agent.run("p")
@@ -1052,15 +1030,16 @@ def test_container_path_refuses_a_path_outside_the_workspace(tmp_path) -> None:
         sandbox.container_path(tmp_path, outside)
 
 
-def test_every_cli_harness_declares_sandbox_support() -> None:
-    """All four CLI harnesses declare the seam; an undeclared one is refused when sandboxed."""
+def test_cli_harness_sandbox_support_is_declared_deliberately() -> None:
+    """Three harnesses declare the seam; claude_code opts out until its host paths are ported."""
     from devops_bench.agents.cli.antigravity.agent import AgyCliAgent
     from devops_bench.agents.cli.claude_code.agent import ClaudeCodeAgent
     from devops_bench.agents.cli.gemini_cli.agent import GeminiCliAgent
     from devops_bench.agents.cli.openclaw.agent import OpenClawAgent
 
-    for cls in (AgyCliAgent, ClaudeCodeAgent, GeminiCliAgent, OpenClawAgent):
+    for cls in (AgyCliAgent, GeminiCliAgent, OpenClawAgent):
         assert cls.supports_sandbox is True, f"{cls.__name__} is not wired onto the seam"
+    assert ClaudeCodeAgent.supports_sandbox is False
 
 
 def test_wrap_argv_remaps_user_when_uid_exceeds_dockers_limit(
@@ -1208,7 +1187,12 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
     monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
 
+    calls: list[list[str]] = []
+
     def fake_run(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "kill"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
         if "chown" in argv:
             raise SubprocessError(argv, returncode=1, stdout="", stderr="boom")
         raise AssertionError("the agent container must not run when the pre-run chown fails")
@@ -1216,6 +1200,8 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_fails(
     monkeypatch.setattr(sandbox, "run", fake_run)
     with pytest.raises(SandboxError, match="chown"):
         executor.run(["gemini"])
+    # A partial pre-run chown still gets the handback attempt.
+    assert len([c for c in calls if "chown" in c]) == 2
 
 
 def test_remap_chowns_are_time_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1266,6 +1252,8 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_cannot_start(
     monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
 
     def fake_run(argv, **kwargs):
+        if argv[:2] == ["docker", "kill"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="No such container")
         if "chown" in argv:
             raise FileNotFoundError("docker")
         raise AssertionError("the agent container must not run when the pre-run chown fails")
@@ -1273,6 +1261,15 @@ def test_executor_run_raises_sandboxerror_when_the_pre_run_chown_cannot_start(
     monkeypatch.setattr(sandbox, "run", fake_run)
     with pytest.raises(SandboxError, match="chown"):
         executor.run(["gemini"])
+
+
+def test_needs_id_remap_is_false_off_linux(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "darwin")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    assert executor._needs_id_remap() is False
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    assert executor._needs_id_remap() is True
 
 
 def test_wrap_argv_omits_user_flag_on_non_linux_even_when_ids_are_out_of_range(
@@ -1357,6 +1354,30 @@ def test_spec_from_env_rejects_a_malformed_owner(owner: str) -> None:
         sandbox.spec_from_env({"BENCH_AGENT_SANDBOX": "1", "BENCH_AGENT_SANDBOX_OWNER": owner})
 
 
+def test_chown_helper_is_named_and_killed_before_the_handback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A timed-out chown helper must not keep changing ownership during the handback."""
+    executor = sandbox.SandboxExecutor(_complete_spec(tmp_path))
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "getuid", lambda: 3998470835)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    executor.run(["agent"], check=False)
+
+    helper = f"{executor.container_name}-chown"
+    pre = calls[0]
+    assert "chown" in pre and pre[pre.index("--name") + 1] == helper
+    killed = calls.index(["docker", "kill", helper])
+    handback = next(i for i, c in enumerate(calls) if "3998470835:1000" in c)
+    assert killed < handback
+
+
 def test_remap_covers_external_generated_kubeconfig(tmp_path: Path) -> None:
     spec = _complete_spec(tmp_path)
     executor = sandbox.SandboxExecutor(spec)
@@ -1365,7 +1386,7 @@ def test_remap_covers_external_generated_kubeconfig(tmp_path: Path) -> None:
 
 @pytest.fixture(autouse=True)
 def _ordinary_host_ids(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep ordinary-path tests independent of the test runner's OS Login IDs."""
+    """Keep ordinary-path tests independent of the host's real ids."""
     monkeypatch.setattr(
         sandbox,
         "os",

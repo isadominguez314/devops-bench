@@ -89,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--parallel",
         action="store_true",
         help=(
-            "Isolate this run (own kubeconfig / gcloud config / tofu data dir and "
+            "Isolate this run (own kubeconfig, cloud CLI config and tofu data dir, and "
             "a run-unique cluster name) so it can run concurrently with others."
         ),
     )
