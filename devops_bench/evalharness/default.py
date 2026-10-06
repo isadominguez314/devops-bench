@@ -1208,7 +1208,11 @@ class DefaultEvalHarness(Harness):
             )
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
         if with_cluster:
-            plan = agent_sandbox.build_network_plan(provider, cluster_info)
+            # Pinned here (not only inside provisioning) so the spec — and the
+            # run-end teardown it feeds — target the same authorized cluster.
+            plan = agent_credentials.pin_plan_context(
+                agent_sandbox.build_network_plan(provider, cluster_info)
+            )
             kubeconfig = agent_credentials.provision_agent_credentials(
                 plan,
                 creds_dir,

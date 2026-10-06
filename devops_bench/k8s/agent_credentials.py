@@ -29,6 +29,7 @@ module — everything is plain Kubernetes API surface reached through ``kubectl`
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from devops_bench.core import NetworkPlan, SandboxError, SubprocessError, get_bool, get_logger
@@ -67,6 +68,10 @@ ALLOW_AMBIENT_ENV = "BENCH_SANDBOX_ALLOW_AMBIENT_CLUSTER"
 
 # Slack over the agent's timeout so the token covers provisioning, teardown, and clock skew.
 TOKEN_TTL_SLACK_SEC = 900
+
+# Bound on every provisioning/teardown kubectl call: an apiserver that accepts the
+# connection and never answers must not hang _run_one (teardown promises to return).
+_KUBECTL_TIMEOUT_SEC = 60
 
 # Pod-security levels a task may declare via ``agent_pod_security:``.
 POD_SECURITY_BASELINE = "baseline"
@@ -522,7 +527,7 @@ def ensure_agent_identity(work_dir: Path, context: str | None = None) -> None:
     """
     manifest = work_dir / "bench-agent-rbac.yaml"
     manifest.write_text(_RBAC_MANIFEST)
-    kubectl.apply(str(manifest), context=context)
+    kubectl.apply(str(manifest), context=context, timeout=_KUBECTL_TIMEOUT_SEC)
     _log.info(
         "ensured the sandboxed agent identity %s/%s (edit, plus a cluster-scoped supplement)",
         AGENT_NAMESPACE,
@@ -549,7 +554,7 @@ def enforce_pod_security(
 
     guards = work_dir / "bench-agent-namespace-guards.yaml"
     guards.write_text(_render_namespace_guard(pod_security) + _EXEMPT_NAMESPACE_GUARD_MANIFEST)
-    kubectl.apply(str(guards), context=context)
+    kubectl.apply(str(guards), context=context, timeout=_KUBECTL_TIMEOUT_SEC)
 
     if pod_security == POD_SECURITY_PRIVILEGED:
         _log.warning(
@@ -563,7 +568,7 @@ def enforce_pod_security(
 
     manifest = work_dir / "bench-agent-pod-security.yaml"
     manifest.write_text(_POD_SECURITY_POLICY_MANIFEST)
-    kubectl.apply(str(manifest), context=context)
+    kubectl.apply(str(manifest), context=context, timeout=_KUBECTL_TIMEOUT_SEC)
 
     _deny_shell_into_nonconformant_pods(work_dir, _policy_exempt_namespaces(namespaces), context)
 
@@ -580,6 +585,7 @@ def enforce_pod_security(
                 },
                 overwrite=True,
                 context=context,
+                timeout=_KUBECTL_TIMEOUT_SEC,
             )
         except SubprocessError as exc:
             _log.warning("could not label namespace %s for pod security: %s", name, exc)
@@ -676,7 +682,7 @@ def _apply_shell_guard(work_dir: Path, pods: list[str], context: str | None) -> 
     """Apply the shell guard even when empty: a reused cluster must not keep the last run's list."""
     manifest = work_dir / "bench-agent-nonconformant-pods.yaml"
     manifest.write_text(_render_nonconformant_pod_guard(pods))
-    kubectl.apply(str(manifest), context=context)
+    kubectl.apply(str(manifest), context=context, timeout=_KUBECTL_TIMEOUT_SEC)
 
 
 def _labellable_namespaces(namespaces: list[dict]) -> list[str]:
@@ -704,6 +710,7 @@ def mint_agent_token(ttl_sec: int, context: str | None = None) -> str:
         namespace=AGENT_NAMESPACE,
         duration_sec=ttl_sec,
         context=context,
+        timeout=_KUBECTL_TIMEOUT_SEC,
     )
 
 
@@ -722,12 +729,16 @@ def render_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path, *, user_fields: s
         SandboxError: When the context carries no CA or no server URL.
     """
     ctx = plan.kubectl_context
-    ca = kubectl.config_value("{.clusters[0].cluster.certificate-authority-data}", context=ctx)
+    ca = kubectl.config_value(
+        "{.clusters[0].cluster.certificate-authority-data}",
+        context=ctx,
+        timeout=_KUBECTL_TIMEOUT_SEC,
+    )
     if not ca:
         raise SandboxError("could not read the cluster CA from the run's kubectl context")
 
     server = plan.rewrite_server or kubectl.config_value(
-        "{.clusters[0].cluster.server}", context=ctx
+        "{.clusters[0].cluster.server}", context=ctx, timeout=_KUBECTL_TIMEOUT_SEC
     )
     if not server:
         raise SandboxError("could not read the cluster server URL from the run's kubectl context")
@@ -756,14 +767,21 @@ def render_agent_kubeconfig(plan: NetworkPlan, dest_dir: Path, *, user_fields: s
 def _preflight_render_inputs(plan: NetworkPlan) -> None:
     """Refuse before the first cluster write when the final kubeconfig render would fail."""
     ctx = plan.kubectl_context
-    if not kubectl.config_value("{.clusters[0].cluster.certificate-authority-data}", context=ctx):
+    if not kubectl.config_value(
+        "{.clusters[0].cluster.certificate-authority-data}",
+        context=ctx,
+        timeout=_KUBECTL_TIMEOUT_SEC,
+    ):
         raise SandboxError(
             "the run's kubectl context embeds no certificate-authority-data (a "
             "certificate-authority file path cannot cross into the container); "
             "refusing before anything is written to the cluster"
         )
     if not (
-        plan.rewrite_server or kubectl.config_value("{.clusters[0].cluster.server}", context=ctx)
+        plan.rewrite_server
+        or kubectl.config_value(
+            "{.clusters[0].cluster.server}", context=ctx, timeout=_KUBECTL_TIMEOUT_SEC
+        )
     ):
         raise SandboxError(
             "could not read the cluster server URL from the run's kubectl context; "
@@ -796,7 +814,7 @@ def provision_agent_credentials(
             (checked before any cluster write); or enforcement/mint failure without
             :data:`ALLOW_ADMIN_ENV`.
     """
-    _refuse_unpinned_cluster(plan)
+    plan = pin_plan_context(plan)
     _preflight_render_inputs(plan)
     # One switch for both: an operator who cannot create cluster roles cannot create policies.
     allow_admin = get_bool(ALLOW_ADMIN_ENV, False)
@@ -878,8 +896,13 @@ def teardown_agent_credentials(context: str | None = None) -> bool:
     Returns:
         True when every object is confirmed removed (already-absent counts —
         the deletes ignore not-found); False when any step failed and the
-        cluster may still carry sandbox residue.
+        cluster may still carry sandbox residue. An unpinned context without
+        :data:`ALLOW_AMBIENT_ENV` is skipped as clean: nothing was provisioned
+        there, and the deletes must not land on the operator's ambient cluster.
     """
+    if context is None and not get_bool(ALLOW_AMBIENT_ENV, False):
+        _log.info("sandbox teardown: no cluster pin and no ambient opt-in; nothing to remove")
+        return True
     clean = True
 
     def _delete(kind: str, *names: str, timeout: float) -> None:
@@ -943,7 +966,9 @@ def _remove_managed_pod_security_labels(context: str | None) -> bool:
         if not name or _PSA_MANAGED_LABEL not in (meta.get("labels") or {}):
             continue
         try:
-            kubectl.label("namespace", name, removals, context=context)
+            kubectl.label(
+                "namespace", name, removals, context=context, timeout=_KUBECTL_TIMEOUT_SEC
+            )
         except SubprocessError as exc:
             ok = False
             _log.warning("teardown could not remove PSA labels from namespace %s: %s", name, exc)
@@ -967,19 +992,27 @@ def _teardown_after_failed_provisioning(context: str | None) -> None:
     teardown_agent_credentials(context)
 
 
-def _refuse_unpinned_cluster(plan: NetworkPlan) -> None:
-    """Refuse cluster-wide writes onto a cluster no provider vouched for (unpinned plan)."""
+def pin_plan_context(plan: NetworkPlan) -> NetworkPlan:
+    """Return a plan pinned to a cluster the run may write to, or refuse.
+
+    A plan a provider pinned is returned as is. An unpinned one (the no-op
+    deployer) is refused unless :data:`ALLOW_AMBIENT_ENV` is set, in which case
+    the ambient current-context is snapshotted *once* and pinned, so every
+    later provisioning and teardown call targets the cluster the operator
+    authorized rather than whatever current-context says at that moment.
+    """
     if plan.kubectl_context:
-        return
-    current = kubectl.config_value("{.current-context}") or "<unset>"
-    if get_bool(ALLOW_AMBIENT_ENV, False):
+        return plan
+    current = kubectl.config_value("{.current-context}", timeout=_KUBECTL_TIMEOUT_SEC) or ""
+    if get_bool(ALLOW_AMBIENT_ENV, False) and current:
         _log.warning(
             "%s is set: provisioning the sandboxed agent's identity and pod-security "
             "policy on the ambient current-context (%s), which no provider vouched for",
             ALLOW_AMBIENT_ENV,
             current,
         )
-        return
+        return replace(plan, kubectl_context=current)
+    current = current or "<unset>"
     raise SandboxError(
         "this run's network plan carries no kubectl context pin, so its deployer has "
         "no provider to identify the cluster (BENCH_NO_INFRA / the no-op deployer). "
@@ -992,8 +1025,12 @@ def _refuse_unpinned_cluster(plan: NetworkPlan) -> None:
 def _render_admin_fallback_kubeconfig(plan: NetworkPlan, dest_dir: Path) -> Path:
     """Fall back to the operator's client certificate, giving up the RBAC boundary entirely."""
     ctx = plan.kubectl_context
-    cert = kubectl.config_value("{.users[0].user.client-certificate-data}", context=ctx)
-    key = kubectl.config_value("{.users[0].user.client-key-data}", context=ctx)
+    cert = kubectl.config_value(
+        "{.users[0].user.client-certificate-data}", context=ctx, timeout=_KUBECTL_TIMEOUT_SEC
+    )
+    key = kubectl.config_value(
+        "{.users[0].user.client-key-data}", context=ctx, timeout=_KUBECTL_TIMEOUT_SEC
+    )
     if not (cert and key):
         raise SandboxError(
             f"{ALLOW_ADMIN_ENV} is set but the run's kubectl context carries no static "

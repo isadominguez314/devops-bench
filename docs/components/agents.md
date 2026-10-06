@@ -377,8 +377,8 @@ Overlapping controls, applied at the same point:
    covered here: that request carries the Service's name, not the pod's, so a
    Service fronting one of these pods remains reachable over HTTP. The list stays correct for the run — policy 2 denies these pods on
    `CREATE`, so a name that leaves it cannot come back. It is applied even when
-   the list is empty, since nothing here is torn down and a reused cluster would
-   otherwise keep the previous run's list.
+   the list is empty: a run whose teardown reported residue can leave the
+   previous run's list behind, and the empty apply is the explicit reset.
 
 Policies 3, 4 and 5 are scoped to the agent's own username, so the cluster's own
 components keep running — the exemption exists for kube-proxy and the CNI, not
@@ -431,12 +431,16 @@ opt-out drops exactly two things: policy 2 and the PSA labels (including policy
 may write is unrelated to what its pods may do, and policy 5 is still applied
 with an empty list so a reused cluster does not keep the previous run's.
 
-**None of this is torn down.** `bench-system`, the ClusterRoleBindings, the
-admission policies and the PSA labels outlive the run. On a disposable cluster that is
-irrelevant; on a reused one it means a second run finds most namespaces already
-labelled and skips them, which is correct but makes the labeller look inert.
-Read the labels as the state of the cluster, not as the output of the run that
-is in front of you.
+**All of this is torn down at the end of the run.** `teardown_agent_credentials`
+removes the policy bindings first (a binding is what makes a policy enforce, so
+denial stops immediately), then the policies, the PSA labels on namespaces
+carrying the `devops-bench.io/psa-managed` marker (a level anyone else set never
+carries it and is never touched), the RBAC, and `bench-system` last, waited on.
+Provisioning's own failure paths clean up their partial writes the same way.
+Teardown never raises; residue is logged with its consequence spelled out — see
+the reused-cluster row in [known issues](../appendix/known_issues.md) for the
+by-hand recovery. A sandboxed task with no cluster (the no-op deployer) provisions
+nothing and tears nothing down.
 
 ### Known gaps in the RBAC scope
 

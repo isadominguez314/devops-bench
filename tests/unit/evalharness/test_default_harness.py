@@ -1156,7 +1156,12 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     from devops_bench.core import ClusterInfo, NetworkPlan
 
     harness = _sandboxed_harness(monkeypatch, tmp_path)
-    plan = NetworkPlan(docker_network="kind", rewrite_server="https://c1-control-plane:6443")
+    # A provider-pinned plan passes pin_plan_context untouched (identity kept).
+    plan = NetworkPlan(
+        docker_network="kind",
+        rewrite_server="https://c1-control-plane:6443",
+        kubectl_context="kind-c1",
+    )
     kubeconfig = tmp_path / "creds" / "kubeconfig"
     provider = object()
 

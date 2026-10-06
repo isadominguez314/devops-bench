@@ -118,6 +118,11 @@ def _selector_args(selector: str | None) -> list[str]:
     return ["-l", selector] if selector else []
 
 
+def _timeout_kwargs(timeout: float | None) -> dict[str, float]:
+    """``run`` kwargs for an optional timeout; omitted entirely when None."""
+    return {"timeout": timeout} if timeout is not None else {}
+
+
 def _context_args(context: str | None) -> list[str]:
     return ["--context", context] if context else []
 
@@ -317,6 +322,7 @@ def apply(
     namespace: str | None = None,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> CompletedProcess:
     """Apply a manifest file or directory via ``kubectl apply -f``.
 
@@ -325,6 +331,7 @@ def apply(
         namespace: Optional namespace (``-n``).
         kubeconfig: Kubeconfig path or context-like object.
         context: Optional kubeconfig context to pin the call to (``--context``).
+        timeout: Optional subprocess timeout in seconds for the whole call.
 
     Returns:
         The completed process.
@@ -333,7 +340,7 @@ def apply(
         SubprocessError: If kubectl exits non-zero or times out.
     """
     argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
-    return _run_kubectl(argv, kubeconfig, context=context)
+    return _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout))
 
 
 def delete(
@@ -397,6 +404,7 @@ def label(
     namespace: str | None = None,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> CompletedProcess:
     """Set or remove labels on one resource via ``kubectl label``.
 
@@ -416,7 +424,7 @@ def label(
         *(["--overwrite"] if overwrite else []),
         *_namespace_args(namespace),
     ]
-    return _run_kubectl(argv, kubeconfig, context=context)
+    return _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout))
 
 
 def config_value(
@@ -424,6 +432,7 @@ def config_value(
     *,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Read one value out of the effective kubeconfig via jsonpath.
 
@@ -435,7 +444,9 @@ def config_value(
         fails; callers decide whether that is fatal.
     """
     argv = ["kubectl", "config", "view", "--raw", "--minify", "-o", f"jsonpath={jsonpath}"]
-    completed = _run_kubectl(argv, kubeconfig, context=context, check=False)
+    completed = _run_kubectl(
+        argv, kubeconfig, context=context, check=False, **_timeout_kwargs(timeout)
+    )
     return (completed.stdout or "").strip()
 
 
@@ -446,6 +457,7 @@ def create_token(
     duration_sec: float,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Mint a short-lived ServiceAccount token via ``kubectl create token``.
 
@@ -466,7 +478,9 @@ def create_token(
         f"--duration={int(duration_sec)}s",
         *_namespace_args(namespace),
     ]
-    return (_run_kubectl(argv, kubeconfig, context=context).stdout or "").strip()
+    return (
+        _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout)).stdout or ""
+    ).strip()
 
 
 def rollout_status(
