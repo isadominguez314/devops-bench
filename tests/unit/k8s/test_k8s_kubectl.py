@@ -209,6 +209,31 @@ def test_delete_threads_the_subprocess_timeout(mocker: MockerFixture) -> None:
     assert mock_run.call_args.kwargs["timeout"] == 300
 
 
+def test_apply_label_config_value_and_create_token_thread_the_timeout(
+    mocker: MockerFixture,
+) -> None:
+    """The credential module's provisioning and teardown calls must be bounded:
+    an apiserver that accepts the connection and never answers would otherwise
+    block _run_one indefinitely."""
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed(stdout="v"))
+    kubectl.apply("m.yaml", timeout=60)
+    assert mock_run.call_args.kwargs["timeout"] == 60
+    kubectl.label("namespace", "ns", {"k": None}, timeout=61)
+    assert mock_run.call_args.kwargs["timeout"] == 61
+    kubectl.config_value("{.x}", timeout=62)
+    assert mock_run.call_args.kwargs["timeout"] == 62
+    kubectl.create_token("sa", namespace="ns", duration_sec=5, timeout=63)
+    assert mock_run.call_args.kwargs["timeout"] == 63
+
+
+def test_apply_and_label_omit_the_timeout_kwarg_when_unset(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+    kubectl.apply("m.yaml")
+    assert "timeout" not in mock_run.call_args.kwargs
+    kubectl.label("namespace", "ns", {"k": "v"})
+    assert "timeout" not in mock_run.call_args.kwargs
+
+
 def test_delete_refuses_an_empty_name_list(mocker: MockerFixture) -> None:
     # ``kubectl delete <kind>`` with no name is a no-op kubectl rejects; a
     # caller who wants --all should have to spell that out, not fall into it.
