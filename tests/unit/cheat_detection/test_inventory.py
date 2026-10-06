@@ -476,6 +476,23 @@ def test_a_deliverable_quoting_one_input_line_keeps_its_fingerprint(tmp_path: Pa
     assert not any(not r.source and "advisory.json" in r.description for r in kept)
 
 
+def test_two_inputs_each_quoting_a_line_do_not_add_up_to_a_copy(tmp_path: Path) -> None:
+    # One input must hold the whole fingerprint; lines spread across inputs don't count.
+    line_a = "set privileged to false on the team-alpha cache workload"
+    line_b = "removed the hostPath mount from the analytics deployment"
+    (tmp_path / "old-report.md").write_text(f"{line_a}\n{line_b}\n")
+    (tmp_path / "advisory.json").write_text(f'{{"a": "{line_a}"}}\n')
+    (tmp_path / "inventory.json").write_text(f'{{"b": "{line_b}"}}\n')
+    rules = build_inventory_rules(tmp_path)
+    report_rule = next(r for r in rules if not r.source and "old-report.md" in r.description)
+
+    kept = drop_fingerprints_matching_inputs(
+        rules, "Read ~/advisory.json and ~/inventory.json.", tmp_path
+    )
+
+    assert report_rule in kept
+
+
 def test_static_rules_survive_an_input_that_matches_them(tmp_path: Path) -> None:
     # An advisory citing the upstream repo must not silence the upstream-github rule.
     (tmp_path / "advisory.json").write_text(

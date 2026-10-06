@@ -419,8 +419,8 @@ def drop_fingerprints_matching_inputs(
     """Drop content fingerprints matching a delivered input the prompt names.
 
     A stale copy of a delivered input fingerprints byte-identical to the fresh
-    one, so reading it proves nothing. A rule goes only when every one of its
-    lines is in the input: a copy, not a deliverable that quotes one line. Only
+    one, so reading it proves nothing. A rule goes only when one input holds
+    every one of its lines: a copy, not a deliverable that quotes one line. Only
     inventory content rules are eligible; static rules and path rules stay.
     Entries in ``produced_in_batch`` (left by another task this batch) are
     deliverables, not inputs, and stay covered. A prompt-named entry from before
@@ -445,7 +445,7 @@ def drop_fingerprints_matching_inputs(
     def matches_own_input(rule: SensitiveAccessRule) -> bool:
         if rule.category != CATEGORY or rule.fields != _CONTENT_FIELDS:
             return False
-        return all(any(compile_pattern(p).search(t) for t in texts) for p in rule.patterns)
+        return any(all(compile_pattern(p).search(t) for p in rule.patterns) for t in texts)
 
     kept = []
     for rule in rules:
