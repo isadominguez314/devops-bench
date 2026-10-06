@@ -407,15 +407,19 @@ class SandboxExecutor:
     def _chown_container_name(self) -> str:
         return f"{self.container_name}-chown"
 
-    def _chown_argv(self, uid: int, gid: int) -> list[str]:
+    def _chown_argv(self, uid: int, gid: int, *, from_uid: int) -> list[str]:
         """``docker run`` argv for a root container (same image, no ``--user``) that
-        chowns every remap mount to ``uid:gid``; only root can chown ids past int32."""
+        chowns every remap mount to ``uid:gid``; only root can chown ids past int32.
+
+        ``--from`` limits each pass to entries the previous pass is responsible
+        for, so a fixture entry owned by anyone else keeps its owner.
+        """
         argv = [CONTAINER_RUNTIME, "run", "--rm", "--name", self._chown_container_name]
         targets: list[str] = []
         for host_path, mount_path in self._remap_mounts():
             argv += ["-v", f"{host_path}:{mount_path}"]
             targets.append(mount_path)
-        argv += [self.spec.image, "chown", "-R", f"{uid}:{gid}", *targets]
+        argv += [self.spec.image, "chown", "-R", f"--from={from_uid}", f"{uid}:{gid}", *targets]
         return argv
 
     def _chown_before_remap(self) -> None:
@@ -423,7 +427,7 @@ class SandboxExecutor:
 
         Fatal: an unprivileged agent cannot write a workspace it does not own.
         """
-        argv = self._chown_argv(_REMAP_UID, _REMAP_GID)
+        argv = self._chown_argv(_REMAP_UID, _REMAP_GID, from_uid=os.getuid())
         try:
             run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
         except (OSError, SubprocessError) as exc:
@@ -439,7 +443,7 @@ class SandboxExecutor:
         the exact repair command.
         """
         uid, gid = os.getuid(), os.getgid()
-        argv = self._chown_argv(uid, gid)
+        argv = self._chown_argv(uid, gid, from_uid=_REMAP_UID)
         try:
             run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
         except (OSError, SubprocessError):
