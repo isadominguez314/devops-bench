@@ -293,10 +293,7 @@ class Task(BaseModel):
             group = entry.get("group")
             if group is None:
                 continue
-            # Raw mappings, so the value can be anything YAML produced. A
-            # non-string is unhashable or meaningless as a key, and would be
-            # rejected by parse_entries anyway; say so here instead of raising
-            # a TypeError from the membership test.
+            # Raw YAML value: reject a non-string here rather than TypeError on the lookup.
             if not isinstance(group, str):
                 raise ValueError(f"verification entry {label!r}: group must be a string")
             # Stripped here as VerificationEntry strips it, so the two agree.

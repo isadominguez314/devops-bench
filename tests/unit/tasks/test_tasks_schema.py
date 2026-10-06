@@ -212,10 +212,8 @@ def test_chaos_spec_is_opaque():
 
 
 def test_non_list_verification_spec_raises():
-    # verification_spec is a list of entry mappings; parse_entries downstream
-    # keeps a defensive non-list branch for callers outside Task, but the
-    # schema should reject the malformed shape at load time with a clear
-    # error rather than deferring it.
+    # verification_spec must be a list of entry mappings; reject the malformed shape
+    # at load time instead of deferring to parse_entries.
     with pytest.raises(ValidationError):
         Task.from_dict({"verification_spec": {"check": "ok"}}, name_default="d")
 
@@ -286,9 +284,8 @@ def test_requires_unsandboxed_empty_block_coalesces_false():
 
 
 def test_safety_checklists_empty_block_coalesces_to_empty_list():
-    # An empty ``recoverable_safety:`` / ``catastrophic:`` block parses to None.
-    # Both entry points must coalesce it: from_dict, and direct
-    # model_validate/__init__, which only goes through the _coalesce_empty validator.
+    # An empty ``recoverable_safety:`` / ``catastrophic:`` block parses to None; both
+    # from_dict and direct model_validate must coalesce it.
     assert Task.from_dict({"name": "n", "recoverable_safety": None}).recoverable_safety == []
     direct = Task.model_validate({"name": "n", "recoverable_safety": None, "catastrophic": None})
     assert direct.recoverable_safety == []

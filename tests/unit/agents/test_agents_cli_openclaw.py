@@ -75,8 +75,8 @@ def _tool_result(
     }
 
 
-# Mirrors the real ``oc sessions export-trajectory`` events.jsonl schema:
-# dotted ``type`` with a nested ``data`` payload (captured from oc 2026.6.9).
+# Mirrors the ``oc sessions export-trajectory`` events.jsonl schema: dotted ``type``
+# with a nested ``data`` payload.
 SAMPLE_EVENTS = _events(
     _tool_call("1", "kubectl_get_pods", {"namespace": "default"}),
     _tool_result("1", "pod-a Running\n"),
@@ -114,11 +114,7 @@ def test_parse_trajectory_export_folds_call_result_pairs() -> None:
 
 
 def test_parse_trajectory_export_sums_usage_across_turns() -> None:
-    """Token usage is summed across every model.completed, not just the last.
-
-    OpenClaw reports usage per turn (per model call); a multi-turn session that
-    kept only the final ``model.completed`` would undercount to a single call.
-    """
+    """Token usage is summed across every model.completed, not just the last turn."""
     blob = _events(
         {"type": "model.completed", "data": {"usage": {"input": 100, "output": 20, "total": 120}}},
         _tool_call("1", "kubectl_get_pods", {}),
@@ -182,13 +178,8 @@ def test_parse_trajectory_export_surfaces_decode_errors() -> None:
 
 
 def test_parse_trajectory_export_drops_unpaired_result_and_surfaces_error() -> None:
-    """Orphan tool.result is dropped from trajectory, recorded on errors.
-
-    Mirrors the API agent's ``_fold_with_extraction_errors`` policy and the
-    Gemini ``parse_stream_json`` policy so every agent feeds the metrics seam
-    one shape — only real ToolCalls the model issued ride on
-    ``AgentResult.trajectory``; orphans are diagnostics, not trajectory entries.
-    """
+    """An orphan tool.result is dropped from the trajectory and recorded on errors, as
+    the other agents do, so the metrics seam sees one shape."""
     blob = _events(_tool_result("ghost", "?"))
     trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
     # Orphan must NOT appear in the canonical trajectory.
@@ -306,13 +297,8 @@ def _install_oc_run(
     fake_bash: Callable[..., Any],
     fake_core_run: Callable[..., Any] | None = None,
 ) -> None:
-    """Install a fake ``core.subprocess.run`` on the agent module.
-
-    The agent turn arrives as ``["/bin/bash", "-c", <command>]`` and is routed
-    to ``fake_bash(<command>, **kwargs)`` so fakes keep asserting on the bash
-    command string; any other argv is the direct ``oc`` extraction call and
-    goes to ``fake_core_run`` (defaulting to an empty ``oc sessions``).
-    """
+    """Install a fake ``core.subprocess.run``: the bash agent turn goes to
+    ``fake_bash(<command>)``, any other argv (the ``oc`` extraction call) to ``fake_core_run``."""
     core = fake_core_run or (lambda argv, **kwargs: _make_subprocess_result(json.dumps([]), "", 0))
 
     def dispatch(argv, **kwargs):
@@ -324,12 +310,8 @@ def _install_oc_run(
 
 
 def _bundle_writer(events_jsonl: str) -> Callable[..., Any]:
-    """Build a fake core-subprocess.run that writes an export bundle's events.jsonl.
-
-    ``oc sessions`` returns one session row; ``oc sessions export-trajectory``
-    writes ``events.jsonl`` (the real trajectory filename) into the bundle dir
-    under the ``--workspace`` it was handed.
-    """
+    """Fake core-subprocess.run: ``oc sessions`` returns one row and export-trajectory
+    writes ``events.jsonl`` into the bundle dir under the ``--workspace`` it was handed."""
     sessions_payload = json.dumps(
         [{"key": "agent:operator:test", "model": "google/gemini-2.5-pro"}]
     )
@@ -351,11 +333,7 @@ def _bundle_writer(events_jsonl: str) -> Callable[..., Any]:
 def test_execute_happy_path_emits_canonical_trajectory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """oc agent succeeds, oc sessions yields one row, export-trajectory parses cleanly.
-
-    The final answer comes from the bundle (``model.completed.assistantTexts``),
-    not the noisy bash stdout.
-    """
+    """Happy path: the final answer comes from the bundle, not the noisy bash stdout."""
 
     def fake_bash(cmd, **kwargs):
         return _make_subprocess_result(stdout="OK\n", returncode=0)
@@ -374,9 +352,7 @@ def test_execute_happy_path_emits_canonical_trajectory(
 def test_execute_prefers_bundle_output_over_noisy_stdout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The agent's final answer (events.jsonl assistantTexts) must win over
-    `oc --log-level debug` noise — otherwise the judge grades debug spew.
-    """
+    """The bundle's assistantTexts win over ``--log-level debug`` noise on stdout."""
     noisy_stdout = "[DEBUG] starting oc...\n[INFO] sessionFile=/tmp/.openclaw/...\n[DEBUG] turn 1\n"
 
     def fake_bash(cmd, **kwargs):
@@ -484,16 +460,12 @@ def test_legacy_local_runner_is_gone() -> None:
     assert not hasattr(oc_mod, "run_openclaw_agent_local")
 
 
-# ---------------------------------------------------------------------------
-# Capability negotiation: OpenClaw wires MCP + skills via oc's native channels
-# ---------------------------------------------------------------------------
+# Capability negotiation: OpenClaw wires MCP + skills via oc's native channels.
 
 
 def test_openclaw_satisfies_mcp_skills_and_rules_protocols() -> None:
-    """OpenClaw declares MCP, Skills and Rules: it writes ``mcp.servers`` into an
-    isolated ``OPENCLAW_CONFIG_PATH``, materializes managed skills under
-    ``<OPENCLAW_STATE_DIR>/skills``, and prepends the operator brief to the
-    prompt."""
+    """OpenClaw declares MCP, Skills and Rules: mcp.servers in an isolated config, managed
+    skills under the state dir, the operator brief prepended to the prompt."""
     agent = OpenClawAgent(AgentConfig())
     assert isinstance(agent, SupportsRules)
     assert isinstance(agent, SupportsMcp)
@@ -521,9 +493,7 @@ def test_openclaw_agent_mirrors_rules_binding_onto_mixin_attribute() -> None:
     assert agent.rules == AgentRules(text="be precise")
 
 
-# ---------------------------------------------------------------------------
-# Rules delivery: the bound text actually reaches the spawned `oc` command.
-# ---------------------------------------------------------------------------
+# Rules delivery: the bound text reaches the spawned `oc` command.
 
 
 def test_prepend_rules_passes_prompt_through_when_rules_empty() -> None:
@@ -542,10 +512,8 @@ def test_prepend_rules_separates_brief_from_prompt_with_blank_line() -> None:
 def test_execute_prepends_bound_rules_to_oc_prompt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The rules text must land inside the bash command string the agent
-    spawns — specifically inside the ``-m '<prompt>'`` segment that ``oc
-    agent`` reads. We capture the command and assert both the original prompt
-    and the rules text are present, with the rules ahead of the prompt."""
+    """The rules text lands inside the ``-m '<prompt>'`` segment of the spawned bash
+    command, ahead of the prompt."""
     captured: dict = {}
 
     def fake_bash(cmd, **kwargs):
@@ -582,15 +550,12 @@ def test_execute_does_not_prepend_rules_when_empty(
 
     OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("just the prompt")
     cmd = captured["cmd"]
-    # The agent shlex-quotes the prompt; "just the prompt" appears verbatim
-    # inside single quotes in the `-m` segment — and no extra blank-line
-    # prefix surrounds it.
+    # The prompt is shlex-quoted and appears verbatim in the -m segment, with no
+    # blank-line prefix.
     assert "-m 'just the prompt'" in cmd
 
 
-# ---------------------------------------------------------------------------
 # MCP server wiring: mcp.servers reach an isolated OPENCLAW_CONFIG_PATH.
-# ---------------------------------------------------------------------------
 
 
 def test_build_openclaw_config_wraps_servers_under_mcp() -> None:
@@ -648,10 +613,7 @@ def test_build_openclaw_config_uses_container_kubeconfig_when_sandboxed(
     assert cfg["mcp"]["servers"]["gke"]["env"] == {"KUBECONFIG": sandbox_mod.CONTAINER_KUBECONFIG}
 
 
-# ---------------------------------------------------------------------------
-# Model catalog override: models oc doesn't ship by default get registered in
-# the per-run isolated config, for both google-genai and google-vertex.
-# ---------------------------------------------------------------------------
+# Model catalog override: ids oc does not ship get registered in the per-run config.
 
 
 def test_model_override_empty_for_catalog_known_model() -> None:
@@ -664,10 +626,8 @@ def test_model_override_empty_when_no_model() -> None:
 
 
 def test_model_override_genai_pins_generative_ai_transport() -> None:
-    """google-genai: the entry pins ``api: google-generative-ai`` so oc routes it
-    through the google-genai transport (a per-run provider entry replaces oc's
-    built-in one, so the transport must be carried) and needs no ``baseUrl``.
-    Allowlists ``google/<model>``."""
+    """google-genai pins ``api: google-generative-ai`` (a per-run provider entry replaces
+    oc's built-in one), needs no ``baseUrl``, and allowlists ``google/<model>``."""
     override = _build_model_override(AgentConfig(model="gemini-3.5-flash", provider="google"))
     google = override["models"]["providers"]["google"]
     assert google["api"] == "google-generative-ai"
@@ -757,9 +717,8 @@ def _empty_sessions_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
 def test_execute_writes_mcp_servers_into_isolated_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A command-bearing MCP binding lands in ``<cwd>/openclaw.json`` and
-    ``OPENCLAW_CONFIG_PATH`` is pointed at it (read inside the fake to beat
-    temp-dir cleanup)."""
+    """A command-bearing MCP binding lands in ``<cwd>/openclaw.json`` via
+    ``OPENCLAW_CONFIG_PATH`` (read inside the fake, before temp-dir cleanup)."""
     captured: dict = {}
 
     def fake_bash(cmd, **kwargs):

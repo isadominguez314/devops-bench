@@ -14,18 +14,14 @@
 
 """Run the agent-under-test inside a container with a scoped view of the world.
 
-Ambient CLI agents inherit the operator's filesystem and environment: the
-benchmark's answer material, cloud credentials, admin kubeconfig. This module
-is the boundary. The container sees the per-run workspace at ``/workspace``
-(``HOME`` under it), the task's seeded fixtures, a single-cluster kubeconfig
-read-only at ``/creds/kubeconfig``, and a deny-filtered env overlay passed as
-name-only ``-e`` flags. A sandbox that cannot be built raises
-:class:`~devops_bench.core.errors.SandboxError` rather than running ambient.
-
-The container is bridge-attached; what it may reach on the host is governed by
-the host's ``DOCKER-USER`` rules (bastion setup), not here. The kubeconfig's
-credential is the scoped ServiceAccount token from
-:mod:`devops_bench.k8s.agent_credentials`; the model credential comes from
+The container sees the per-run workspace at ``/workspace`` (``HOME`` under it),
+the task's seeded fixtures, a single-cluster kubeconfig read-only at
+``/creds/kubeconfig``, and a deny-filtered env overlay passed as name-only ``-e``
+flags; never the operator's filesystem, cloud credentials or admin kubeconfig. A
+sandbox that cannot be built raises :class:`~devops_bench.core.errors.SandboxError`
+rather than running ambient. Host reachability is the host setup's
+``DOCKER-USER`` rules, not this module's; the cluster credential comes from
+:mod:`devops_bench.k8s.agent_credentials`, the model credential from
 :mod:`devops_bench.core.model_providers`.
 """
 
@@ -85,10 +81,8 @@ CONTAINER_WORKSPACE = "/workspace"
 CONTAINER_HOME = f"{CONTAINER_WORKSPACE}/home"
 CONTAINER_KUBECONFIG = "/creds/kubeconfig"
 
-# Docker refuses ``--user`` ids above int32 max outright (exit 125, no start
-# event); IdP-minted ids routinely exceed it. Dropping ``--user`` would run the
-# agent as root inside the boundary and leave root-owned files teardown cannot
-# remove (observed live), so out-of-range ids are remapped; see _needs_id_remap.
+# Docker refuses ``--user`` ids above int32 max (exit 125); IdP-minted ids can exceed it.
+# Dropping ``--user`` would run the agent as root, so such ids are remapped (_needs_id_remap).
 _MAX_CONTAINER_ID = 2**31 - 1
 
 # In-range unprivileged id for the remap: the ``node`` user of the node:22-slim
