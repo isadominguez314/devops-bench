@@ -1094,11 +1094,65 @@ def test_provision_uses_the_ambient_cluster_only_when_told_to(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv(creds.ALLOW_AMBIENT_ENV, "1")
-    _patch_kubectl(monkeypatch)
+    calls = _patch_kubectl(monkeypatch)
 
     path = creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
 
     assert yaml.safe_load(path.read_text())["users"][0]["user"] == {"token": _TOKEN}
+    # Authorized once, then pinned: every write names the snapshotted context
+    # rather than re-reading current-context at each call.
+    writes = [c for c in calls if "apply" in c or "token" in c or "label" in c]
+    assert writes and all("some-ambient-context" in c for c in writes)
+
+
+def test_pin_plan_context_pins_the_authorized_ambient_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(creds.ALLOW_AMBIENT_ENV, "1")
+    _patch_kubectl(monkeypatch)
+    pinned = creds.pin_plan_context(NetworkPlan())
+    assert pinned.kubectl_context == "some-ambient-context"
+    provider_pinned = NetworkPlan(kubectl_context="kind-c1")
+    assert creds.pin_plan_context(provider_pinned) is provider_pinned
+
+
+def test_every_provisioning_and_teardown_kubectl_call_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An apiserver that accepts the connection and never answers must not hang
+    _run_one: every kubectl call these paths make carries a subprocess timeout,
+    which is also what lets teardown keep its promise to return."""
+    _patch_kubectl(monkeypatch)
+    inner = kubectl.run
+    timeouts: list[tuple[list[str], float | None]] = []
+
+    def recording_run(argv, **kwargs):
+        timeouts.append((list(argv), kwargs.get("timeout")))
+        return inner(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", recording_run)
+    plan = NetworkPlan(kubectl_context="kind-c1")
+    creds.provision_agent_credentials(plan, tmp_path, token_ttl_sec=1500)
+    creds.teardown_agent_credentials("kind-c1")
+
+    unbounded = [argv for argv, timeout in timeouts if timeout is None]
+    assert timeouts and unbounded == []
+
+
+def test_teardown_skips_an_unpinned_cluster_unless_told_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sandboxed task with no cluster (no-op deployer) provisions nothing, so
+    its run-end teardown must not fire deletes at the operator's ambient
+    current-context; with the ambient opt-in the operator asked for exactly that."""
+    monkeypatch.delenv(creds.ALLOW_AMBIENT_ENV, raising=False)
+    calls = _patch_kubectl(monkeypatch)
+    assert creds.teardown_agent_credentials(None) is True
+    assert calls == []
+
+    monkeypatch.setenv(creds.ALLOW_AMBIENT_ENV, "1")
+    assert creds.teardown_agent_credentials(None) is True
+    assert any("delete" in c for c in calls)
 
 
 def test_provision_fails_loud_when_pod_security_cannot_be_applied(
