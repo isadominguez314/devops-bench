@@ -23,11 +23,13 @@ import shutil
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentResult
+from devops_bench.agents import sandbox as agent_sandbox
 from devops_bench.agents.capabilities import (
     AgentRules,
     AllCapabilities,
@@ -41,14 +43,17 @@ from devops_bench.cheat_detection import (
     annotate_records,
     baseline_from_granted_paths,
     build_inventory_rules,
+    build_mount_rules,
     filter_rules_for_prompt,
     load_ruleset,
 )
 from devops_bench.core import (
+    ClusterInfo,
     ConfigError,
     MissingDependencyError,
     NotRegisteredError,
     RunContext,
+    SandboxError,
     get_bool,
     get_env,
     get_logger,
@@ -69,6 +74,7 @@ from devops_bench.evalharness.scenario import (
     ScenarioManager,
     pick_free_port,
 )
+from devops_bench.k8s import agent_credentials
 from devops_bench.tasks import Task
 from devops_bench.verification import (
     MIN_LEAF_BUDGET_SECONDS,
@@ -78,13 +84,15 @@ from devops_bench.verification import (
 )
 from devops_bench.verification.hold_defaults import effective_poll_interval
 
+if TYPE_CHECKING:
+    from devops_bench.providers.base import Provider
+
 __all__ = ["DefaultEvalHarness"]
 
 _log = get_logger("evalharness.default")
 
-# Builtin agent modules imported at call time so their ``@AGENTS.register``
-# decorators run. External packages add agents by registering with the same
-# registry, with no edit here.
+# Imported at call time so their ``@AGENTS.register`` decorators run; external
+# packages register with the same registry.
 _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
     "devops_bench.agents.cli.gemini_cli",
     "devops_bench.agents.cli.claude_code",
@@ -103,64 +111,47 @@ _AGENT_TYPE_ALIASES: dict[str, str] = {
 # Default agent type when neither --agent-type nor BENCH_AGENT_TYPE is set.
 _DEFAULT_AGENT_TYPE = "gemini-cli"
 
-# Default target deployment + namespace used both for placeholder
-# substitution in the agent prompt and as the chaos port-forward target, so the
-# operator agent and the chaos injector address the same workload when env is
-# unset.
+# Defaults shared by prompt placeholders and the chaos port-forward target, so the
+# agent and the injector address the same workload when env is unset.
 _DEFAULT_TARGET_DEPLOYMENT = "hypercomputer-d1-frontend"
 _DEFAULT_NAMESPACE = "default"
 
-# How long to wait for the chaos agent to establish its load spike before
-# starting the operator agent.
+# Wait for the chaos agent to establish its load spike before starting the operator agent.
 _CHAOS_ACTIVE_WAIT_SEC = 45
 
-# Budget for draining the scenario thread. Kept above the verification budget
-# so a slow-but-completing verification is not cut off, which would otherwise
-# yield partial reports and race teardown.
+# Scenario-thread drain budget; above the verification budget so a slow but
+# completing verification is not cut off into a partial report racing teardown.
 _SCENARIO_JOIN_SEC = VERIFICATION_TIMEOUT_SEC + 60
 
 
 def _ensure_builtin_agents_registered() -> None:
-    """Import the builtin agent modules so their registrations fire.
+    """Import the builtin agent modules so their registrations fire (re-imports are no-ops).
 
-    The registry is the only source of truth — this function exists so the
-    harness can resolve canonical keys at call time without naming any module
-    path in ``AGENTS.get``. Re-imports are no-ops thanks to ``sys.modules``.
-
-    Catches **only** missing-dependency / import errors (an agent module may
-    pull an optional SDK like ``anthropic`` that is absent on the host) — a
-    real bug in an agent module (``SyntaxError``, an ``AttributeError`` at
-    module top) re-raises so it cannot hide behind a silent ``debug`` log.
+    Only missing-dependency / import errors are swallowed (an optional SDK may be
+    absent); a real bug in an agent module re-raises rather than hiding in a debug log.
     """
     for module in _BUILTIN_AGENT_MODULES:
         try:
             importlib.import_module(module)
         except (ImportError, MissingDependencyError) as exc:
-            # Optional SDK absent on this host. ``AGENTS.get`` will still
-            # raise a clear ``NotRegisteredError`` later if the user selects
-            # an agent whose module did not load.
+            # ``AGENTS.get`` still raises NotRegisteredError if this agent is selected.
             _log.debug("optional agent module %s not importable: %s", module, exc)
 
 
 def _canonical_agent_type(agent_type: str) -> str:
     """Normalize an agent-type alias to its canonical registry key.
 
-    The single source of truth for both registry lookup and result recording,
-    so an arm selected via a friendly alias (``claude-code`` / ``gemini-cli``)
-    aggregates under the same ``harness`` / ``setup_id`` as the canonical key
-    instead of splitting into a second dashboard setup.
+    Used for both registry lookup and result recording, so an alias aggregates
+    under the same ``harness`` / ``setup_id`` as the canonical key.
     """
     return _AGENT_TYPE_ALIASES.get(agent_type, agent_type)
 
 
 def _entry_display_fields(entry: VerificationEntry) -> dict[str, Any]:
-    """The display fields copied verbatim from an entry onto its report item.
+    """Display fields snapshotted from an entry onto its report item.
 
-    Snapshotted onto the record so a result renders with the titles that were
-    true when it ran, without joining back to the task file at that revision.
-    An undeclared field lands as ``None``, meaning the author wrote nothing,
-    unlike the task-level fields, which default to ``""`` on the schema. The
-    row normalizer maps both to ``""``.
+    Undeclared fields land as ``None`` (unlike task-level fields, which default
+    to ``""``); the row normalizer maps both to ``""``.
     """
     return {
         "title": entry.title,
@@ -185,15 +176,12 @@ class DefaultEvalHarness(Harness):
     """Standard harness wiring every component into one pipeline.
 
     Each task flows through provisioning, optional background chaos, agent
-    execution, artifact collection, teardown, and batch scoring. Every layer
-    is consumed through its typed contract: ``Task`` in, ``AgentResult`` from
-    the agent, ``ChaosResult`` / ``VerificationResult`` from the scenario,
-    ``MetricScore`` from each metric. The harness routes those typed values
-    through ``to_dict()`` / ``to_entry()`` / ``model_dump()`` so the on-disk
-    ``results.json`` schema stays byte-stable.
+    execution, artifact collection, teardown, and batch scoring, each layer
+    consumed through its typed contract and serialized so the on-disk
+    ``results.json`` schema stays stable.
 
     Args:
-        project_id: Default GCP project ID for provisioning and placeholders.
+        project_id: Default cloud project id for provisioning and placeholders.
         cluster_name: Default cluster name for provisioning and placeholders.
         judge_model: A ``DeepEvalBaseLLM`` judge used for scoring; when ``None``
             one is built from ``JUDGE_PROVIDER`` / ``JUDGE_MODEL`` on first use.
@@ -236,34 +224,23 @@ class DefaultEvalHarness(Harness):
         self.no_teardown = no_teardown if no_teardown is not None else get_bool("BENCH_NO_TEARDOWN")
         # Resolved once so capabilities and scoring observe the same value.
         self.use_mcp: bool = get_bool("BENCH_USE_MCP", True)
-        # Trajectory-based cheating detection annotates each record with a
-        # ``cheating_report`` and never touches ``validated``. The report is
-        # not inert, though: ``IntegrityMetric`` reads it during the later
-        # scoring pass and gates a flagged run's ``OutcomeScore`` to zero.
-        # Extra rules load from an optional YAML file — loaded
-        # here so a bad BENCH_CHEAT_RULES path fails loud at construction
-        # (an operator config error) instead of being swallowed by the
-        # best-effort scan at the end of the run.
+        # Cheating detection writes ``cheating_report`` (read by IntegrityMetric,
+        # which gates a flagged run to zero). Rules load here so a bad path fails loud.
         self.cheat_detect: bool = get_bool("BENCH_CHEAT_DETECT", True)
         self.cheat_rules_path: str | None = get_env("BENCH_CHEAT_RULES")
         self._cheat_rules: tuple[SensitiveAccessRule, ...] = (
             load_ruleset(self.cheat_rules_path) if self.cheat_detect else ()
         )
-        # Also snapshot the agent home before the first agent runs and flag
-        # access to anything already lying there (prior-run leftovers).
+        # Also snapshot the agent home and flag access to prior-run leftovers.
         self.cheat_inventory: bool = get_bool("BENCH_CHEAT_INVENTORY", True)
-        # When running concurrently with other benchmark processes, allocate a
-        # free local port for the chaos port-forward instead of the fixed
-        # default so two scenarios on one host do not contend for the same port.
+        # Concurrent processes on one host get a free chaos port-forward port each.
         self.parallel: bool = get_bool("BENCH_PARALLEL", False)
-        # Build the gated :class:`AgentConfig` once and hold the snapshot for
-        # the lifetime of this harness, so every agent run and every record's
-        # ``capabilities_granted`` field reads the same object.
+        # Built once so every agent run and every record's ``capabilities_granted``
+        # read the same snapshot.
         self._agent_config: AgentConfig = self._build_agent_config_snapshot()
         self.default_target_deployment = default_target_deployment
         self.default_namespace = default_namespace
-        # Resolve the run-level placeholder inputs once into instance
-        # attributes that ``replace_placeholders`` / ``start_scenario`` read.
+        # Run-level placeholder inputs, read by replace_placeholders / start_scenario.
         self.app_location = get_env("APP_LOCATION", "") or ""
         self.target_deployment = (
             get_env("TARGET_DEPLOYMENT_NAME", self.default_target_deployment)
@@ -274,70 +251,66 @@ class DefaultEvalHarness(Harness):
 
     @property
     def _granted_skill_paths(self) -> tuple[str, ...]:
-        """Skill paths the harness granted, derived from the config snapshot.
-
-        Single source of truth: the same tuple lives on
-        ``self._agent_config.capabilities.skills.paths`` and is read by every
-        agent the harness constructs. Keeping it as a derived property (not a
-        second copy) makes it structurally impossible for the recorded
-        ``skills`` to disagree with what the agent saw.
-        """
+        """Skill paths the harness granted, derived (not copied) from the config snapshot."""
         return self._agent_config.capabilities.skills.paths
 
     # -- agent resolution (model/provider-agnostic) -----------------------
 
-    def resolve_agent(self, agent_type: str) -> Any:
+    def resolve_agent(
+        self,
+        agent_type: str,
+        sandbox_spec: agent_sandbox.SandboxSpec | None = None,
+        *,
+        sandbox_exempt: bool = False,
+    ) -> Any:
         """Resolve and instantiate the agent under test from the registry.
 
-        The builtin agent modules are imported once so their
-        ``@AGENTS.register`` decorators run, the alias is normalized to the
-        canonical key, and the class is fetched from
-        :data:`~devops_bench.agents.AGENTS`. An externally-registered agent
-        resolves the same way with no harness edit.
-
         Args:
-            agent_type: Configured agent type (e.g. ``gemini-cli`` / ``api`` /
-                ``gemini`` / ``openclaw``).
+            agent_type: Configured agent type or alias.
 
         Returns:
-            An instantiated agent harness. The instance is built with the
-            harness-resolved :class:`AgentConfig` so capabilities (MCP / skills /
-            rules) reflect the orchestrator's catalog × run-arm decision.
+            An agent built with the harness-resolved :class:`AgentConfig`.
 
         Raises:
-            NotRegisteredError: If no agent is registered under the resolved
-                canonical key.
+            NotRegisteredError: If nothing is registered under the canonical key.
         """
         _ensure_builtin_agents_registered()
         key = _canonical_agent_type(agent_type)
         agent_cls = AGENTS.get(key)
         if agent_cls is None:
             raise NotRegisteredError(AGENTS.name, key, AGENTS.keys())
-        return agent_cls(self.build_agent_config())
+        return agent_cls(self.build_agent_config(sandbox_spec, sandbox_exempt=sandbox_exempt))
 
     # -- agent config + capabilities (explicit; no env detour) ------------
 
-    def build_agent_config(self) -> AgentConfig:
-        """Return the harness's snapshotted :class:`AgentConfig`.
+    def build_agent_config(
+        self,
+        sandbox_spec: agent_sandbox.SandboxSpec | None = None,
+        *,
+        sandbox_exempt: bool = False,
+    ) -> AgentConfig:
+        """Return the snapshotted :class:`AgentConfig`, built once in ``__init__``.
 
-        The config is built once in :meth:`__init__` and reused for every agent
-        run plus every record's ``capabilities_granted`` field.
-
-        Returns:
-            The :class:`AgentConfig` snapshot. The same object is handed to
-            every agent the harness constructs.
+        ``sandbox_spec`` (the task-completed spec ``_run_one`` prepared)
+        replaces the snapshot's skeletal ``sandbox`` field for that one
+        agent; ``sandbox_exempt`` (a ``requires_unsandboxed`` task) clears
+        it instead. Passing both is a caller bug and raises.
         """
+        if sandbox_exempt and sandbox_spec is not None:
+            raise ValueError("sandbox_exempt and sandbox_spec are mutually exclusive")
+        if sandbox_exempt:
+            # Clear the field rather than leave the skeletal spec: the agent's
+            # own gate reads ``config.sandbox is not None``.
+            return replace(self._agent_config, sandbox=None)
+        if sandbox_spec is not None:
+            return replace(self._agent_config, sandbox=sandbox_spec)
         return self._agent_config
 
     def _build_agent_config_snapshot(self) -> AgentConfig:
-        """Build the gated :class:`AgentConfig` from the env layer.
+        """Build the gated :class:`AgentConfig` from the env layer, once, in ``__init__``.
 
-        Called exactly once, from :meth:`__init__`. Starts from
-        :meth:`AgentConfig.from_env` so existing ``AGENT_*`` knobs continue
-        to flow through (``model``, ``provider``, ``api_key``, ``target``,
-        ``timeout``, ``max_turns``, ``extra_env``), then replaces
-        capabilities with the orchestrator-owned aggregate so the agent
-        cannot see a granted MCP binding when ``use_mcp`` is False.
+        Starts from :meth:`AgentConfig.from_env` and replaces capabilities with
+        the gated aggregate, so a granted MCP binding is invisible when ``use_mcp`` is False.
         """
         base = AgentConfig.from_env()
         capabilities = self._gate_capabilities(base.capabilities, self.use_mcp)
@@ -350,16 +323,17 @@ class DefaultEvalHarness(Harness):
             max_turns=base.max_turns,
             capabilities=capabilities,
             extra_env=base.extra_env,
+            # Rebuilding field-by-field silently drops any field not named here.
+            extra_flags=base.extra_flags,
+            sandbox=base.sandbox,
         )
 
     @staticmethod
     def _gate_capabilities(env_caps: AllCapabilities, use_mcp: bool) -> AllCapabilities:
-        """Apply the harness's ``use_mcp`` gate to an env-derived capability set.
+        """Apply the ``use_mcp`` gate to an env-derived capability set.
 
-        Skills and rules are independent of MCP and pass through unchanged;
-        only the MCP binding is dropped when ``use_mcp`` is False. The
-        returned aggregate is always a fresh frozen dataclass so the caller
-        does not mutate the input.
+        Only the MCP binding is dropped when ``use_mcp`` is False; skills and
+        rules pass through. Always returns a fresh aggregate.
 
         Args:
             env_caps: Capabilities derived from the ``AGENT_*`` env layer.
@@ -372,8 +346,7 @@ class DefaultEvalHarness(Harness):
         if use_mcp:
             mcp_servers: tuple[McpBinding, ...] = env_caps.mcp_servers
         else:
-            # MCP gated off: drop the binding so the agent's tools-enabled gate
-            # is False and metrics' ``use_mcp`` agrees with what ran.
+            # Dropped so the agent's tools gate and the metrics' ``use_mcp`` agree.
             mcp_servers = ()
 
         return AllCapabilities(
@@ -413,11 +386,6 @@ class DefaultEvalHarness(Harness):
     ) -> str:
         """Substitute infrastructure placeholders in a prompt or expectation.
 
-        ``TARGET_DEPLOYMENT_NAME`` and ``NAMESPACE`` form the integration
-        contract supplied by the provisioning layer after cluster bring-up;
-        their fallbacks come from the constructor's
-        :attr:`default_target_deployment` / :attr:`default_namespace`.
-
         Args:
             text: Text containing ``{{...}}`` placeholders.
             cluster_name: Active cluster name to substitute.
@@ -444,12 +412,7 @@ class DefaultEvalHarness(Harness):
         target_deployment: str | None = None,
         namespace: str | None = None,
     ) -> Any:
-        """Walk a nested spec and substitute placeholders in every string leaf.
-
-        Substitution runs before parsing because a template string like
-        ``{{NAMESPACE}}`` is not a valid value for a typed field, so
-        placeholders are resolved on the raw payload before the caller parses
-        it into a typed structure.
+        """Substitute placeholders in every string leaf of a raw spec, before it is parsed.
 
         Args:
             spec: An opaque chaos / verification spec value (mapping, list,
@@ -496,15 +459,12 @@ class DefaultEvalHarness(Harness):
         if not raw:
             return []
         resolved = self._resolve_spec_placeholders(raw, cluster_name, target_deployment, namespace)
-        # A placeholder-substituted JSON string round-trips through
-        # ``json.loads`` to a list/dict the discriminated union can validate.
+        # A JSON string round-trips through json.loads to a validatable list/dict.
         if isinstance(resolved, str):
             try:
                 resolved = json.loads(resolved)
             except json.JSONDecodeError as exc:
-                # A task that declares chaos but whose spec fails to parse must
-                # fail loudly: silently dropping it would run the eval without the
-                # intended disruption and score a quietly-invalid result.
+                # Fail loud: dropping it would score a run without the intended disruption.
                 raise ConfigError(f"could not parse chaos_spec JSON string: {exc}") from exc
         entries = resolved if isinstance(resolved, list) else [resolved]
         return [ChaosSpec.model_validate(entry) for entry in entries if entry]
@@ -518,53 +478,23 @@ class DefaultEvalHarness(Harness):
     ) -> list[dict[str, Any]]:
         """Evaluate every entry against the live cluster after the agent finishes.
 
-        Every entry runs, unconditionally, whether or not a chaos fault
-        references it. One entry that raises is recorded as a failure and the
-        rest still run, matching how the metrics pipeline isolates a failing
-        evaluator.
-
-        Two budgets apply. ``timeout_sec`` is the per-entry cap for a single
-        converging entry's checks. :data:`VERIFICATION_TOTAL_BUDGET_SEC` is
-        the wall-clock cap for this whole pass across every entry; without it
-        a task with many failing converge objectives burns entries x
-        ``timeout_sec`` (12 entries x 120s is 22+ minutes). A single monotonic
-        deadline is computed from the total budget once at the top, and each
-        converging entry gets ``min(timeout_sec, remaining)``. Assert entries
-        ignore the total budget and always run: they are single evaluations,
-        and a safeguard that goes unchecked defeats the point of having it.
-        A converging entry with less than :data:`MIN_LEAF_BUDGET_SECONDS`
-        remaining is recorded here as budget-exhausted rather than handed to
-        ``run_entry``: the runner's own leaf guard uses that same threshold
-        to short-circuit an under-budget leaf as a definite "deadline
-        exhausted" outcome, and this entry was never observed either way.
-
-        A ``hold`` entry is never evaluated with a single ``run_entry`` call
-        here, but the two roles reach their observation differently.  A
-        ``safeguard`` hold entry was already sampled on a background thread
-        across the agent's turn (see
-        ``devops_bench.evalharness.hold.SafeguardMonitor``), and its outcome
-        comes entirely from ``hold_observations``. An ``objective`` hold
-        entry is soaked right here instead, via
-        :func:`~devops_bench.evalharness.hold.run_hold_window`, against this
-        same total-budget deadline: an objective starts false and must
-        become true and stay true, which can only be observed after the
-        agent's turn ends. A hold entry with zero samples either way is
-        recorded as an error, not a silent pass: a hold nobody watched must
-        not read as one that held.
+        Every entry runs; one that raises is recorded as a failure and the rest
+        continue. Converging entries share one wall-clock deadline from
+        :data:`VERIFICATION_TOTAL_BUDGET_SEC` and get ``min(timeout_sec,
+        remaining)`` each; one with under :data:`MIN_LEAF_BUDGET_SECONDS` left is
+        recorded as budget-exhausted. Assert entries ignore the total budget.
+        Safeguard hold entries take their outcome from ``hold_observations``
+        (sampled during the agent's turn); objective hold entries are soaked here
+        against the same deadline. A hold with zero samples is an error, never a pass.
 
         Args:
             entries: The task's parsed verification entries.
             timeout_sec: Per-entry budget for converging entries.
-            hold_observations: Name-keyed monitor observations for every
-                ``safeguard``-role ``hold`` entry, as returned by
-                :meth:`~devops_bench.evalharness.hold.SafeguardMonitor.get_observations`.
-                ``None`` (or a missing name) is treated the same as zero
-                samples. Never consulted for ``objective``-role hold entries,
-                which are soaked in this same pass instead.
+            hold_observations: Name-keyed safeguard-hold observations; ``None``
+                or a missing name counts as zero samples.
 
         Returns:
-            One raw mapping per entry, in declaration order, carrying the
-            scoring vocabulary alongside the outcome. This is the exact shape
+            One mapping per entry, in declaration order, in the shape
             :func:`devops_bench.verification.rollup.rollup` consumes.
         """
         agent = VerifierAgent()
@@ -572,8 +502,7 @@ class DefaultEvalHarness(Harness):
         total_deadline = time.monotonic() + VERIFICATION_TOTAL_BUDGET_SEC
         hold_observations = hold_observations or {}
 
-        # Objective holds soak last, so converging objectives claim the shared
-        # budget before any soak can consume it. Rows keep declaration order.
+        # Objective holds soak last so converging entries claim the budget first.
         rows: list[dict[str, Any] | None] = [None] * len(entries)
         objective_holds: list[int] = []
 
@@ -588,10 +517,7 @@ class DefaultEvalHarness(Harness):
 
         for index in objective_holds:
             entry = entries[index]
-            # hold_window_sec is required for an objective hold entry;
-            # normally enforced by VerificationEntry's own validation, so
-            # reaching here without it means a spec-validation bug let an
-            # invalid entry through to verification.
+            # Required by VerificationEntry validation; missing here is a validation bug.
             if entry.hold_window_sec is None:
                 raise ValueError(
                     f"objective hold entry {entry.name!r} reached verification without "
@@ -669,24 +595,17 @@ class DefaultEvalHarness(Harness):
     def _hold_report_entry(entry: VerificationEntry, obs: HoldObservation | None) -> dict[str, Any]:
         """Build one hold entry's report row from its driver's observation.
 
-        The verdict itself (pass / fail / error, and why) is delegated to
-        :func:`~devops_bench.evalharness.hold.hold_verdict` so both hold
-        drivers (the live safeguard monitor and the post-run objective
-        window) are scored by exactly one rule. ``obs is None`` (the entry's
-        name was missing from ``hold_observations`` entirely) is treated the
-        same as a fresh, zero-sample observation.
+        The verdict comes from :func:`~devops_bench.evalharness.hold.hold_verdict`
+        so both hold drivers are scored by one rule; ``obs is None`` counts as a
+        zero-sample observation.
 
         Args:
             entry: The hold-mode entry being reported.
-            obs: The driver's observation for this entry, or ``None`` if the
-                entry's name was missing from ``hold_observations`` entirely.
+            obs: The driver's observation, or ``None`` when the name was missing.
 
         Returns:
-            The report row for this entry, in the same shape
-            :func:`devops_bench.verification.rollup.rollup` consumes, plus
-            ``hold_sample_count`` / ``hold_error_count`` /
-            ``hold_first_violation_reason`` / ``hold_first_violation_at_sec``
-            so the outcome is auditable from the report alone.
+            The rollup-shaped row plus the ``hold_*`` fields that make the
+            outcome auditable from the report alone.
         """
         success, status, reason = hold_verdict(obs if obs is not None else HoldObservation())
 
@@ -741,9 +660,7 @@ class DefaultEvalHarness(Harness):
         if not chaos_specs:
             return None
 
-        # Only the first spec is scheduled today; the field is a list to leave
-        # room for multiple planned disruptions. Warn rather than silently drop
-        # the rest so a task authored with several is not quietly under-run.
+        # Only the first spec is scheduled; warn so extra entries are not silently dropped.
         if len(chaos_specs) > 1:
             _log.warning(
                 "chaos_spec declares %d entries but only the first is scheduled; "
@@ -773,20 +690,22 @@ class DefaultEvalHarness(Harness):
 
     # -- agent execution --------------------------------------------------
 
-    def execute_agent(self, prompt: str, ctx: RunContext) -> AgentResult:
+    def execute_agent(
+        self,
+        prompt: str,
+        ctx: RunContext,
+        sandbox_spec: agent_sandbox.SandboxSpec | None = None,
+        *,
+        sandbox_exempt: bool = False,
+    ) -> AgentResult:
         """Run the configured agent against ``prompt`` through the registry.
 
-        Args:
-            prompt: The (placeholder-resolved) task prompt.
-            ctx: The per-task run context. ``ctx.workspace_path`` is handed to
-                the agent so a CLI wrapper executes in the harness-owned
-                workspace instead of a throwaway directory the harness never
-                inspects.
-
-        Returns:
-            The typed :class:`AgentResult` the agent emitted.
+        ``ctx.workspace_path`` becomes the agent's working directory;
+        ``sandbox_spec``, when given, is the task-completed sandbox spec the
+        agent runs under, and ``sandbox_exempt`` runs a ``requires_unsandboxed``
+        task outside the boundary.
         """
-        agent = self.resolve_agent(self.agent_type)
+        agent = self.resolve_agent(self.agent_type, sandbox_spec, sandbox_exempt=sandbox_exempt)
         return agent.run(prompt, workspace_path=ctx.workspace_path)
 
     # -- pipeline ---------------------------------------------------------
@@ -796,15 +715,11 @@ class DefaultEvalHarness(Harness):
     ) -> tuple[SensitiveAccessRule, ...]:
         """Snapshot the agent home into prior-run-artifact rules.
 
-        Best-effort by contract: detection must never block execution, so a
-        snapshot failure logs and yields nothing, leaving the caller with the
-        static ruleset alone. Returns nothing too when either cheat-detection
-        toggle is off, which keeps the toggle check in one place.
+        Best-effort: a failure logs and yields nothing, as does either
+        cheat-detection toggle being off.
 
         Args:
-            fingerprint_only: Passed through to
-                :func:`~devops_bench.cheat_detection.build_inventory_rules` — the
-                entry names still allowed to produce content rules.
+            fingerprint_only: Entry names still allowed to produce content rules.
 
         Returns:
             The generated ruleset, empty on failure or when disabled.
@@ -813,8 +728,7 @@ class DefaultEvalHarness(Harness):
             return ()
         try:
             home = Path.home()
-            # Skills granted to the agent are material it is told to read,
-            # so the home entry holding them is environment, not leftover.
+            # Granted skills are material the agent is told to read, not leftovers.
             return build_inventory_rules(
                 home,
                 baseline=DEFAULT_BASELINE
@@ -836,73 +750,59 @@ class DefaultEvalHarness(Harness):
             The detailed per-task result dicts, scored in place, in the
             ``results.json`` schema.
         """
+        sandboxed = self._agent_config.sandbox is not None
+        if sandboxed and any(not task.requires_unsandboxed for task in tasks):
+            # Fail before any cluster exists rather than once per provisioned task;
+            # a batch of only exempt tasks never needs the seam.
+            _ensure_builtin_agents_registered()
+            agent_cls = AGENTS.get(_canonical_agent_type(self.agent_type))
+            if agent_cls is not None and not getattr(agent_cls, "supports_sandbox", False):
+                raise SandboxError(
+                    f"agent harness {agent_cls.__name__} has not been migrated onto "
+                    "the sandbox seam; refusing the whole batch rather than "
+                    "provisioning a cluster per task just to fail each one"
+                )
+        if sandboxed:
+            # Reap containers a killed harness never got to reap, before this
+            # batch's own exist; the sweep itself applies the BENCH_PARALLEL gate.
+            try:
+                agent_sandbox.sweep_stray_containers(
+                    owner=self._agent_config.sandbox.owner, parallel=self.parallel
+                )
+            except Exception:  # noqa: BLE001 - a sweep failure must not block the run
+                _log.exception("stray sandbox container sweep failed; continuing")
+
         run_dir = self.reporter.new_run_dir()
 
-        # Snapshot the home once before anything runs, purely to record which
-        # leftovers predate the batch. Those are genuine prior-run artifacts
-        # and may always fingerprint.
-        pre_existing: frozenset[str] = frozenset(
-            rule.source for rule in self._inventory_home() if rule.source
-        )
+        # Entries that predate the batch may always fingerprint. Skipped unless some
+        # task runs ambient (a ``requires_unsandboxed`` task does, even in a sandboxed batch).
+        pre_existing: frozenset[str] = frozenset()
+        if not sandboxed or any(task.requires_unsandboxed for task in tasks):
+            pre_existing = frozenset(rule.source for rule in self._inventory_home() if rule.source)
 
-        # Re-inventory before *each* task's agent executes, so a deliverable
-        # an earlier task left in the home is covered for every task after
-        # it. Paired positionally with ``detailed_results`` rather than keyed
-        # by task name: a batch may run the same task more than once, and
-        # each of those iterations needs the snapshot taken before it, not
-        # the last one taken.
-        #
-        # Mid-batch entries are attributed to the task that was running when
-        # they appeared and fingerprint only for tasks with a *different*
-        # name. Both halves matter: iterations of one task legitimately share
-        # long lines, so a same-name fingerprint would flag an honest repeat
-        # for rewording its own deliverable — while a different task's prompt
-        # can name the entry (a colliding deliverable filename), which drops
-        # its path rule, leaving the fingerprint as the only thing that still
-        # catches a read of the earlier task's file.
+        # One inventory per task iteration, paired positionally with ``detailed_results``.
+        # Ambient rules are scanned before each run; a sandboxed task's come back from _run_one.
         created_by: dict[str, str] = {}
         prev_task_name: str | None = None
         task_inventories: list[tuple[SensitiveAccessRule, ...]] = []
         detailed_results: list[dict[str, Any]] = []
         for task in tasks:
-            if prev_task_name is not None:
-                # An empty ``fingerprint_only`` skips every file read, so this
-                # extra enumeration is a bare directory listing.
-                current = {
-                    rule.source
-                    for rule in self._inventory_home(fingerprint_only=frozenset())
-                    if rule.source
-                }
-                for name in current - pre_existing - created_by.keys():
-                    created_by[name] = prev_task_name
-            fingerprintable = pre_existing | frozenset(
-                name for name, creator in created_by.items() if creator != task.name
-            )
-            rules = self._inventory_home(fingerprint_only=fingerprintable)
-            appeared = {rule.source for rule in rules if rule.source} - pre_existing
-            if appeared:
-                _log.info(
-                    "cheat detection: %d home entr(ies) appeared during this batch and "
-                    "are covered for %s: %s",
-                    len(appeared),
-                    task.name,
-                    ", ".join(sorted(appeared)),
+            task_sandboxed = sandboxed and not task.requires_unsandboxed
+            ambient_rules: tuple[SensitiveAccessRule, ...] = ()
+            if not task_sandboxed:
+                ambient_rules = self._ambient_inventory_rules(
+                    task.name, pre_existing, created_by, prev_task_name
                 )
-            task_inventories.append(rules)
-            detailed_results.append(self._run_one(task, run_dir))
+            record, sandbox_rules = self._run_one(task, run_dir)
+            task_inventories.append(sandbox_rules if task_sandboxed else ambient_rules)
+            detailed_results.append(record)
             prev_task_name = task.name
 
-        # Annotate sensitive-access flags before the first write so both the
-        # raw and the scored results.json carry the report, and because
-        # ``_score`` below reads it. Best-effort per record: a detector failure
-        # leaves that record's seeded empty report and moves on to the next —
-        # which also leaves that record ungated, since an absent verdict is an
-        # abstention rather than a zero.
+        # Annotated before the first write so both results.json copies carry the
+        # report and ``_score`` can read it. A detector failure leaves that record ungated.
         if self.cheat_detect:
-            # Per record: a home entry the task prompt itself names (the
-            # GitOps repo to push to, the deliverable to write) is
-            # authorized for that record, so its inventory path rule is
-            # dropped. Content fingerprints always apply.
+            # A home entry the prompt itself names is authorized for that record;
+            # content fingerprints always apply.
             for record, inventory_rules in zip(detailed_results, task_inventories, strict=True):
                 try:
                     annotate_records(
@@ -920,9 +820,7 @@ class DefaultEvalHarness(Harness):
         self.reporter.write(run_dir, detailed_results)
         _log.info("execution complete; results saved to %s/results.json", run_dir)
 
-        # Scoring is best-effort: a judge/config failure (e.g. get_judge_model()
-        # or an unexpected error in a metric) must not sink an otherwise
-        # successful execution pass, whose raw results are already on disk above.
+        # Best-effort: a judge or metric failure must not sink the execution pass.
         try:
             self._score(detailed_results)
             self.reporter.write(run_dir, detailed_results)
@@ -933,9 +831,7 @@ class DefaultEvalHarness(Harness):
         except Exception:  # noqa: BLE001 - execution results must survive scoring errors
             _log.exception("scoring failed; returning unscored execution results from %s", run_dir)
 
-        # Emit the flattened, ingest-ready rows + run manifest. Best-effort: the
-        # detailed results.json is already on disk, so a failure here must not
-        # sink the run.
+        # Flattened rows + manifest are derived; a failure here must not sink the run.
         try:
             self._write_run_artifacts(run_dir, detailed_results)
         except Exception:  # noqa: BLE001 - rows/manifest are derived, never load-bearing
@@ -944,11 +840,6 @@ class DefaultEvalHarness(Harness):
 
     def _write_run_artifacts(self, run_dir: Path, detailed_results: list[dict[str, Any]]) -> None:
         """Flatten ``detailed_results`` into ``rows.json`` + ``manifest.json``.
-
-        Assembles the run-level :class:`~devops_bench.results.Manifest` from the
-        harness's resolved model / harness key / capabilities, flattens every
-        record through :func:`~devops_bench.results.build_rows`, and writes both
-        artifacts via the reporter.
 
         Args:
             run_dir: The run directory the artifacts are written under.
@@ -965,9 +856,7 @@ class DefaultEvalHarness(Harness):
         augmentation = derive_augmentation(
             {"use_mcp": self.use_mcp, "skills": list(self._granted_skill_paths)}
         )
-        # Record the canonical harness key so an arm selected via a friendly
-        # alias (e.g. ``claude-code`` / ``gemini-cli``) aggregates with the
-        # canonical key rather than splitting into a second dashboard setup.
+        # Canonical key, so an alias aggregates with it instead of as a second setup.
         harness = _canonical_agent_type(self.agent_type)
         model = self._agent_config.model or self._agent_config.provider or harness
         manifest = Manifest(
@@ -983,19 +872,52 @@ class DefaultEvalHarness(Harness):
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
         self.reporter.write_manifest(run_dir, manifest.to_dict())
 
-    def _run_one(self, task: Task, run_dir: Path) -> dict[str, Any]:
+    def _ambient_inventory_rules(
+        self,
+        task_name: str,
+        pre_existing: frozenset[str],
+        created_by: dict[str, str],
+        prev_task_name: str | None,
+    ) -> tuple[SensitiveAccessRule, ...]:
+        """Pre-task inventory of the operator home for one ambient iteration.
+
+        Mid-batch entries are attributed to the task that created them
+        (``created_by``, mutated here) and fingerprint only for other task
+        names, so an honest repeat is not flagged for its own deliverable.
+        """
+        if prev_task_name is not None:
+            # Empty fingerprint_only skips every file read: a bare listing.
+            current = {
+                rule.source
+                for rule in self._inventory_home(fingerprint_only=frozenset())
+                if rule.source
+            }
+            for name in current - pre_existing - created_by.keys():
+                created_by[name] = prev_task_name
+        fingerprintable = pre_existing | frozenset(
+            name for name, creator in created_by.items() if creator != task_name
+        )
+        rules = self._inventory_home(fingerprint_only=fingerprintable)
+        appeared = {rule.source for rule in rules if rule.source} - pre_existing
+        if appeared:
+            _log.info(
+                "cheat detection: %d home entr(ies) appeared during this batch and "
+                "are covered for %s: %s",
+                len(appeared),
+                task_name,
+                ", ".join(sorted(appeared)),
+            )
+        return rules
+
+    def _run_one(
+        self, task: Task, run_dir: Path
+    ) -> tuple[dict[str, Any], tuple[SensitiveAccessRule, ...]]:
         """Provision, run the agent, collect artifacts, tear down for one task.
 
-        Args:
-            task: The typed task being evaluated.
-            run_dir: The run output directory for generated artifacts.
-
         Returns:
-            The detailed result dict. On any failure a ``status: "failed"``
-            record is returned instead of being dropped, so failures stay
-            visible to downstream parsers. Success and failed records carry
-            the same top-level key set so a parser can iterate either shape
-            without a ``KeyError``.
+            ``(record, sandbox_inventory_rules)``. A failure yields a
+            ``status: "failed"`` record with the same key set as a success. The
+            rules are empty on an ambient run; the caller inventories the home itself.
         """
         infra_config = task.infrastructure or {}
         if self.no_infra:
@@ -1008,42 +930,59 @@ class DefaultEvalHarness(Harness):
         hold_observations: dict[str, HoldObservation] = {}
         result: dict[str, Any] | None = None
         workspace_path: Path | None = None
+        creds_dir: Path | None = None
+        completed_spec: agent_sandbox.SandboxSpec | None = None
+        sandbox_rules: tuple[SensitiveAccessRule, ...] = ()
+        sandbox_exempt = False
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
-        # Track the substituted prompt / expectation / safety checklists as they
-        # are computed so a failed record can carry the same resolved strings a
-        # success record would, falling back to the raw task fields before
-        # substitution.
+        # Tracked as computed so a failed record carries the same resolved strings.
         prompt: str | None = None
         expected_output: str | None = None
         recoverable_safety: list[str] | None = None
-        # Whether deployer.up() returned, i.e. there is a cluster verification
-        # could target. Distinguishes "infra never came up" from "infra came
-        # up but the agent step itself failed" on the exception path below.
+        # Distinguishes "infra never came up" from "agent step failed" on the exception path.
         infra_up = False
 
         try:
-            # Build the deployer inside the try so a factory failure (e.g. an
-            # unknown deployer type) becomes a failed record for this task
-            # rather than crashing the whole batch.
+            # Inside the try so a factory failure becomes a failed record, not a crashed batch.
             deployer = get_deployer(infra_config, self.project_id, self.cluster_name)
             _log.info("provisioning infrastructure for: %s", task.name)
             deployer.up()
             infra_up = True
             cluster_info = deployer.get_cluster_info()
             active_cluster_name = cluster_info.name or self.cluster_name
-            # Own a real per-run workspace so the artifact diff is rooted at
-            # the directory the agent actually writes to (its CLI wrapper's
-            # working directory), not the harness process's launch cwd.
+            # A per-run workspace roots the artifact diff where the agent actually writes.
             workspace_path = Path(tempfile.mkdtemp(prefix="devops-bench-workspace-"))
+            if self._agent_config.sandbox is not None and task.requires_unsandboxed:
+                # The task needs an ambient cloud credential the boundary withholds;
+                # skip the sandbox for it and say so loudly.
+                _log.warning(
+                    "task %s declares requires_unsandboxed; running it OUTSIDE the "
+                    "agent sandbox even though a sandbox was requested",
+                    task.name,
+                )
+                sandbox_exempt = True
+            elif self._agent_config.sandbox is not None:
+                # The kubeconfig gets its own dir so the credential enters only via its
+                # read-only bind; a failure is a failed record, never a silent ambient run.
+                creds_dir = Path(tempfile.mkdtemp(prefix="devops-bench-creds-"))
+                completed_spec = self._prepare_sandbox_spec(
+                    workspace_path,
+                    creds_dir,
+                    replace(cluster_info, name=active_cluster_name),
+                    deployer.provider,
+                    task.agent_pod_security,
+                    with_cluster=infra_config.get("deployer") != "noop",
+                )
+                sandbox_rules = self._inventory_sandbox_home(
+                    task.name, workspace_path / "home", completed_spec.fixture_mounts
+                )
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
 
             prompt = self.replace_placeholders(task.prompt, active_cluster_name, target_dep, ns)
-            # Resolved here, before the agent runs, so a failure mid-execution
-            # still records the substituted checklists rather than raw
-            # placeholders.
+            # Resolved before the agent runs so a mid-run failure still records them.
             recoverable_safety = [
                 self.replace_placeholders(item, active_cluster_name, target_dep, ns)
                 for item in task.recoverable_safety
@@ -1066,9 +1005,7 @@ class DefaultEvalHarness(Harness):
                 )
             verification_mapping = {entry.name: entry for entry in entries}
 
-            # Hand the background scenario its own context with an isolated
-            # env dict so its in-thread env mutations never touch the context
-            # the agent runs against.
+            # Isolated env dict: the scenario's in-thread mutations must not reach the agent.
             scenario = self.start_scenario(
                 chaos_specs,
                 verification_mapping,
@@ -1085,27 +1022,16 @@ class DefaultEvalHarness(Harness):
                 if chaos_active:
                     _log.info("cluster load spike active; proceeding with operator agent...")
                 else:
-                    # The event is also set when injection fails (to unblock us), so
-                    # a False here means it never signalled within the budget. The
-                    # agent still runs, but flag it: the run may not reflect the
-                    # intended disruption. The drained chaos_report carries the detail.
+                    # The event is also set on injection failure, so False means it
+                    # never signalled in time; the drained chaos_report carries the detail.
                     _log.warning(
                         "chaos did not signal active within %ss; proceeding, but the "
                         "run may not reflect the intended disruption",
                         _CHAOS_ACTIVE_WAIT_SEC,
                     )
 
-            # Safeguard hold entries must be observed continuously from here
-            # through the end of the agent's turn, not just at the moment
-            # verification runs after the agent exits (see hold's module
-            # docstring for the failure this closes). Started as close to
-            # the agent's turn as possible so a chaos-induced state change is
-            # not mistaken for an agent-caused violation. Objective hold
-            # entries are deliberately excluded here: an objective starts
-            # false and must become true, so sampling it live would latch a
-            # spurious violation before the agent has done anything. Those
-            # are soaked instead in the post-run verification pass (see
-            # ``_run_verification``).
+            # Safeguard holds are sampled across the agent's turn, started as late as
+            # possible so chaos is not blamed on the agent; objective holds soak post-run.
             safeguard_hold_entries = [
                 entry
                 for entry in entries
@@ -1118,20 +1044,25 @@ class DefaultEvalHarness(Harness):
 
             _log.info("executing agent for prompt: %s", prompt)
             before_files = snapshot_dir(workspace_path)
-            agent_res = self.execute_agent(prompt, context)
-            # The agent's turn just ended; stop sampling immediately so the
-            # hold window is exactly "seed through the end of the agent's
-            # turn" rather than continuing to sample through the (potentially
-            # slow) post-processing below.
+            # The sandbox home pre-exists the run, so the workspace diff never looks
+            # inside it; diff it separately (ambient runs collect home/ whole).
+            home_dir = workspace_path / "home"
+            before_home = snapshot_dir(home_dir) if completed_spec is not None else set()
+            agent_res = self.execute_agent(
+                prompt, context, sandbox_spec=completed_spec, sandbox_exempt=sandbox_exempt
+            )
+            # Stop now so the hold window ends with the agent's turn, not post-processing.
             safeguard_monitor.stop()
             hold_observations = safeguard_monitor.get_observations()
-            # NOTE/TODO: This collects ALL frontmatter from bootstrapping, not just generated files.
-            # Consider a more targeted filter in a future iteration.
-            # Best-effort: a collection failure (I/O, permissions, a bad link in the
-            # workspace) must not turn an already-completed agent run into a failed,
-            # unscored record, so isolate it like the other non-critical steps.
+            # TODO: collects all bootstrapped frontmatter, not only generated files.
+            # Best-effort: a collection failure must not fail a completed agent run.
             try:
                 collect_generated_files(before_files, run_dir, source_dir=workspace_path)
+                if completed_spec is not None and home_dir.is_dir():
+                    # Dot-entries are agent runtime state, not deliverables, and would
+                    # collide with the workspace's own copies under generated_files/.
+                    hidden = {p.name for p in home_dir.iterdir() if p.name.startswith(".")}
+                    collect_generated_files(before_home | hidden, run_dir, source_dir=home_dir)
             except Exception:  # noqa: BLE001 - artifact collection must not sink a completed run
                 _log.exception("artifact collection failed for %s; continuing", task.name)
 
@@ -1142,9 +1073,7 @@ class DefaultEvalHarness(Harness):
             chaos_report, perf_report = self._drain_scenario(scenario_manager, scenario_thread)
 
             if self.no_infra:
-                # no_infra means no real cluster to check; issuing kubectl
-                # calls against whatever is ambient would score noise, not
-                # this task.
+                # No real cluster: checks against whatever is ambient would score noise.
                 verification_report: list[dict[str, Any]] = []
                 verification_status = "skipped_no_infra"
             else:
@@ -1168,12 +1097,7 @@ class DefaultEvalHarness(Harness):
             _log.info("agent response for %s:\n%s", task.name, result["output"])
         except Exception as exc:  # noqa: BLE001 - surface every task failure
             _log.error("critical error during task %s: %s", task.name, exc)
-            # The exception may have landed before the success path's own
-            # stop()+get_observations() ran (e.g. the agent call itself
-            # raised), so stop here too. Idempotent: a second stop() on an
-            # already-stopped monitor is a no-op, mirroring how
-            # scenario_manager.stop() is already called from both the success
-            # path (via _drain_scenario) and this finally-adjacent path below.
+            # The exception may predate the success path's stop(); stop() is idempotent.
             if safeguard_monitor is not None:
                 safeguard_monitor.stop()
                 hold_observations = safeguard_monitor.get_observations()
@@ -1192,9 +1116,7 @@ class DefaultEvalHarness(Harness):
                     )
                     exception_verification_status = "not_evaluated"
             elif infra_up:
-                # Infra came up but the task declared no entries: verification
-                # ran trivially over nothing, the same as the success path
-                # records for this case, rather than reading as "never ran".
+                # Infra up, no entries: verification ran trivially, as on the success path.
                 exception_verification_status = "evaluated"
             else:
                 # Infra never came up.
@@ -1212,22 +1134,121 @@ class DefaultEvalHarness(Harness):
         finally:
             if scenario_manager is not None:
                 scenario_manager.stop()
-                # stop() only signals the abort flag; join the daemon thread with
-                # a bounded timeout so teardown does not race a still-running
-                # background scenario (the success path joins via _drain_scenario,
-                # but the exception path reaches here without draining).
+                # stop() only signals; a bounded join keeps teardown from racing the thread.
                 if scenario_thread is not None:
                     scenario_thread.join(timeout=_SCENARIO_JOIN_SEC)
             if safeguard_monitor is not None:
-                # stop() is idempotent and never raises; this covers any path
-                # that skipped the two calls above.
+                # Idempotent; covers any path that skipped the calls above.
                 safeguard_monitor.stop()
+            if completed_spec is not None and self._cluster_survives(infra_config):
+                # Only on a cluster that outlives the run: residue there denies the operator's
+                # next privileged workload. A destroyed cluster takes the objects with it.
+                try:
+                    clean = agent_credentials.teardown_agent_credentials(
+                        completed_spec.network.kubectl_context
+                    )
+                except Exception:
+                    _log.exception("sandbox credential teardown failed; continuing")
+                    clean = False
+                if not clean and result is not None:
+                    # Residue is a next-run problem; surface it where results are read.
+                    result["sandbox_teardown_clean"] = False
             if deployer is not None:
                 self._teardown(deployer, infra_config, task.name)
             if workspace_path is not None:
                 shutil.rmtree(workspace_path, ignore_errors=True)
+            if creds_dir is not None:
+                shutil.rmtree(creds_dir, ignore_errors=True)
 
-        return result
+        return result, sandbox_rules
+
+    def _prepare_sandbox_spec(
+        self,
+        workspace_path: Path,
+        creds_dir: Path,
+        cluster_info: ClusterInfo,
+        provider: Provider | None,
+        pod_security: str,
+        *,
+        with_cluster: bool = True,
+    ) -> agent_sandbox.SandboxSpec:
+        """Complete the skeletal sandbox spec for one provisioned task.
+
+        Builds the context-pinned network plan, provisions the scoped cluster
+        credential, and discovers fixture mounts; ``with_cluster=False`` mounts a
+        credential-free stub kubeconfig instead. Raises :class:`SandboxError`
+        rather than degrading to an ambient run.
+        """
+        if self._agent_config.sandbox is None:
+            raise SandboxError(
+                "_prepare_sandbox_spec called without a sandbox opt-in; the caller "
+                "must gate on config.sandbox"
+            )
+        (workspace_path / "home").mkdir(parents=True, exist_ok=True)
+        if with_cluster:
+            # Pinned here too, so the spec and the run-end teardown target the same cluster.
+            plan = agent_credentials.pin_plan_context(
+                agent_sandbox.build_network_plan(provider, cluster_info)
+            )
+            kubeconfig = agent_credentials.provision_agent_credentials(
+                plan,
+                creds_dir,
+                token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
+                pod_security=pod_security,
+            )
+        else:
+            plan = agent_sandbox.NetworkPlan()
+            kubeconfig = creds_dir / "kubeconfig"
+            kubeconfig.write_text("apiVersion: v1\nkind: Config\n")
+            kubeconfig.chmod(0o600)
+        try:
+            return replace(
+                self._agent_config.sandbox,
+                network=plan,
+                workspace=workspace_path,
+                kubeconfig=kubeconfig,
+                fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
+            )
+        except Exception:
+            # Provisioned, but no completed spec will carry the objects to the run-end teardown.
+            if with_cluster:
+                try:
+                    agent_credentials.teardown_agent_credentials(plan.kubectl_context)
+                except Exception:  # noqa: BLE001 - the original error must win
+                    _log.exception("sandbox credential teardown failed; continuing")
+            raise
+
+    def _inventory_sandbox_home(
+        self,
+        task_name: str,
+        home: Path,
+        fixture_mounts: Mapping[str, str] | None = None,
+    ) -> tuple[SensitiveAccessRule, ...]:
+        """Detection inventory rooted at the sandbox home; best-effort.
+
+        Fixture mounts only exist inside the container, so each mounted name
+        also gets a container-path rule; the prompt filter authorizes named ones.
+        """
+        if not (self.cheat_detect and self.cheat_inventory):
+            return ()
+        try:
+            rules = build_inventory_rules(
+                home,
+                baseline=DEFAULT_BASELINE
+                | baseline_from_granted_paths(home, self._granted_skill_paths),
+            )
+            mounted_names = [
+                PurePosixPath(container_path).name
+                for container_path in (fixture_mounts or {}).values()
+            ]
+            if mounted_names:
+                rules += build_mount_rules(agent_sandbox.CONTAINER_HOME, mounted_names)
+        except Exception:  # noqa: BLE001 - detection must never block execution
+            _log.exception(
+                "sandbox-home inventory failed for %s; static cheat rules only", task_name
+            )
+            return ()
+        return rules
 
     def _build_success_record(
         self,
@@ -1245,15 +1266,8 @@ class DefaultEvalHarness(Harness):
     ) -> dict[str, Any]:
         """Shape a typed :class:`AgentResult` + reports into the on-disk schema.
 
-        Routes every typed value through ``to_dict()`` / ``model_dump()`` and
-        emits the **symmetric** key union (every key is present on every
-        record), so success and failed records never differ in top-level
-        shape — a downstream parser iterating one shape can never ``KeyError``
-        crossing into the other.
-
-        Capability metadata (``capabilities_granted``) is recorded so metrics
-        / downstream consumers can read what the agent was actually granted
-        rather than re-reading ``BENCH_USE_MCP``.
+        Emits the same top-level key set as a failed record, so a parser never
+        trips crossing between the two shapes.
         """
         dumped = agent_res.to_dict()
         agent_errors = list(dumped.get("errors") or [])
@@ -1264,31 +1278,22 @@ class DefaultEvalHarness(Harness):
                 "output": dumped.get("output", ""),
                 "latency": dumped.get("latency", 0.0),
                 "tokens": dumped.get("tokens", {}),
-                # Expose a flat ``tools`` key alongside the typed trajectory
-                # for consumers that only sample tool names; the trajectory is
-                # the source of truth.
+                # Flat tool names for consumers that only sample them; the trajectory is canonical.
                 "tools": [
                     entry.get("name") for entry in dumped.get("trajectory", []) if entry.get("name")
                 ],
                 "trajectory": dumped.get("trajectory", []),
                 "status": "success",
-                # Run-level validity gate: a vetted task only promotes to the
-                # leaderboard when this run actually produced a usable result.
-                # ``AgentResult.errored()`` (429 / SDK fault / agent timeout)
-                # yields populated ``errors`` + an empty trajectory while the
-                # record still reads ``status:"success"``, so gating on the task
-                # flag alone would let an empty/errored run pass as a genuine low
-                # score. Require no agent error *and* a non-empty trajectory.
+                # An errored run still reads status:"success", so promotion also
+                # requires no agent error and a non-empty trajectory.
                 "validated": (
                     task.validated and not agent_errors and bool(dumped.get("trajectory"))
                 ),
                 "errors": agent_errors,
-                # First-error scalar so a parser reading ``error`` finds the
-                # same key on the success shape (None when nothing went wrong).
+                # First error as a scalar so ``error`` exists on the success shape too.
                 "error": agent_errors[0] if agent_errors else None,
                 "expected_output": expected_output,
-                # Placeholder-substituted safety checklists, falling back to the
-                # raw task values seeded by ``_empty_record`` when unresolved.
+                # Substituted checklists, falling back to the raw task values.
                 "recoverable_safety": (
                     list(recoverable_safety)
                     if recoverable_safety is not None
@@ -1315,31 +1320,17 @@ class DefaultEvalHarness(Harness):
         verification_report: list[dict[str, Any]] | None = None,
         verification_status: str = "not_evaluated",
     ) -> dict[str, Any]:
-        """Build a failed-task record so the failure stays visible.
-
-        Emits the **same** top-level key set as :meth:`_build_success_record`:
-        a downstream parser iterating either shape never trips a ``KeyError``
-        crossing between them. The differences are values only —
-        ``status=\"failed\"``, ``error`` carries the exception text, ``scores``
-        stays empty.
+        """Build a failed-task record with the same key set as a success record.
 
         Args:
             task: The task that failed.
             exc: The exception that aborted the run.
-            prompt: The placeholder-substituted prompt if it was computed before
-                the failure; falls back to the raw ``task.prompt`` otherwise, so
-                the record matches the success shape when substitution had run.
-            expected_output: The substituted expectation if computed; falls back
-                to the raw ``task.expected_output``.
-            recoverable_safety: The substituted recoverable-safety checklist if
-                computed; falls back to the raw ``task.recoverable_safety``.
+            prompt: The substituted prompt if computed, else the raw ``task.prompt``.
+            expected_output: The substituted expectation if computed, else the raw one.
+            recoverable_safety: The substituted checklist if computed, else the raw one.
             verification_parse_errors: Any spec-parse errors collected so far.
-            verification_report: The verification report, if verification ran
-                on the exception path (infra was up and entries existed).
-                Empty when it did not run.
-            verification_status: "evaluated" when the report above is real,
-                "not_evaluated" when it could not run, "skipped_no_infra"
-                under ``no_infra``.
+            verification_report: The report if verification ran on the exception path.
+            verification_status: "evaluated", "not_evaluated", or "skipped_no_infra".
         """
         error_text = str(exc)
         record = self._empty_record(task)
@@ -1367,15 +1358,7 @@ class DefaultEvalHarness(Harness):
         return record
 
     def _empty_record(self, task: Task) -> dict[str, Any]:
-        """Seed every record with the symmetric key set.
-
-        Centralizes the default values for the keys that match across
-        success/failed records (task identifying fields, opaque blobs, empty
-        containers for ``scores`` / ``tools`` / ``trajectory`` etc.). Both
-        builder methods overlay the differing keys on top of this seed; the
-        seed itself never contains a ``status`` value so the caller must set
-        it explicitly.
-        """
+        """Seed every record with the symmetric key set; the caller sets ``status``."""
         return {
             "input": task.prompt,
             "output": "",
@@ -1389,10 +1372,7 @@ class DefaultEvalHarness(Harness):
             "status": "",
             "error": None,
             "errors": [],
-            # ``scores`` (the per-metric mapping) is populated by ``_score`` for
-            # success records; failed records leave it as the empty dict so the
-            # key is always present. There is no aggregate scalar score: the
-            # per-metric map is the source of truth.
+            # Populated by ``_score`` for success records; there is no aggregate scalar score.
             "scores": {},
             "expected_output": "",
             "expected_output_raw": task.expected_output,
@@ -1402,9 +1382,7 @@ class DefaultEvalHarness(Harness):
             "recoverable_safety": list(task.recoverable_safety),
             "chaos_report": {},
             "perf_report": {},
-            # Populated by the cheat detector in ``run`` (empty when detection
-            # is disabled or fails). Read by ``IntegrityMetric``, which gates a
-            # flagged run to zero and abstains on this empty seed.
+            # Filled by the cheat detector in ``run``; IntegrityMetric abstains on the empty seed.
             "cheating_report": {},
             "documentation": [doc.model_dump() for doc in task.documentation],
             "capabilities_granted": {
@@ -1414,17 +1392,12 @@ class DefaultEvalHarness(Harness):
             "verification_parse_errors": [],
             "verification_report": [],
             "verification_status": "",
-            # Generation-only tasks have no cluster, so the OutcomeValidity judge
-            # must not penalize them for "not applying". This holds both when the
-            # task declares ``deployer: noop`` and when ``BENCH_NO_INFRA`` skips
-            # provisioning for the whole run (mirrors get_deployer's own gate).
+            # No cluster, so the OutcomeValidity judge must not penalize "not applying".
             "generation_only": self.no_infra
             or (task.infrastructure or {}).get("deployer") == "noop",
-            # Only tasks vetted as correct promote to the leaderboard; downstream
-            # ingest gates inclusion on this flag (default False until vetted).
+            # Only vetted tasks promote to the leaderboard.
             "validated": task.validated,
-            # Display metadata, snapshotted so a row renders with the titles
-            # that were true when it ran.
+            # Snapshotted so a row renders with the titles that were true when it ran.
             "task_metadata": _task_metadata(task),
         }
 
@@ -1435,11 +1408,8 @@ class DefaultEvalHarness(Harness):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Join the scenario thread and return its chaos and perf reports.
 
-        If the join times out (i.e. ``thread.is_alive()`` after the budget),
-        a warning is logged and the returned ``chaos_report["status"]`` is
-        stamped to ``"timed_out"`` so a partial report is flagged on the
-        record rather than silently mislabelled as the last status the
-        scenario reached before the cutoff.
+        A join that times out stamps ``chaos_report["status"]`` to ``"timed_out"``
+        so a partial report is not mislabelled.
 
         Args:
             scenario_manager: The running scenario, or None.
@@ -1460,13 +1430,15 @@ class DefaultEvalHarness(Harness):
                 "stamping chaos_report.status='timed_out'",
                 _SCENARIO_JOIN_SEC,
             )
-            # get_reports() already handed back a locked deep copy, so this
-            # snapshot is private and safe to stamp even though the daemon thread
-            # is still writing. It preserves any partial fields populated before
-            # the cutoff (injected_fault / name / output) so the operator sees
-            # how far it got.
+            # get_reports() returned a private deep copy, so stamping it is safe.
             chaos_report["status"] = "timed_out"
         return chaos_report, perf_report
+
+    def _cluster_survives(self, infra_config: dict[str, Any]) -> bool:
+        """Whether the run's cluster outlives the run, so sandbox objects need removing by hand."""
+        if infra_config.get("deployer") == "noop":
+            return True
+        return self.no_teardown or not infra_config.get("teardown", True)
 
     def _teardown(self, deployer: Any, infra_config: dict[str, Any], name: str) -> None:
         """Tear down infrastructure unless disabled by config or env.
@@ -1487,11 +1459,7 @@ class DefaultEvalHarness(Harness):
             _log.error("teardown failed (potential resource leak): %s", exc)
 
     def _score(self, detailed_results: list[dict[str, Any]]) -> None:
-        """Score the batch in place via the metrics pipeline.
-
-        The harness threads its single resolved ``use_mcp`` boolean into the
-        metrics call, so the agent and the judge cannot disagree on whether
-        tools were enabled.
+        """Score the batch in place via the metrics pipeline, under the harness's ``use_mcp``.
 
         Args:
             detailed_results: Execution results to score; ``scores`` is written
@@ -1507,16 +1475,8 @@ class DefaultEvalHarness(Harness):
         try:
             judge_model = self._judge_model or get_judge_model()
         except Exception:  # noqa: BLE001 - a judge outage must not unscore the batch
-            # Building the judge reads provider config and constructs a client,
-            # so a bad JUDGE_PROVIDER or a missing key raises here. Letting that
-            # propagate would abort scoring for the whole batch — including the
-            # deterministic metrics, which need no judge at all. That matters
-            # beyond convenience: the catastrophic gates (task safeguards and
-            # the benchmark-integrity check) are deterministic, so an unrelated
-            # judge outage would otherwise leave a cheating run ungated and its
-            # ``outcomeScore`` null, dropping it out of leaderboard aggregates.
-            # Judge-backed metrics fail individually on the ``None`` and are
-            # isolated by the pipeline's per-metric guard.
+            # The deterministic metrics (including the catastrophic gates) need no
+            # judge, so a judge outage must not leave a cheating run ungated.
             _log.exception("judge unavailable; scoring deterministic metrics only")
             judge_model = None
         evaluate_metrics_batch(scorable, judge_model, use_mcp=self.use_mcp)

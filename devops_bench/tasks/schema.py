@@ -14,7 +14,7 @@
 
 """Typed schema for benchmark task contracts."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -182,12 +182,21 @@ class Task(BaseModel):
             declared deterministically in ``verification_spec`` instead.
         infrastructure: Deployer and stack settings for the task environment.
         documentation: Documentation entries, each with per-constraint criticality.
+        agent_pod_security: Pod-security level enforced on the namespaces a
+            sandboxed agent can reach: ``"baseline"`` (default) or
+            ``"privileged"`` to opt out. Reserve ``"privileged"`` for tasks
+            about privileged workloads -- it removes the control that denies
+            the privileged-pod and hostPath escape.
         validated: Whether the task has been vetted as correct and is eligible to
             promote to the leaderboard. Defaults to ``False`` so an unvetted task
             never counts until explicitly marked. A validated task must carry
             the display metadata (``title``, ``summary``, ``category``, and a
             ``title`` and ``description`` on every verification entry), because
             the leaderboard renders validated tasks and nothing else.
+        requires_unsandboxed: Opt this task out of the agent sandbox even when the
+            run asks for one, for a task whose objective needs an ambient cloud
+            credential the sandbox withholds (``gcp/secret-rotation``). Declared on
+            the task so the exemption travels with it.
     """
 
     model_config = _STRICT
@@ -208,7 +217,10 @@ class Task(BaseModel):
     recoverable_safety: list[str] = Field(default_factory=list)
     infrastructure: dict[str, Any] = Field(default_factory=dict)
     documentation: list[DocumentationEntry] = Field(default_factory=list)
+    # Closed set: a typo'd level must fail validation, not silently enforce.
+    agent_pod_security: Literal["baseline", "privileged"] = "baseline"
     validated: bool = False
+    requires_unsandboxed: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -236,7 +248,9 @@ class Task(BaseModel):
                 "recoverable_safety": [],
                 "infrastructure": {},
                 "documentation": [],
+                "agent_pod_security": "baseline",
                 "validated": False,
+                "requires_unsandboxed": False,
             },
         )
 
@@ -279,10 +293,7 @@ class Task(BaseModel):
             group = entry.get("group")
             if group is None:
                 continue
-            # Raw mappings, so the value can be anything YAML produced. A
-            # non-string is unhashable or meaningless as a key, and would be
-            # rejected by parse_entries anyway; say so here instead of raising
-            # a TypeError from the membership test.
+            # Raw YAML value: reject a non-string here rather than TypeError on the lookup.
             if not isinstance(group, str):
                 raise ValueError(f"verification entry {label!r}: group must be a string")
             # Stripped here as VerificationEntry strips it, so the two agree.
@@ -341,9 +352,11 @@ class Task(BaseModel):
         recoverable_safety = raw.get("recoverable_safety", [])
         infrastructure = raw.get("infrastructure", {})
         documentation = raw.get("documentation", [])
+        agent_pod_security = raw.get("agent_pod_security", "baseline")
         validated = raw.get("validated", False)
         tags = raw.get("tags", [])
         check_groups = raw.get("check_groups", {})
+        requires_unsandboxed = raw.get("requires_unsandboxed", False)
 
         return cls.model_validate(
             {
@@ -365,7 +378,13 @@ class Task(BaseModel):
                 "recoverable_safety": ([] if recoverable_safety is None else recoverable_safety),
                 "infrastructure": {} if infrastructure is None else infrastructure,
                 "documentation": [] if documentation is None else documentation,
+                "agent_pod_security": (
+                    "baseline" if agent_pod_security is None else _text(str(agent_pod_security))
+                ),
                 "validated": False if validated is None else validated,
+                "requires_unsandboxed": (
+                    False if requires_unsandboxed is None else requires_unsandboxed
+                ),
             }
         )
 
