@@ -391,8 +391,7 @@ def delete(
         *([] if wait else ["--wait=false"]),
         *_namespace_args(namespace),
     ]
-    kwargs: dict[str, Any] = {"timeout": timeout} if timeout is not None else {}
-    return _run_kubectl(argv, kubeconfig, context=context, **kwargs)
+    return _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout))
 
 
 def label(
