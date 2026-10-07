@@ -53,7 +53,7 @@ from devops_bench.agents.shared.cli_capabilities import (
 from devops_bench.agents.shared.vertex_env import vertex_location, vertex_project
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError, SandboxError
-from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
+from devops_bench.core.model_providers import ProviderSpec, resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
@@ -261,12 +261,19 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
     return payload
 
 
+def _vertex_key_present(config: AgentConfig, spec: ProviderSpec) -> bool:
+    """Whether the run carries a real Vertex key; the ADC marker in either place does not count."""
+    candidates = (config.api_key or "", *(os.environ.get(var, "") for var in spec.api_key_envs))
+    return any(c.strip() and c.strip() != _VERTEX_CREDENTIALS_MARKER for c in candidates)
+
+
 def _build_env(config: AgentConfig) -> dict[str, str]:
     """Build the env overlay that gives ``oc agent --local`` its model API key.
 
     ``config.api_key`` lands on the provider's key var(s) from
     :func:`~devops_bench.core.model_providers.resolve_provider`; keyless (ambient
-    credential) backends get no key. The caller adds the ``OPENCLAW_*`` paths.
+    credential) backends get no key. A Vertex backend also gets its location,
+    sandboxed or not. The caller adds the ``OPENCLAW_*`` paths.
 
     Raises:
         ConfigError: If ``config.provider`` is not a known provider.
@@ -279,6 +286,9 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
+    if spec.backend == "vertex":
+        # oc aborts without a location; the shared chain ends at "global".
+        overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
     if config.extra_env:
         overlay.update(config.extra_env)
     return overlay
@@ -309,11 +319,8 @@ def _sandbox_provider_env(config: AgentConfig, state_dir: Path) -> dict[str, str
     register = _write_node_fetch_shim(state_dir) / "register.mjs"
     overlay["NODE_OPTIONS"] = f"--import={sandbox.container_path(sandbox_spec.workspace, register)}"
     spec = resolve_provider(config.provider)
-    if spec.backend == "vertex":
-        # oc aborts without a location; a forwarded GOOGLE_CLOUD_LOCATION resolves to itself.
-        overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
-        if not config.api_key:
-            overlay.update(sandbox_credential_env(spec, project=vertex_project()))
+    if spec.backend == "vertex" and not _vertex_key_present(config, spec):
+        overlay.update(sandbox_credential_env(spec, project=vertex_project()))
     if spec.oc_provider == "anthropic-vertex":
         overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
         overlay.setdefault("GOOGLE_CLOUD_API_KEY", _VERTEX_CREDENTIALS_MARKER)
@@ -335,15 +342,16 @@ def _oc_model_flag(config: AgentConfig) -> str:
 def _vertex_auth_profile_provider(config: AgentConfig) -> str | None:
     """The oc provider id a keyless Vertex run must seed a headless auth profile for, else ``None``.
 
-    From openclaw 2026.9.1 a per-agent auth-profile store gates every provider before
-    ADC resolution, so a keyless run fails with ``ProviderAuthError`` until
-    ``oc models auth paste-api-key`` registers :data:`_VERTEX_CREDENTIALS_MARKER`.
+    In current openclaw releases a per-agent auth-profile store gates the Vertex
+    providers before ADC resolution, so a keyless run fails with ``ProviderAuthError``
+    until ``oc models auth paste-api-key`` registers :data:`_VERTEX_CREDENTIALS_MARKER`.
+    A real key, configured or in the environment, gets no profile: it would be shadowed.
     """
     try:
         spec = resolve_provider(config.provider)
     except ConfigError:
         return None
-    if spec.backend != "vertex" or config.api_key:
+    if spec.backend != "vertex" or _vertex_key_present(config, spec):
         return None
     return spec.oc_provider
 

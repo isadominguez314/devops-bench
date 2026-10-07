@@ -663,7 +663,8 @@ def test_model_override_vertex_needs_no_api_key() -> None:
         AgentConfig(model="gemini-3.5-flash", provider="google-vertex", api_key=None)
     )
     assert override["agents"]["defaults"]["models"] == {"google-vertex/gemini-3.5-flash": {}}
-    assert _build_env(AgentConfig(model="gemini-3.5-flash", provider="google-vertex")) == {}
+    env = _build_env(AgentConfig(model="gemini-3.5-flash", provider="google-vertex"))
+    assert "GOOGLE_CLOUD_API_KEY" not in env
 
 
 def test_build_env_threads_api_key_by_provider() -> None:
@@ -679,7 +680,8 @@ def test_build_env_routes_vertex_key_to_cloud_api_key() -> None:
     """A ``google-vertex`` key reaches ``GOOGLE_CLOUD_API_KEY`` (the vertex
     transport's var), not ``GEMINI_API_KEY`` (the google-genai one)."""
     vertex = _build_env(AgentConfig(api_key="marker", provider="google-vertex"))
-    assert vertex == {"GOOGLE_CLOUD_API_KEY": "marker"}
+    assert vertex["GOOGLE_CLOUD_API_KEY"] == "marker"
+    assert "GEMINI_API_KEY" not in vertex
 
 
 def test_build_env_unknown_provider_raises() -> None:
@@ -942,6 +944,26 @@ def test_vertex_auth_profile_skipped_for_a_keyed_run() -> None:
     assert "paste-api-key" not in command
 
 
+@pytest.mark.parametrize(
+    "env_key,api_key,seeded",
+    [
+        ("real-express-key", "", False),
+        (oc_mod._VERTEX_CREDENTIALS_MARKER, "", True),
+        ("", oc_mod._VERTEX_CREDENTIALS_MARKER, True),
+        ("   ", "", True),
+    ],
+)
+def test_vertex_auth_profile_follows_the_effective_key(
+    monkeypatch: pytest.MonkeyPatch, env_key: str, api_key: str, seeded: bool
+) -> None:
+    """A key in the environment counts too; the ADC marker never counts as a key."""
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", env_key)
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex", api_key=api_key), "hi", "operator", "oc"
+    )
+    assert ("paste-api-key --provider google-vertex" in command) is seeded
+
+
 def test_vertex_auth_profile_skipped_for_a_non_vertex_provider() -> None:
     command = oc_mod._build_local_command(AgentConfig(provider="google"), "hi", "operator", "oc")
     assert "paste-api-key" not in command
@@ -1052,23 +1074,35 @@ def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
         ({}, "google", "k", None),
     ],
 )
-def test_sandbox_overlay_pins_a_vertex_location(
+def test_build_env_pins_a_vertex_location(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     env: dict[str, str],
     provider: str,
     api_key: str,
     expected: str | None,
 ) -> None:
-    """oc aborts on Vertex without a location; keyed runs need one too, non-Vertex gets none."""
+    """oc aborts on Vertex without a location, sandboxed or not; non-Vertex gets none."""
     monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
     monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    _install_fake_emulator(monkeypatch)
-    config = _sandboxed(tmp_path, provider=provider, api_key=api_key)
-    overlay = oc_mod._sandbox_provider_env(config, tmp_path)
+    overlay = _build_env(AgentConfig(provider=provider, api_key=api_key))
     assert overlay.get("GOOGLE_CLOUD_LOCATION") == expected
+
+
+@pytest.mark.parametrize(
+    "env_key,emulator",
+    [("real-express-key", False), (oc_mod._VERTEX_CREDENTIALS_MARKER, True)],
+)
+def test_sandbox_overlay_reads_the_key_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, env_key: str, emulator: bool
+) -> None:
+    """An env key crosses by value and needs no emulator; the env marker is not a key."""
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", env_key)
+    calls = _install_fake_emulator(monkeypatch)
+    overlay = oc_mod._sandbox_provider_env(_sandboxed(tmp_path, provider="google-vertex"), tmp_path)
+    assert ("GCE_METADATA_HOST" in overlay) is emulator
+    assert bool(calls) is emulator
 
 
 def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
@@ -1081,18 +1115,20 @@ def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
         "sandbox_credential_env",
         lambda *a, **k: pytest.fail("sandbox_credential_env called on an unsandboxed run"),
     )
-    captured: dict = {}
+    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
+    captured: dict[str, Any] = {}
 
-    def fake_bash(cmd, **kwargs):
+    def fake_bash(cmd: str, **kwargs: Any) -> SimpleNamespace:
+        captured["cmd"] = cmd
         captured["env"] = kwargs.get("extra_env") or {}
         return _make_subprocess_result(stdout="ok", returncode=0)
 
     _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
     cfg = AgentConfig(target=str(tmp_path / "oc"), provider="google-vertex")
     OpenClawAgent(cfg).run("p")
-    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(
-        captured["env"]
-    )
+    # The auth profile and the location are not sandbox concerns: both reach the host run.
+    assert "paste-api-key --provider google-vertex" in captured["cmd"]
+    assert captured["env"]["GOOGLE_CLOUD_LOCATION"]
 
 
 @pytest.mark.parametrize(
