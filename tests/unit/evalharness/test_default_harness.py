@@ -1356,8 +1356,11 @@ def test_write_run_artifacts_records_sandbox_provenance(
     """The arm's sandboxing lands in the setup id (A/B is a group-by), and the
     image is pinned by digest — a mutable tag is not provenance."""
     harness = _sandboxed_harness(monkeypatch, tmp_path)
+    resolved: list[str] = []
     monkeypatch.setattr(
-        harness_default.agent_sandbox, "image_digest", lambda image: f"{image}@sha256:feed"
+        harness_default.agent_sandbox,
+        "image_digest",
+        lambda image: resolved.append(image) or f"{image}@sha256:feed",
     )
     written: dict[str, Any] = {}
     monkeypatch.setattr(
@@ -1367,8 +1370,13 @@ def test_write_run_artifacts_records_sandbox_provenance(
         harness.reporter, "write_manifest", lambda run_dir, m: written.update(manifest=m)
     )
 
+    # Pinned once at batch start, not re-read from the mutable tag at report time.
+    harness._pin_sandbox_image()  # noqa: SLF001
+    harness._pin_sandbox_image()  # noqa: SLF001
+    assert resolved == ["agent-sandbox:test"]
     record = {"name": "t", "folder": "f", "status": "success", "sandboxed": True}
     harness._write_run_artifacts(tmp_path, [record])  # noqa: SLF001
+    assert resolved == ["agent-sandbox:test"]
 
     manifest = written["manifest"]
     assert "sandboxed" in manifest["augmentation"]
@@ -1376,6 +1384,19 @@ def test_write_run_artifacts_records_sandbox_provenance(
     assert manifest["sandboxImage"] == "agent-sandbox:test"
     assert manifest["sandboxImageDigest"] == "agent-sandbox:test@sha256:feed"
     assert written["rows"][0]["sandboxed"] is True
+
+
+def test_run_pins_the_sandbox_image_before_the_first_task(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest the manifest records is the image the batch started on."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "image_digest", lambda image: f"{image}@sha256:feed"
+    )
+    harness.run([])
+    assert harness.build_agent_config().sandbox.image_digest == "agent-sandbox:test@sha256:feed"
 
 
 def test_write_run_artifacts_stays_baseline_when_unsandboxed(
@@ -1409,6 +1430,23 @@ def test_empty_record_carries_the_task_scoped_sandboxed_flag(
 
     assert harness._empty_record(task)["sandboxed"] is False  # noqa: SLF001
     assert harness._empty_record(task, sandboxed=True)["sandboxed"] is True  # noqa: SLF001
+
+
+def test_failed_record_leaves_sandboxed_unknown_when_never_provisioned(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provisioning failure is not an exemption: ``None``, never ``False``."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+    exempt = Task.from_dict(
+        {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+    )
+    assert harness._sandboxed_outcome(task, None) is None  # noqa: SLF001
+    spec = harness_default.agent_sandbox.SandboxSpec(image="agent-sandbox:test")
+    assert harness._sandboxed_outcome(task, spec) is True  # noqa: SLF001
+    assert harness._sandboxed_outcome(exempt, None) is False  # noqa: SLF001
+    record = harness._build_failed_record(task, RuntimeError("no plan"), sandboxed=None)  # noqa: SLF001
+    assert record["sandboxed"] is None
 
 
 def test_sandbox_credential_teardown_only_runs_when_the_cluster_survives(

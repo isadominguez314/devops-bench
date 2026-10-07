@@ -151,6 +151,19 @@ def test_image_digest_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sandbox, "run", malformed)
     assert sandbox.image_digest("nope:latest") is None
 
+    def missing_docker(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(sandbox, "run", missing_docker)
+    assert sandbox.image_digest("nope:latest") is None
+
+    def wedged_daemon(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        assert kwargs.get("timeout"), "inspect must be bounded"
+        raise sandbox.SubprocessError(argv, returncode=-1, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", wedged_daemon)
+    assert sandbox.image_digest("nope:latest") is None
+
 
 def test_kill_container_invokes_docker_kill_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}

@@ -29,7 +29,7 @@ import argparse
 import datetime
 import json
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 from devops_bench.results.row import SCHEMA_VERSION, Manifest, ResultRow
@@ -44,6 +44,9 @@ __all__ = [
 
 # ``manifests.json`` is plural: the combined file may span several setups.
 _ROWS_FILENAME = "rows.json"
+_MANIFEST_FILENAME = "manifest.json"
+# Per setup: ``(sandbox_image, sandbox_image_digest)`` as the per-task manifests recorded them.
+Provenance = Mapping[str, tuple[str | None, str | None]]
 _OUT_ROWS_FILENAME = "rows.json"
 _OUT_MANIFESTS_FILENAME = "manifests.json"
 
@@ -87,6 +90,37 @@ def _load_rows(files: Iterable[Path]) -> list[dict]:
             raise ValueError(f"{file}: top level must be a ResultRow[] array")
         rows.extend(parsed)
     return rows
+
+
+def _load_provenance(files: Iterable[Path]) -> dict[str, tuple[str | None, str | None]]:
+    """Collect each setup's sandbox image and digest from the sibling ``manifest.json`` files.
+
+    Rows do not carry the image, so the combined manifests would otherwise lose
+    it. A setup whose per-task manifests disagree gets ``None`` for the field
+    that differs: the batch did not run on one image, and saying so is the point.
+
+    Args:
+        files: ``rows.json`` paths; a ``manifest.json`` beside each is read when present.
+
+    Returns:
+        ``setup_id -> (sandbox_image, sandbox_image_digest)`` for every setup seen.
+    """
+    seen: dict[str, tuple[set[str | None], set[str | None]]] = {}
+    for file in files:
+        sibling = Path(file).with_name(_MANIFEST_FILENAME)
+        if not sibling.is_file():
+            continue
+        parsed = json.loads(sibling.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            continue
+        images, digests = seen.setdefault(str(parsed.get("setupId", "")), (set(), set()))
+        images.add(parsed.get("sandboxImage"))
+        digests.add(parsed.get("sandboxImageDigest"))
+
+    def sole(values: set[str | None]) -> str | None:
+        return next(iter(values)) if len(values) == 1 else None
+
+    return {setup: (sole(images), sole(digests)) for setup, (images, digests) in seen.items()}
 
 
 def dedupe_latest(rows: Iterable[dict]) -> list[dict]:
@@ -140,7 +174,9 @@ def rebatch_rows(rows: Iterable[dict], *, run_id: str, t: str) -> list[ResultRow
     ]
 
 
-def build_manifests(rows: Iterable[ResultRow], *, run_id: str, t: str) -> list[Manifest]:
+def build_manifests(
+    rows: Iterable[ResultRow], *, run_id: str, t: str, provenance: Provenance | None = None
+) -> list[Manifest]:
     """Build one :class:`Manifest` per distinct setup in ``rows``.
 
     Setups appear in first-seen order; each manifest takes the arm identity
@@ -151,6 +187,7 @@ def build_manifests(rows: Iterable[ResultRow], *, run_id: str, t: str) -> list[M
         rows: Re-batched rows (all already carrying the batch ``run_id`` / ``t``).
         run_id: Batch run id, mirrored onto every manifest.
         t: Batch timestamp, mirrored onto every manifest.
+        provenance: Per-setup sandbox image and digest (see :func:`_load_provenance`).
 
     Returns:
         One manifest per setup, in first-seen order.
@@ -159,6 +196,7 @@ def build_manifests(rows: Iterable[ResultRow], *, run_id: str, t: str) -> list[M
     for row in rows:
         if row.setup_id in manifests:
             continue
+        image, digest = (provenance or {}).get(row.setup_id, (None, None))
         manifests[row.setup_id] = Manifest(
             schema_version=SCHEMA_VERSION,
             run_id=run_id,
@@ -167,6 +205,8 @@ def build_manifests(rows: Iterable[ResultRow], *, run_id: str, t: str) -> list[M
             model=row.model,
             harness=row.harness,
             augmentation=list(row.augmentation),
+            sandbox_image=image,
+            sandbox_image_digest=digest,
         )
     return list(manifests.values())
 
@@ -175,7 +215,8 @@ def aggregate(files: Iterable[Path], *, run_id: str, t: str) -> tuple[list[dict]
     """Aggregate per-task ``rows.json`` files into one batch run.
 
     De-duplicates retried tasks (latest wins), re-batches the rows onto a single
-    ``run_id`` / ``t``, and derives the per-setup manifests.
+    ``run_id`` / ``t``, and derives the per-setup manifests, carrying each
+    setup's sandbox image and digest over from the per-task ``manifest.json``.
 
     Args:
         files: Per-task ``rows.json`` paths.
@@ -186,9 +227,10 @@ def aggregate(files: Iterable[Path], *, run_id: str, t: str) -> tuple[list[dict]
         A ``(rows, manifests)`` pair of JSON-serializable dict lists, ready to
         write as ``rows.json`` / ``manifests.json``.
     """
+    files = list(files)
     deduped = dedupe_latest(_load_rows(files))
     rows = rebatch_rows(deduped, run_id=run_id, t=t)
-    manifests = build_manifests(rows, run_id=run_id, t=t)
+    manifests = build_manifests(rows, run_id=run_id, t=t, provenance=_load_provenance(files))
     return [row.to_dict() for row in rows], [m.to_dict() for m in manifests]
 
 

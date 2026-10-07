@@ -147,9 +147,11 @@ def derive_augmentation(capabilities_granted: Mapping[str, Any] | None) -> list[
     side-channel metadata join.
 
     Args:
-        capabilities_granted: The record's ``capabilities_granted`` mapping
+        capabilities_granted: The arm's capability mapping
             (``{"use_mcp": bool, "skills": list, "sandboxed": bool}``), or
-            ``None``.
+            ``None``. The harness passes the arm-level ``sandboxed`` flag
+            explicitly: a stored record keeps its per-task ``sandboxed`` as a
+            top-level field, not under ``capabilities_granted``.
 
     Returns:
         Sorted, de-duplicated capability tokens.
@@ -393,8 +395,8 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
         # Per-record, not per-manifest: within a sandboxed arm a task that
         # declared ``requires_unsandboxed`` ran OUTSIDE the boundary, and its
-        # row must say so. Absent (a record predating the field) stays None —
-        # unknown, which is not the same claim as False.
+        # row must say so. Absent (predates the field) or null (requested but
+        # never provisioned) stays None — unknown, which is not the same claim as False.
         raw_sandboxed = record.get("sandboxed")
         sandboxed = raw_sandboxed if isinstance(raw_sandboxed, bool) else None
         task_meta = record.get("task_metadata")

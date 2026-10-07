@@ -148,6 +148,8 @@ class SandboxSpec:
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
     owner: str = ""
+    # Resolved once at batch start (see :func:`image_digest`), before the first container runs.
+    image_digest: str | None = None
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
@@ -606,7 +608,15 @@ def image_digest(image: str) -> str | None:
     Returns:
         A ``repo@sha256:...`` or ``sha256:...`` string, or ``None``.
     """
-    completed = run(["docker", "image", "inspect", image], check=False)
+    try:
+        completed = run(
+            [CONTAINER_RUNTIME, "image", "inspect", image],
+            check=False,
+            timeout=_HOUSEKEEPING_TIMEOUT_SEC,
+        )
+    except (OSError, SubprocessError) as exc:
+        _log.warning("could not resolve a digest for sandbox image %s (%s)", image, exc)
+        return None
     if completed.returncode != 0:
         _log.warning(
             "could not resolve a digest for sandbox image %s; the manifest will "

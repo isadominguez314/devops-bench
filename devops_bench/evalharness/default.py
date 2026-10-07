@@ -771,6 +771,7 @@ class DefaultEvalHarness(Harness):
                 )
             except Exception:  # noqa: BLE001 - a sweep failure must not block the run
                 _log.exception("stray sandbox container sweep failed; continuing")
+            self._pin_sandbox_image()
 
         run_dir = self.reporter.new_run_dir()
 
@@ -877,18 +878,37 @@ class DefaultEvalHarness(Harness):
             model=model,
             harness=harness,
             augmentation=augmentation,
-            # A mutable tag is not provenance; the digest is. Resolved at
-            # report time (best-effort, None recorded honestly on failure) so
-            # an A/B pair claiming "the same image" is checkable after the
-            # fact.
+            # A mutable tag is not provenance; the digest is. Pinned at batch
+            # start (None recorded honestly when unresolvable), so an A/B pair
+            # claiming "the same image" is checkable after the fact.
             sandbox_image=sandbox.image if sandbox is not None else None,
-            sandbox_image_digest=(
-                agent_sandbox.image_digest(sandbox.image) if sandbox is not None else None
-            ),
+            sandbox_image_digest=sandbox.image_digest if sandbox is not None else None,
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
         self.reporter.write_manifest(run_dir, manifest.to_dict())
+
+    def _pin_sandbox_image(self) -> None:
+        """Resolve the sandbox image digest once, before any container starts.
+
+        A tag re-pointed mid-batch would otherwise be resolved at report time
+        to an image the earlier tasks never ran on.
+        """
+        spec = self._agent_config.sandbox
+        if spec is None or spec.image_digest is not None:
+            return
+        pinned = replace(spec, image_digest=agent_sandbox.image_digest(spec.image))
+        self._agent_config = replace(self._agent_config, sandbox=pinned)
+
+    def _sandboxed_outcome(
+        self, task: Task, completed_spec: agent_sandbox.SandboxSpec | None
+    ) -> bool | None:
+        """Per-record ``sandboxed`` for a failed run: ``None`` when requested but never provisioned."""
+        if completed_spec is not None:
+            return True
+        if self._agent_config.sandbox is None or task.requires_unsandboxed:
+            return False
+        return None
 
     def _ambient_inventory_rules(
         self,
@@ -1143,7 +1163,7 @@ class DefaultEvalHarness(Harness):
             result = self._build_failed_record(
                 task,
                 exc,
-                sandboxed=completed_spec is not None,
+                sandboxed=self._sandboxed_outcome(task, completed_spec),
                 prompt=prompt,
                 expected_output=expected_output,
                 recoverable_safety=recoverable_safety,
@@ -1334,7 +1354,7 @@ class DefaultEvalHarness(Harness):
         task: Task,
         exc: Exception,
         *,
-        sandboxed: bool = False,
+        sandboxed: bool | None = False,
         prompt: str | None = None,
         expected_output: str | None = None,
         recoverable_safety: list[str] | None = None,
@@ -1347,6 +1367,8 @@ class DefaultEvalHarness(Harness):
         Args:
             task: The task that failed.
             exc: The exception that aborted the run.
+            sandboxed: Per-record boundary truth; ``None`` when a sandbox was
+                requested but never provisioned, which is not the claim ``False`` makes.
             prompt: The substituted prompt if computed, else the raw ``task.prompt``.
             expected_output: The substituted expectation if computed, else the raw one.
             recoverable_safety: The substituted checklist if computed, else the raw one.
@@ -1379,7 +1401,7 @@ class DefaultEvalHarness(Harness):
         )
         return record
 
-    def _empty_record(self, task: Task, *, sandboxed: bool = False) -> dict[str, Any]:
+    def _empty_record(self, task: Task, *, sandboxed: bool | None = False) -> dict[str, Any]:
         """Seed every record with the symmetric key set; the caller sets ``status``."""
         return {
             "input": task.prompt,

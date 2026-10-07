@@ -231,7 +231,8 @@ class ResultRow(BaseModel):
             ``sandboxed`` augmentation token, because the two legitimately
             disagree: within a sandboxed arm a task that declared
             ``requires_unsandboxed`` runs outside the boundary, and its row
-            must say so. ``None`` when the record predates the field —
+            must say so. ``None`` when the record predates the field, or when
+            a sandbox was requested but failed before it was provisioned —
             unknown, which is not the claim ``False`` makes.
     """
 
