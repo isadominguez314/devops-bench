@@ -141,17 +141,11 @@ def derive_augmentation(capabilities_granted: Mapping[str, Any] | None) -> list[
     ``"skills"``; a truthy ``sandboxed`` contributes ``"sandboxed"``. An arm
     with none of them yields ``[]`` (baseline).
 
-    ``sandboxed`` is an augmentation token deliberately: it lands in the
-    ``setup_id``, so a sandboxed arm aggregates as its own dashboard setup and
-    the sandbox A/B soak is a plain group-by on rows — no re-scoring, no
-    side-channel metadata join.
+    ``sandboxed`` is a token so a sandboxed arm gets its own setup id and A/B is a group-by.
 
     Args:
-        capabilities_granted: The arm's capability mapping
-            (``{"use_mcp": bool, "skills": list, "sandboxed": bool}``), or
-            ``None``. The harness passes the arm-level ``sandboxed`` flag
-            explicitly: a stored record keeps its per-task ``sandboxed`` as a
-            top-level field, not under ``capabilities_granted``.
+        capabilities_granted: ``{"use_mcp": bool, "skills": list, "sandboxed": bool}`` or
+            ``None``; ``sandboxed`` is the arm flag the harness passes, not a record field.
 
     Returns:
         Sorted, de-duplicated capability tokens.
@@ -393,10 +387,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         tokens = normalize_tokens(record.get("tokens"))
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
-        # Per-record, not per-manifest: within a sandboxed arm a task that
-        # declared ``requires_unsandboxed`` ran OUTSIDE the boundary, and its
-        # row must say so. Absent (predates the field) or null (requested but
-        # never provisioned) stays None — unknown, which is not the same claim as False.
+        # Per-record: an exempt task in a sandboxed arm reads False; absent or null stays None.
         raw_sandboxed = record.get("sandboxed")
         sandboxed = raw_sandboxed if isinstance(raw_sandboxed, bool) else None
         task_meta = record.get("task_metadata")

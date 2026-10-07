@@ -426,8 +426,7 @@ def test_manifest_to_dict_keys():
 
 
 def test_derive_augmentation_sandboxed_token():
-    """``sandboxed`` rides in the setup id so a sandboxed arm aggregates as its
-    own dashboard setup — the A/B soak is then a plain group-by on rows."""
+    """``sandboxed`` rides in the setup id so a sandboxed arm is its own dashboard setup."""
     assert derive_augmentation({"sandboxed": True}) == ["sandboxed"]
     assert derive_augmentation({"use_mcp": True, "sandboxed": True}) == ["mcp", "sandboxed"]
     assert derive_augmentation({"sandboxed": False}) == []
@@ -435,9 +434,7 @@ def test_derive_augmentation_sandboxed_token():
 
 
 def test_build_rows_carries_per_record_sandboxed():
-    """Per-row, not per-manifest: a requires_unsandboxed task inside a
-    sandboxed arm ran OUTSIDE the boundary and its row must say so. A record
-    predating the field yields None — unknown is not the claim False makes."""
+    """An exempt task in a sandboxed arm reads False; a record predating the field reads None."""
     manifest = _manifest()
     base = {"name": "t", "folder": "f", "status": "success"}
     inside = build_rows([{**base, "sandboxed": True}], manifest)[0]

@@ -105,8 +105,7 @@ def test_container_name_for_workspace_differs_per_workspace() -> None:
 
 
 def test_image_digest_prefers_the_repo_digest(monkeypatch: pytest.MonkeyPatch) -> None:
-    """RepoDigests is the registry-anchored identity that survives across
-    hosts; the local Id is only the fallback for a never-pushed image."""
+    """RepoDigests is the cross-host identity; the local Id is only the never-pushed fallback."""
     inspected = [
         {
             "Id": "sha256:aaaa",
@@ -135,9 +134,7 @@ def test_image_digest_falls_back_to_the_local_id(monkeypatch: pytest.MonkeyPatch
 
 
 def test_image_digest_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Provenance must never sink a finished run: unknown image, missing
-    docker, malformed output all yield None (and the manifest records the
-    absence honestly)."""
+    """Unknown image, malformed output, a missing runtime, or a timeout all yield None."""
 
     def unknown_image(argv: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=1, stdout="", stderr="No such image")

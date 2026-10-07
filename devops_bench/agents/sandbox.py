@@ -148,7 +148,7 @@ class SandboxSpec:
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
     owner: str = ""
-    # Resolved once at batch start (see :func:`image_digest`), before the first container runs.
+    # Pinned by the harness at batch start, before the first container runs.
     image_digest: str | None = None
 
 
@@ -590,23 +590,10 @@ def container_name_for_workspace(workspace: Path, owner: str = "") -> str:
 
 
 def image_digest(image: str) -> str | None:
-    """Resolve ``image`` to a content digest for the run manifest. Never raises.
+    """Resolve ``image`` to a content digest for the run manifest; never raises.
 
-    Prefers the first ``RepoDigests`` entry — the registry-anchored identity
-    that survives across hosts — and falls back to the local image ID (the
-    config hash) for an image that was only ever built locally and has no
-    repo digest. Both are content-addressed; either one turns "we ran
-    ``agent-sandbox:dev``" from a mutable-tag claim into evidence.
-
-    Best-effort by design: provenance must never sink a finished run, so a
-    missing docker binary, an unknown image, or malformed inspect output all
-    log and return ``None`` — and the manifest records the absence honestly.
-
-    Args:
-        image: The image reference the run used (tag or digest form).
-
-    Returns:
-        A ``repo@sha256:...`` or ``sha256:...`` string, or ``None``.
+    Prefers the registry-anchored ``RepoDigests`` entry, else the local image ID;
+    any failure logs and returns ``None`` so provenance cannot sink a finished run.
     """
     try:
         completed = run(

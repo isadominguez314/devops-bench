@@ -854,11 +854,7 @@ class DefaultEvalHarness(Harness):
         )
         from devops_bench.results import setup_id as results_setup_id
 
-        # ``sandboxed`` is the ARM's property (the run was requested sandboxed),
-        # so it belongs in the setup id: a sandboxed arm aggregates as its own
-        # dashboard setup and the A/B soak is a plain group-by. Per-task
-        # divergence (a requires_unsandboxed exemption) is carried on each
-        # row's own ``sandboxed`` field instead.
+        # Arm-level: the token lands in the setup id so A/B is a group-by; rows hold per-task truth.
         sandbox = self._agent_config.sandbox
         augmentation = derive_augmentation(
             {
@@ -878,9 +874,7 @@ class DefaultEvalHarness(Harness):
             model=model,
             harness=harness,
             augmentation=augmentation,
-            # A mutable tag is not provenance; the digest is. Pinned at batch
-            # start (None recorded honestly when unresolvable), so an A/B pair
-            # claiming "the same image" is checkable after the fact.
+            # Pinned at batch start; a mutable tag alone is not provenance.
             sandbox_image=sandbox.image if sandbox is not None else None,
             sandbox_image_digest=sandbox.image_digest if sandbox is not None else None,
         )
@@ -889,11 +883,7 @@ class DefaultEvalHarness(Harness):
         self.reporter.write_manifest(run_dir, manifest.to_dict())
 
     def _pin_sandbox_image(self) -> None:
-        """Resolve the sandbox image digest once, before any container starts.
-
-        A tag re-pointed mid-batch would otherwise be resolved at report time
-        to an image the earlier tasks never ran on.
-        """
+        """Resolve the image digest once, before the first container; a tag can move mid-batch."""
         spec = self._agent_config.sandbox
         if spec is None or spec.image_digest is not None:
             return
@@ -1367,8 +1357,7 @@ class DefaultEvalHarness(Harness):
         Args:
             task: The task that failed.
             exc: The exception that aborted the run.
-            sandboxed: Per-record boundary truth; ``None`` when a sandbox was
-                requested but never provisioned, which is not the claim ``False`` makes.
+            sandboxed: Per-record boundary truth; ``None`` when requested but never provisioned.
             prompt: The substituted prompt if computed, else the raw ``task.prompt``.
             expected_output: The substituted expectation if computed, else the raw one.
             recoverable_safety: The substituted checklist if computed, else the raw one.
@@ -1433,9 +1422,7 @@ class DefaultEvalHarness(Harness):
                 "use_mcp": self.use_mcp,
                 "skills": list(self._granted_skill_paths),
             },
-            # Whether THIS task's agent actually ran inside the container
-            # boundary — per-record, not per-run: a ``requires_unsandboxed``
-            # task inside a sandboxed run legitimately differs from its arm.
+            # Per-task, not per-arm: a requires_unsandboxed task in a sandboxed run reads False.
             "sandboxed": sandboxed,
             "verification_parse_errors": [],
             "verification_report": [],

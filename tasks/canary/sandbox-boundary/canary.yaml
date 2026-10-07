@@ -12,25 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CANARY — not a benchmark task. See README.md in this directory.
-#
-# Deliberately named canary.yaml, not task.yaml: both task discovery paths key
-# on the literal filename (loader.load_from_tasks_dir and the matrix's
-# `find tasks -name task.yaml`), so this file is invisible to every sweep and
-# runs only when someone names it explicitly:
+# CANARY, not a benchmark task; see README.md. Named canary.yaml so no task.yaml
+# sweep picks it up; it runs only when named explicitly:
 #
 #     BENCH_AGENT_SANDBOX=1 BENCH_SANDBOX_IMAGE=agent-sandbox:dev \
 #     BENCH_REQUIRE_FIXTURES=0 \
 #     python -m devops_bench tasks/canary/sandbox-boundary/canary.yaml
 #
-# BENCH_REQUIRE_FIXTURES=0 is forward-compatibility: the fixture-completeness
-# gate arrives with PR #255 and is inert until then. The gate reads the
-# prompt's ~/ paths as promised inputs, and this prompt deliberately names
-# paths that must be absent. See README.md.
-#
-# It exercises the FULL pipeline — a real agent, real trajectory capture, real
-# detection — where hack/sandbox_probe.py exercises the boundary with
-# deterministic argv. The two are complementary; neither replaces the other.
+# BENCH_REQUIRE_FIXTURES=0: the #255 fixture gate would read the prompt's ~/ paths
+# as promised inputs, and this prompt names paths that must be absent.
 task_id: 990
 name: "canary-sandbox-boundary"
 infrastructure:

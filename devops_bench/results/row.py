@@ -63,16 +63,10 @@ class Manifest(BaseModel):
             ``api``).
         augmentation: Capability tokens active for the run (e.g.
             ``["mcp", "skills"]``); an empty list denotes the baseline arm.
-        sandbox_image: The agent container image reference for a sandboxed
-            run, verbatim from ``BENCH_SANDBOX_IMAGE``. ``None`` on an
-            unsandboxed arm (or a manifest predating the field).
-        sandbox_image_digest: The resolved content digest of that image
-            (``RepoDigests`` when the image was pulled/pushed, the local image
-            ID otherwise). Recorded because it is otherwise unrecoverable:
-            a mutable tag like ``:dev`` says nothing after the fact, and
-            an A/B comparison between two runs of "the same image" is only
-            evidence when the digests agree. ``None`` when unsandboxed or when
-            the digest could not be resolved (recorded loudly at write time).
+        sandbox_image: The sandbox image reference as given; ``None`` on an unsandboxed arm.
+        sandbox_image_digest: Its content digest (repo digest, else local image ID), pinned
+            at batch start because a tag says nothing after the fact; ``None`` when
+            unsandboxed or unresolvable.
     """
 
     model_config = _MODEL_CONFIG
@@ -226,14 +220,9 @@ class ResultRow(BaseModel):
         status: Terminal record status, ``"success"`` or ``"failed"``.
         validated: Whether the task is vetted as correct and eligible for the
             leaderboard; ingest gates promotion on this (default ``False``).
-        sandboxed: Whether this task's agent actually ran inside the container
-            boundary. Per-row rather than inferred from the setup's
-            ``sandboxed`` augmentation token, because the two legitimately
-            disagree: within a sandboxed arm a task that declared
-            ``requires_unsandboxed`` runs outside the boundary, and its row
-            must say so. ``None`` when the record predates the field, or when
-            a sandbox was requested but failed before it was provisioned —
-            unknown, which is not the claim ``False`` makes.
+        sandboxed: Whether this task actually ran inside the boundary; per-row because a
+            ``requires_unsandboxed`` task in a sandboxed arm reads ``False``. ``None`` when
+            the record predates the field or the sandbox was never provisioned.
     """
 
     model_config = _MODEL_CONFIG

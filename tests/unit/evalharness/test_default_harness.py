@@ -1353,8 +1353,7 @@ def test_run_one_tears_down_sandbox_credentials_in_its_finally(
 def test_write_run_artifacts_records_sandbox_provenance(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The arm's sandboxing lands in the setup id (A/B is a group-by), and the
-    image is pinned by digest — a mutable tag is not provenance."""
+    """The arm's sandboxing lands in the setup id and the image is pinned by digest."""
     harness = _sandboxed_harness(monkeypatch, tmp_path)
     resolved: list[str] = []
     monkeypatch.setattr(
@@ -1423,8 +1422,7 @@ def test_write_run_artifacts_stays_baseline_when_unsandboxed(
 def test_empty_record_carries_the_task_scoped_sandboxed_flag(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Per-record truth: an exempt task inside a sandboxed arm records False
-    while its siblings record True."""
+    """An exempt task inside a sandboxed arm records False while its siblings record True."""
     harness = _sandboxed_harness(monkeypatch, tmp_path)
     task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
 

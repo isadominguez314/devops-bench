@@ -93,17 +93,9 @@ def _load_rows(files: Iterable[Path]) -> list[dict]:
 
 
 def _load_provenance(files: Iterable[Path]) -> dict[str, tuple[str | None, str | None]]:
-    """Collect each setup's sandbox image and digest from the sibling ``manifest.json`` files.
+    """Per-setup ``(sandbox_image, sandbox_image_digest)`` from the sibling ``manifest.json`` files.
 
-    Rows do not carry the image, so the combined manifests would otherwise lose
-    it. A setup whose per-task manifests disagree gets ``None`` for the field
-    that differs: the batch did not run on one image, and saying so is the point.
-
-    Args:
-        files: ``rows.json`` paths; a ``manifest.json`` beside each is read when present.
-
-    Returns:
-        ``setup_id -> (sandbox_image, sandbox_image_digest)`` for every setup seen.
+    A field the setup's manifests disagree on becomes ``None``: the batch did not run on one image.
     """
     seen: dict[str, tuple[set[str | None], set[str | None]]] = {}
     for file in files:

@@ -15,35 +15,20 @@
 
 """Boundary probes for the sandboxed agent, run against a live cluster.
 
-A passing task run proves the agent can WORK inside the sandbox. It says
-nothing about whether the boundary HOLDS -- the pod-security policy could be
-absent entirely and the run would look identical. This script probes the
-boundary directly: it provisions the agent's real credential through the real
-code path, then runs each escape from inside a real sandbox container and
-checks it is refused.
-
-Control probes come first and are not optional. If the token is broken, every
-escape probe "passes" for the wrong reason, and a green run would mean nothing.
+A passing task run proves the agent can work inside the sandbox, not that the
+boundary holds. This script provisions the real agent credential, then runs
+each escape from inside a real sandbox container and checks it is refused.
+Controls come first: a dead token would make every deny pass for the wrong reason.
 
 Usage:
     uv run python hack/sandbox_probe.py --provider kind --cluster-name kind \\
         --image <sandbox-image>
 
-The network plan is built through the shipped
-``agents.sandbox.build_network_plan`` rather than assembled here, so the
-container reaches the apiserver exactly the way a real run does. Hand-building
-the plan is what made an earlier version of this script unable to connect at
-all: kind writes ``https://127.0.0.1:<port>`` as its server, which from inside
-a container is the container.
-
-This began as scratch validation tooling (18/18 probes green on GKE before
-promotion) and is now the boundary's regression suite:
-``tests/e2e/test_sandbox_boundary.py`` drives it and asserts the exit code, so
-a boundary regression is a red build. It stays runnable standalone because an
-operator debugging a refusal wants this transcript, not a pytest traceback.
-Unless ``--keep`` is given, the run ends by tearing the provisioned boundary
-back down and asserting nothing survived — teardown is part of the contract,
-not cleanup.
+The network plan comes from ``agents.sandbox.build_network_plan`` so the
+container reaches the apiserver the way a real run does.
+``tests/e2e/test_sandbox_boundary.py`` drives this and asserts the exit code;
+it stays runnable standalone for the per-probe transcript. Unless ``--keep``
+is given, the run tears the boundary down and asserts nothing survived.
 """
 
 from __future__ import annotations
@@ -68,9 +53,7 @@ from devops_bench.providers.gcp import GcpProvider
 from devops_bench.providers.kind import KindProvider
 from devops_bench.providers.vcluster import VClusterProvider
 
-# Written into the workspace rather than piped: the container runs without
-# ``-i`` by design, so ``kubectl apply -f -`` would read an empty stdin and
-# the probe would "pass" without ever reaching admission.
+# A file, not stdin: the container runs without -i, so ``apply -f -`` would never reach admission.
 _HOSTPATH_POD = """\
 apiVersion: v1
 kind: Pod
@@ -114,18 +97,10 @@ _METADATA_URL = "http://169.254.169.254/computeMetadata/v1/instance/service-acco
 # Bounds every host-side kubectl/curl call so a stalled apiserver cannot outlast teardown.
 _HOST_CMD_TIMEOUT_SEC = 120
 
-# A namespace carrying the addon manager's label and absent from the exempt
-# NAME list, created host-side so the by-label binding has something only it
-# can match. The agent cannot build this itself: ``bench-agent-namespace-guard``
-# denies it the label, which the ``review:claim-managed-label`` probe asserts.
+# Labelled and absent from the exempt NAME list, so only the by-label binding can match it.
 _MANAGED_NAMESPACE = "bench-probe-managed"
 
-# An ordinary, non-exempt namespace holding two pods built host-side *before*
-# provisioning, standing in for what ``tf/prebuilt/opa-remediation`` leaves
-# behind: one privileged pod the policy would have refused had it existed yet,
-# and one conformant pod beside it. The pair is the point -- they differ only
-# in conformance, so a deny on the first and a success on the second can only
-# be the shell guard discriminating between them.
+# Two pods built before provisioning that differ only in conformance, so a deny isolates the guard.
 _LEGACY_NAMESPACE = "bench-probe-legacy"
 _LEGACY_PRIVILEGED_POD = "bench-probe-legacy-priv"
 _LEGACY_ORDINARY_POD = "bench-probe-legacy-ok"
@@ -140,13 +115,8 @@ class Probe:
         why: What a failure of this probe would mean.
         argv: Command line run inside the container.
         expect_denied: True when a non-zero exit is the passing outcome.
-        expect_stderr: Substring the refusal must mention, so a probe that
-            fails for an unrelated reason (typo, missing binary) is not
-            mistaken for the boundary doing its job.
-        setup: Host-side state this probe needs, re-asserted immediately
-            before it runs and reported as a failure when it cannot be. A
-            probe whose precondition is missing has not passed and has not
-            been skipped -- it never reached the boundary at all.
+        expect_stderr: Substring the refusal must mention, so an unrelated failure is not a pass.
+        setup: Host-side precondition re-asserted just before the run; failing it fails the probe.
     """
 
     name: str
@@ -160,18 +130,8 @@ class Probe:
 def _running_pod_in_kube_system(context: str) -> str | None:
     """Name a running kube-system pod for the exec probe to aim at.
 
-    Resolved host-side because the probe needs a target that exists: with a
-    made-up name ``kubectl exec`` fails on the preliminary GET, before the
-    apiserver ever reaches admission, and the probe would report a refusal the
-    boundary had nothing to do with.
-
-    Args:
-        context: kubectl context to query.
-
-    Returns:
-        A pod name; ``None`` when the namespace has no running pod (a vcluster's
-        virtual ``kube-system`` may have none); ``""`` when the query itself failed,
-        which the caller counts as a setup failure rather than a skip.
+    Resolved host-side: with a made-up name ``kubectl exec`` fails before admission.
+    Returns ``None`` when there is no running pod (skip) and ``""`` when the query failed.
     """
     completed = _kubectl(
         context,
@@ -194,26 +154,11 @@ def _running_pod_in_kube_system(context: str) -> str | None:
 def _ensure_managed_namespace(context: str) -> bool:
     """Make sure the labelled namespace the by-label binding needs is Active.
 
-    Two details here are not stylistic, they are what the first live run cost.
-    GKE's addon manager treats a namespace carrying its label as one of its own
-    and prunes it: on that run it deleted this namespace 2.5 seconds before the
-    probe's request reached the apiserver, and the probe reported ``namespaces
-    "bench-probe-managed" not found`` rather than a refusal.
-
-    So the namespace is built with ``create`` + ``label`` rather than ``apply``
-    -- the pruner skips objects with no ``last-applied-configuration``
-    annotation, and ``apply`` is what writes one -- and this function is called
-    again immediately before the probe, which closes whatever window is left.
-
-    Args:
-        context: kubectl context to create it in.
-
-    Returns:
-        True once the namespace is Active. False means the probe must not run:
-        a missing namespace produces a refusal of its own that has nothing to
-        do with the boundary.
+    Built with ``create`` + ``label`` rather than ``apply``: the addon manager
+    prunes labelled namespaces that carry a last-applied annotation, which cost
+    the first live run. Called again right before the probe to close the
+    remaining window. False means the probe must not run.
     """
-
     for attempt in range(5):
         phase = _kubectl(
             context, "get", "namespace", _MANAGED_NAMESPACE, "-o", "jsonpath={.status.phase}"
@@ -259,38 +204,17 @@ def _kubectl(context: str, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _create_legacy_pods(context: str) -> bool:
-    """Build the pods that must predate provisioning, and wait for them.
+    """Build the pods that must predate provisioning, and wait until they are Running.
 
-    Called before ``provision_agent_credentials`` on purpose: the whole point
-    of the guard under test is that admission never saw these creates. Running
-    this afterwards would have the pod-security policy refuse the privileged
-    one, and the probe would be testing the wrong control.
-
-    They must reach Running, not merely exist. ``kubectl exec`` on a Pending
-    pod fails in the kubelet with a message the boundary had nothing to do
-    with, which would read as a deny.
-
-    The pod-security policy is dropped first, and that is not a shortcut. On a
-    fresh cluster the deployer runs before anything here exists, which is the
-    situation being reproduced; on a cluster a previous run left policies on,
-    the operator's own create is refused -- the policy is deliberately not
-    username-scoped, because a pod is often created on the agent's behalf by a
-    controller. Provisioning re-applies it seconds later, and the probe below
-    reads the policy's own status to confirm that.
-
-    Args:
-        context: kubectl context to create them in.
-
-    Returns:
-        True once both pods are Running.
+    Before provisioning on purpose: the guard under test exists because admission
+    never saw these creates. The pod-security policy is dropped first so a reused
+    cluster does not refuse the privileged one; provisioning re-applies it.
+    Running, not Pending: exec on a Pending pod fails in the kubelet, which reads as a deny.
     """
     for kind in ("validatingadmissionpolicybinding", "validatingadmissionpolicy"):
         _kubectl(context, "delete", kind, "bench-agent-pod-security", "--ignore-not-found")
     _kubectl(context, "create", "namespace", _LEGACY_NAMESPACE)
-    # The namespace's default ServiceAccount is minted asynchronously by the
-    # controller manager, and a pod create that races it is refused with
-    # "serviceaccount \"default\" not found" -- a failure the boundary had
-    # nothing to do with, surfaced live on a freshly created kind cluster.
+    # The default ServiceAccount is minted asynchronously; a pod create that races it is refused.
     for _ in range(60):
         if (
             _kubectl(
@@ -339,20 +263,7 @@ def _create_legacy_pods(context: str) -> bool:
 
 
 def _legacy_pod_still_running(context: str, name: str) -> bool:
-    """Re-assert that a legacy pod is still Running, without rebuilding it.
-
-    Deliberately not a create: by the time this runs the pod-security policy is
-    installed, so recreating the privileged one would be denied and the probe
-    would report a refusal from the wrong control. If the pod is gone, the
-    precondition is gone with it and the probe has to say so.
-
-    Args:
-        context: kubectl context to query.
-        name: Pod name in :data:`_LEGACY_NAMESPACE`.
-
-    Returns:
-        True when the pod is Running.
-    """
+    """Re-assert a legacy pod is Running without recreating it (the policy is installed by now)."""
     phase = _kubectl(
         context, "get", "pod", name, "-n", _LEGACY_NAMESPACE, "-o", "jsonpath={.status.phase}"
     )
@@ -365,20 +276,10 @@ def _probes(
     managed_setup: Callable[[], bool] | None,
     legacy_setup: Callable[[str], bool] | None,
 ) -> list[Probe]:
-    """Build the probe list.
+    """Build the probe list: controls first, then the escapes, then the informational checks.
 
-    Args:
-        workspace_pod_path: Container path of the hostPath manifest.
-        exec_target: A running kube-system pod to attempt exec into, or
-            ``None`` to skip that probe.
-        managed_setup: Re-asserts the labelled namespace, or ``None`` to drop
-            the by-label probe because it could not be built at all.
-        legacy_setup: Re-asserts that a named pre-provisioning pod is still
-            Running, or ``None`` to drop the shell-guard probes because the
-            pods could not be built at all.
-
-    Returns:
-        Controls first, then the escapes, then the informational checks.
+    ``exec_target``, ``managed_setup`` and ``legacy_setup`` are ``None`` when their
+    precondition could not be built, which drops the probes that need it.
     """
     return [
         # -- controls: prove the credential works before trusting any refusal --
@@ -484,15 +385,7 @@ def _probes(
             argv=["kubectl", "create", "namespace", "gmp-system"],
             expect_stderr="reserved",
         ),
-        # -- the exemption's other edge: namespaces that already exist --
-        #
-        # This trio found a real hole and is the reason the exempt-namespace
-        # guard exists. On the first live run the pod probe came back CREATED:
-        # the pod policy skips kube-system by namespaceSelector, the labeller
-        # skips it too, and edit is bound cluster-wide, so the escape the whole
-        # stack exists to deny was one -n kube-system away. Keep all three --
-        # they now assert the guard rather than document the hole, and each
-        # covers a different way in.
+        # -- exempt namespaces that already exist: the trio that found the hole the guard closes --
         Probe(
             name="review:exempt-namespace-pod",
             why="the module asserts every exempt name is one the agent cannot "
@@ -646,15 +539,7 @@ def _probes(
 
 
 def _run_probe(executor: SandboxExecutor, probe: Probe) -> tuple[bool, str]:
-    """Run one probe and judge it.
-
-    Args:
-        executor: Executor wrapping the same sandbox the agent would get.
-        probe: The probe to run.
-
-    Returns:
-        ``(passed, detail)``; ``detail`` is the output worth printing.
-    """
+    """Run one probe and judge it; returns ``(passed, detail)``."""
     if probe.setup and not probe.setup():
         return False, "[the probe's precondition could not be met; the boundary was never reached]"
 
@@ -668,25 +553,16 @@ def _run_probe(executor: SandboxExecutor, probe: Probe) -> tuple[bool, str]:
     if probe.expect_denied != denied:
         return False, out
     if probe.expect_denied and probe.expect_stderr and probe.expect_stderr not in out:
-        # Refused, but not by the control we are testing -- a typo, a missing
-        # binary, or an RBAC denial standing in for an admission denial.
+        # Refused, but not by the control under test (typo, missing binary, RBAC not admission).
         return False, f"[refused, but not by the expected control]\n{out}"
     return True, out
 
 
 def _check_policies(context: str) -> list[str]:
-    """Host-side: confirm every policy exists and its CEL compiled.
+    """Host-side: confirm every policy exists and its CEL compiled; returns problem lines.
 
-    A ValidatingAdmissionPolicy whose expression does not type-check is
-    accepted by the apiserver and then, under ``failurePolicy: Fail``, denies
-    everything it matches. On a shared cluster that is a bad afternoon, so it
-    is worth reading the status rather than assuming the apply succeeded.
-
-    Args:
-        context: kubectl context to query.
-
-    Returns:
-        Human-readable problem lines; empty when every policy is healthy.
+    A policy whose expression fails type-checking is accepted and then, under
+    ``failurePolicy: Fail``, denies everything it matches.
     """
     problems: list[str] = []
     for name in creds._POLICY_NAMES:
@@ -708,18 +584,9 @@ def _check_policies(context: str) -> list[str]:
 
 
 def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) -> str:
-    """Replay the agent's token against the HOST apiserver; expect a 401.
+    """Replay the agent's token against the HOST apiserver; returns a problem line or ``""``.
 
-    The whole point of pinning to the virtual cluster's context is that the
-    minted ServiceAccount lives inside the vcluster and its token is signed by
-    a key the host apiserver does not trust.
-
-    Args:
-        kubeconfig: The generated agent kubeconfig.
-        host_apiserver: Base URL of the host cluster's apiserver.
-
-    Returns:
-        A problem line, or ``""`` when the token was correctly rejected.
+    A vcluster-minted token is signed by a key the host does not trust, so it must get 401/403.
     """
     from ruamel.yaml import YAML  # local: only this check needs it
 
@@ -751,20 +618,9 @@ def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) 
 
 
 def _provider_and_cluster(args: argparse.Namespace) -> tuple[Provider | None, ClusterInfo]:
-    """Build the run's provider and cluster description from the CLI args.
+    """Build the provider (``None`` for ``--provider none``) and cluster info from the CLI args.
 
-    The point of going through a real provider is that the plan it returns is
-    the plan a real run gets. A hand-built plan can be wrong in exactly the way
-    the code under test is supposed to prevent.
-
-    Args:
-        args: Parsed command line.
-
-    Returns:
-        The provider (``None`` for ``--provider none``) and its cluster info.
-
-    Raises:
-        SystemExit: When the chosen provider is missing a required argument.
+    A real provider yields the plan a real run gets; raises SystemExit on a missing argument.
     """
     cluster = ClusterInfo(
         name=args.cluster_name or "",
@@ -792,11 +648,7 @@ def _provider_and_cluster(args: argparse.Namespace) -> tuple[Provider | None, Cl
 
 
 def main() -> int:
-    """Provision, probe, report.
-
-    Returns:
-        0 when every probe passed, 1 otherwise.
-    """
+    """Provision, probe, report; 0 when every probe passed, 1 otherwise."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True, help="sandbox image (BENCH_SANDBOX_IMAGE)")
     parser.add_argument(
@@ -856,8 +708,7 @@ def main() -> int:
         failures: list[str] = []
         # One finally from the first cluster write on: a raising probe must still reach cleanup.
         try:
-            # Before provisioning, so it is also in front of the PSA labeller,
-            # which must skip a namespace the cluster has claimed as its own.
+            # Before provisioning: the PSA labeller must skip a namespace the cluster claims.
             print(f"==> creating the labelled namespace {_MANAGED_NAMESPACE}")
             managed_setup: Callable[[], bool] | None = functools.partial(
                 _ensure_managed_namespace, context
@@ -867,8 +718,7 @@ def main() -> int:
                 failures.append("setup:managed-namespace")
                 managed_setup = None
 
-            # Also before provisioning, and that ordering is the whole test: these
-            # pods exist because admission was not there yet to refuse them.
+            # Also before provisioning: these pods exist because admission could not refuse them.
             print(f"==> creating the pre-provisioning pods in {_LEGACY_NAMESPACE}")
             legacy_setup: Callable[[str], bool] | None = functools.partial(
                 _legacy_pod_still_running, context
@@ -921,10 +771,7 @@ def main() -> int:
                 if problem:
                     failures.append("vcluster:token-replay")
         finally:
-            # Always, even under --keep. If the exempt-namespace probes FAILED
-            # then the escape worked, and what they left behind is a
-            # privileged container in kube-system. That is not something to
-            # leave for inspection.
+            # Always, even under --keep: a failed probe here left a privileged pod in kube-system.
             for kind, name in (
                 ("pod", "bench-probe-exempt"),
                 ("deployment", "bench-probe-exempt-deploy"),
@@ -940,9 +787,7 @@ def main() -> int:
                     "--wait=false",
                 )
 
-            # Also unconditional: this namespace holds a privileged pod that the
-            # probe itself put there, and leaving it for inspection would leave
-            # the escape route open on a cluster the next run reuses.
+            # Also unconditional: a privileged pod the probe put there must not outlive the run.
             _kubectl(
                 context,
                 "delete",
@@ -963,13 +808,7 @@ def main() -> int:
                         "--wait=false",
                     )
 
-            # The boundary objects follow --keep the same way the namespaces
-            # do: kept for inspection on request, removed otherwise — and their
-            # removal is itself a probe. Teardown is a correctness requirement
-            # on reused clusters (the pod-security policy is not
-            # username-scoped, so a survivor denies the OPERATOR too), so a
-            # teardown that strands an object, or a policy that outlives it,
-            # fails the suite like any escape would.
+            # Teardown follows --keep and is itself a probe: a leftover policy denies the operator.
             if args.keep:
                 print(
                     "\n==> --keep: the agent credential, PSA labels and admission policies "
