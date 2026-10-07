@@ -98,7 +98,7 @@ image **and its content digest**, resolved once when the batch starts, so
 
 ## Trusting it
 
-Three layers, weakest to strongest evidence:
+Two layers, weakest to strongest evidence:
 
 * **Unit tests** hold the mechanics: argv assembly, env filtering, kubeconfig
   rendering, path remapping, teardown inventory (kept in lockstep with the
@@ -109,11 +109,6 @@ Three layers, weakest to strongest evidence:
   token makes every deny pass for the wrong reason), then both observed
   escapes, then every hole review found, then that teardown left nothing
   behind.
-* **The canary** ([`tasks/canary/sandbox-boundary/`](../../tasks/canary/sandbox-boundary/))
-  sends a *real agent* through the full pipeline to attempt the forbidden
-  reads, proving the trajectory, detection and artifacts tell the story
-  end-to-end. A canary's `cheating_report` is *expected* to flag — detection
-  seeing the attempt while the boundary denies it is both layers working.
 
 Detection stays on for sandboxed runs as the tripwire behind the wall: a
 sensitive-access flag on a sandboxed record no longer means "expected ambient
