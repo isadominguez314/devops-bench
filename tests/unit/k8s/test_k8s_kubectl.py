@@ -173,8 +173,7 @@ def test_apply_builds_argv(mocker: MockerFixture) -> None:
 
 
 def test_delete_builds_argv_and_ignores_not_found_by_default(mocker: MockerFixture) -> None:
-    # Not-found tolerance is the default because the callers are teardown
-    # paths, where "already gone" is success.
+    # Teardown callers treat "already gone" as success.
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 
     kubectl.delete("clusterrolebinding", "a", "b", context="kind-bench")
@@ -212,9 +211,7 @@ def test_delete_threads_the_subprocess_timeout(mocker: MockerFixture) -> None:
 def test_apply_label_config_value_and_create_token_thread_the_timeout(
     mocker: MockerFixture,
 ) -> None:
-    """The credential module's provisioning and teardown calls must be bounded:
-    an apiserver that accepts the connection and never answers would otherwise
-    block _run_one indefinitely."""
+    """Provisioning and teardown calls must be bounded so a silent apiserver cannot hang the run."""
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed(stdout="v"))
     kubectl.apply("m.yaml", timeout=60)
     assert mock_run.call_args.kwargs["timeout"] == 60
@@ -235,8 +232,7 @@ def test_apply_and_label_omit_the_timeout_kwarg_when_unset(mocker: MockerFixture
 
 
 def test_delete_refuses_an_empty_name_list(mocker: MockerFixture) -> None:
-    # ``kubectl delete <kind>`` with no name is a no-op kubectl rejects; a
-    # caller who wants --all should have to spell that out, not fall into it.
+    # No implicit --all.
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 
     with pytest.raises(ValueError):
@@ -246,8 +242,7 @@ def test_delete_refuses_an_empty_name_list(mocker: MockerFixture) -> None:
 
 
 def test_label_renders_a_none_value_as_removal(mocker: MockerFixture) -> None:
-    # ``key-`` is kubectl's spelling for "remove this label"; a mapping mixing
-    # sets and removals renders each element in its own form.
+    # ``key-`` is kubectl's "remove this label".
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 
     kubectl.label("namespace", "default", {"keep": "1", "drop": None})

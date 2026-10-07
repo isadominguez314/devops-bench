@@ -356,19 +356,12 @@ def delete(
     """Delete named resources via ``kubectl delete``.
 
     Args:
-        resource: Resource kind, e.g. ``"namespace"`` or
-            ``"validatingadmissionpolicy"``.
-        *names: Names of the resources to delete. At least one is required —
-            an unqualified ``kubectl delete <kind>`` is a no-op kubectl itself
-            rejects, and a caller reaching for ``--all`` should have to spell
-            that decision out somewhere more visible than an empty argument
-            list.
+        resource: Resource kind, e.g. ``"namespace"``.
+        *names: Names to delete; at least one is required (no implicit ``--all``).
         namespace: Optional namespace (``-n``).
-        ignore_not_found: Pass ``--ignore-not-found``. On by default because
-            the callers are teardown paths, where "already gone" is success,
-            not an error to surface.
-        wait: When False, pass ``--wait=false`` so the call returns as soon as
-            the deletion is accepted rather than once finalizers complete.
+        ignore_not_found: Pass ``--ignore-not-found`` (on by default: teardown treats
+            "already gone" as success).
+        wait: When False, pass ``--wait=false`` and return once the deletion is accepted.
         timeout: Optional subprocess timeout in seconds for the whole call.
         kubeconfig: Kubeconfig path or context-like object.
         context: Optional kubectl context to pin the call to (``--context``).
@@ -407,9 +400,8 @@ def label(
 ) -> CompletedProcess:
     """Set or remove labels on one resource via ``kubectl label``.
 
-    A ``None`` value renders as ``key-`` — kubectl's "remove this label",
-    a no-op when the label is absent. Without ``overwrite`` kubectl refuses
-    to change a label that already has a different value.
+    A ``None`` value renders as ``key-`` (kubectl's "remove this label"). Without
+    ``overwrite`` kubectl refuses to change a label that already has a different value.
 
     Raises:
         SubprocessError: If kubectl exits non-zero or times out.
