@@ -110,6 +110,9 @@ _ORDINARY_POD = json.dumps(
 
 _METADATA_URL = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 
+# Bounds every host-side kubectl/curl call so a stalled apiserver cannot outlast teardown.
+_HOST_CMD_TIMEOUT_SEC = 120
+
 # A namespace carrying the addon manager's label and absent from the exempt
 # NAME list, created host-side so the by-label binding has something only it
 # can match. The agent cannot build this itself: ``bench-agent-namespace-guard``
@@ -165,27 +168,23 @@ def _running_pod_in_kube_system(context: str) -> str | None:
         context: kubectl context to query.
 
     Returns:
-        A pod name, or ``None`` when the namespace has no running pod — a
-        vcluster's virtual ``kube-system`` may have none, and there is nothing
-        to prove there.
+        A pod name; ``None`` when the namespace has no running pod (a vcluster's
+        virtual ``kube-system`` may have none); ``""`` when the query itself failed,
+        which the caller counts as a setup failure rather than a skip.
     """
-    completed = subprocess.run(
-        [
-            "kubectl",
-            "--context",
-            context,
-            "get",
-            "pods",
-            "-n",
-            "kube-system",
-            "--field-selector=status.phase=Running",
-            "-o",
-            "jsonpath={.items[0].metadata.name}",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    completed = _kubectl(
+        context,
+        "get",
+        "pods",
+        "-n",
+        "kube-system",
+        "--field-selector=status.phase=Running",
+        "-o",
+        "jsonpath={.items[0].metadata.name}",
     )
+    if completed.returncode != 0:
+        print(f"    FAIL setup:exec-target ({completed.stderr.strip()})")
+        return ""
     return completed.stdout.strip() or None
 
 
@@ -214,7 +213,11 @@ def _ensure_managed_namespace(context: str) -> bool:
 
     def kubectl(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["kubectl", "--context", context, *args], capture_output=True, text=True, check=False
+            ["kubectl", "--context", context, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HOST_CMD_TIMEOUT_SEC,
         )
 
     for _ in range(4):
@@ -248,7 +251,11 @@ def _ensure_managed_namespace(context: str) -> bool:
 def _kubectl(context: str, *args: str) -> subprocess.CompletedProcess[str]:
     """Run a host-side kubectl pinned to ``context``, never raising."""
     return subprocess.run(
-        ["kubectl", "--context", context, *args], capture_output=True, text=True, check=False
+        ["kubectl", "--context", context, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_HOST_CMD_TIMEOUT_SEC,
     )
 
 
@@ -702,6 +709,7 @@ def _check_policies(context: str) -> list[str]:
             capture_output=True,
             text=True,
             check=False,
+            timeout=_HOST_CMD_TIMEOUT_SEC,
         )
         if completed.returncode != 0:
             problems.append(f"{name}: not present ({completed.stderr.strip()})")
@@ -729,9 +737,10 @@ def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) 
     Returns:
         A problem line, or ``""`` when the token was correctly rejected.
     """
-    import yaml  # local: only this check needs it
+    from ruamel.yaml import YAML  # local: only this check needs it
 
-    token = yaml.safe_load(kubeconfig.read_text())["users"][0]["user"].get("token")
+    loaded = YAML(typ="safe").load(kubeconfig.read_text())
+    token = loaded["users"][0]["user"].get("token")
     if not token:
         return "the agent kubeconfig carries no token -- it fell back to a certificate"
     completed = subprocess.run(
@@ -749,6 +758,7 @@ def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) 
         capture_output=True,
         text=True,
         check=False,
+        timeout=_HOST_CMD_TIMEOUT_SEC,
     )
     code = completed.stdout.strip()
     if code in {"401", "403"}:
@@ -879,59 +889,66 @@ def main() -> int:
             print("    FAIL setup:legacy-pods (the shell guard stays untested)")
             legacy_setup = None
 
-        print(f"==> provisioning the agent credential against {context}")
-        kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
-        print(f"    kubeconfig: {kubeconfig}")
-
-        print("==> checking the admission policies compiled")
-        problems = _check_policies(context)
-        for line in problems:
-            print(f"    FAIL {line}")
-
-        executor = SandboxExecutor(
-            SandboxSpec(image=args.image, network=plan, workspace=workspace, kubeconfig=kubeconfig)
-        )
-
-        exec_target = _running_pod_in_kube_system(context)
-        if not exec_target:
-            print("    NOTE: no running kube-system pod; skipping the exec probe")
-
-        failures = list(problems)
+        failures: list[str] = []
         if managed_setup is None:
             failures.append("setup:managed-namespace")
         if legacy_setup is None:
             failures.append("setup:legacy-pods")
-        for probe in _probes(
-            "/workspace/probe-hostpath.yaml", exec_target, managed_setup, legacy_setup
-        ):
-            passed, detail = _run_probe(executor, probe)
-            verdict = "PASS" if passed else "FAIL"
-            print(f"\n==> [{verdict}] {probe.name}")
-            print(f"    why: {probe.why}")
-            for line in detail.splitlines()[:12]:
-                print(f"    | {line}")
-            if not passed:
-                failures.append(probe.name)
 
-        if args.host_apiserver:
-            print("\n==> replaying the agent token against the host apiserver")
-            problem = _check_token_is_useless_against_host(kubeconfig, args.host_apiserver)
-            print(f"    {problem or 'PASS: rejected, as it must be'}")
-            if problem:
-                failures.append("vcluster:token-replay")
+        # One finally from the first cluster write on: a raising probe must still reach cleanup.
+        try:
+            print(f"==> provisioning the agent credential against {context}")
+            kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
+            print(f"    kubeconfig: {kubeconfig}")
 
-        # Always, even under --keep. If the exempt-namespace probes FAILED then
-        # the escape worked, and what they left behind is a privileged
-        # container in kube-system. That is not something to leave for
-        # inspection.
-        for kind, name in (
-            ("pod", "bench-probe-exempt"),
-            ("deployment", "bench-probe-exempt-deploy"),
-        ):
-            subprocess.run(
-                [
-                    "kubectl",
-                    "--context",
+            print("==> checking the admission policies compiled")
+            problems = _check_policies(context)
+            for line in problems:
+                print(f"    FAIL {line}")
+            failures.extend(problems)
+
+            executor = SandboxExecutor(
+                SandboxSpec(
+                    image=args.image, network=plan, workspace=workspace, kubeconfig=kubeconfig
+                )
+            )
+
+            exec_target = _running_pod_in_kube_system(context)
+            if exec_target == "":
+                # A failed query is not an empty namespace: an untested escape must not read green.
+                failures.append("setup:exec-target")
+                exec_target = None
+            elif exec_target is None:
+                print("    NOTE: no running kube-system pod; skipping the exec probe")
+
+            for probe in _probes(
+                "/workspace/probe-hostpath.yaml", exec_target, managed_setup, legacy_setup
+            ):
+                passed, detail = _run_probe(executor, probe)
+                verdict = "PASS" if passed else "FAIL"
+                print(f"\n==> [{verdict}] {probe.name}")
+                print(f"    why: {probe.why}")
+                for line in detail.splitlines()[:12]:
+                    print(f"    | {line}")
+                if not passed:
+                    failures.append(probe.name)
+
+            if args.host_apiserver:
+                print("\n==> replaying the agent token against the host apiserver")
+                problem = _check_token_is_useless_against_host(kubeconfig, args.host_apiserver)
+                print(f"    {problem or 'PASS: rejected, as it must be'}")
+                if problem:
+                    failures.append("vcluster:token-replay")
+        finally:
+            # Always, even under --keep. If the exempt-namespace probes FAILED
+            # then the escape worked, and what they left behind is a
+            # privileged container in kube-system. That is not something to
+            # leave for inspection.
+            for kind, name in (
+                ("pod", "bench-probe-exempt"),
+                ("deployment", "bench-probe-exempt-deploy"),
+            ):
+                _kubectl(
                     context,
                     "delete",
                     kind,
@@ -940,74 +957,65 @@ def main() -> int:
                     "kube-system",
                     "--ignore-not-found",
                     "--wait=false",
-                ],
-                capture_output=True,
-                check=False,
+                )
+
+            # Also unconditional: this namespace holds a privileged pod that the
+            # probe itself put there, and leaving it for inspection would leave
+            # the escape route open on a cluster the next run reuses.
+            _kubectl(
+                context,
+                "delete",
+                "namespace",
+                _LEGACY_NAMESPACE,
+                "--ignore-not-found",
+                "--wait=false",
             )
 
-        # Also unconditional: this namespace holds a privileged pod that the
-        # probe itself put there, and leaving it for inspection would leave the
-        # escape route open on a cluster the next run reuses.
-        _kubectl(
-            context,
-            "delete",
-            "namespace",
-            _LEGACY_NAMESPACE,
-            "--ignore-not-found",
-            "--wait=false",
-        )
-
-        if not args.keep:
-            for namespace in ("bench-probe-ok", _MANAGED_NAMESPACE):
-                subprocess.run(
-                    [
-                        "kubectl",
-                        "--context",
+            if not args.keep:
+                for namespace in ("bench-probe-ok", _MANAGED_NAMESPACE):
+                    _kubectl(
                         context,
                         "delete",
                         "namespace",
                         namespace,
                         "--ignore-not-found",
                         "--wait=false",
-                    ],
-                    capture_output=True,
-                    check=False,
-                )
+                    )
 
-        # The boundary objects follow --keep the same way the namespaces do:
-        # kept for inspection on request, removed otherwise — and their
-        # removal is itself a probe. Teardown is a correctness requirement on
-        # reused clusters (the pod-security policy is not username-scoped, so
-        # a survivor denies the OPERATOR too), so a teardown that strands an
-        # object, or a policy that outlives it, fails the suite like any
-        # escape would.
-        if args.keep:
-            print(
-                "\n==> --keep: the agent credential, PSA labels and admission policies "
-                "REMAIN on this cluster. The surviving pod-security policy denies the "
-                "operator's own privileged workloads — tear down before the next run "
-                "(see teardown_agent_credentials, or the known-issues recovery)."
-            )
-        else:
-            print("\n==> tearing down the agent credential and admission policies")
-            if not creds.teardown_agent_credentials(context):
-                print("    FAIL teardown:residue (teardown reported leftovers)")
-                failures.append("teardown:residue")
-            leftover = _kubectl(
-                context,
-                "get",
-                "validatingadmissionpolicies.admissionregistration.k8s.io",
-                "-o",
-                "name",
-            )
-            stranded = [
-                line for line in (leftover.stdout or "").splitlines() if "bench-agent" in line
-            ]
-            if stranded:
-                print(f"    FAIL teardown:policies-survived ({', '.join(stranded)})")
-                failures.append("teardown:policies-survived")
+            # The boundary objects follow --keep the same way the namespaces
+            # do: kept for inspection on request, removed otherwise — and their
+            # removal is itself a probe. Teardown is a correctness requirement
+            # on reused clusters (the pod-security policy is not
+            # username-scoped, so a survivor denies the OPERATOR too), so a
+            # teardown that strands an object, or a policy that outlives it,
+            # fails the suite like any escape would.
+            if args.keep:
+                print(
+                    "\n==> --keep: the agent credential, PSA labels and admission policies "
+                    "REMAIN on this cluster. The surviving pod-security policy denies the "
+                    "operator's own privileged workloads — tear down before the next run "
+                    "(see teardown_agent_credentials, or the known-issues recovery)."
+                )
             else:
-                print("    PASS: no bench-agent policies remain")
+                print("\n==> tearing down the agent credential and admission policies")
+                if not creds.teardown_agent_credentials(context):
+                    print("    FAIL teardown:residue (teardown reported leftovers)")
+                    failures.append("teardown:residue")
+                leftover = _kubectl(
+                    context,
+                    "get",
+                    "validatingadmissionpolicies.admissionregistration.k8s.io",
+                    "-o",
+                    "name",
+                )
+                stranded = [
+                    line for line in (leftover.stdout or "").splitlines() if "bench-agent" in line
+                ]
+                if stranded:
+                    print(f"    FAIL teardown:policies-survived ({', '.join(stranded)})")
+                    failures.append("teardown:policies-survived")
+                else:
+                    print("    PASS: no bench-agent policies remain")
 
     print("\n" + "=" * 60)
     if failures:
