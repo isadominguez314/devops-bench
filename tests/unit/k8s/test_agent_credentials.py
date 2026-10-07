@@ -1382,6 +1382,67 @@ def test_teardown_survives_an_unlistable_cluster(monkeypatch: pytest.MonkeyPatch
     assert creds.teardown_agent_credentials("kind-c1") is False
 
 
+def test_teardown_survives_a_listing_that_is_not_an_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid JSON of the wrong shape raises AttributeError, which must not escape either."""
+    calls = _patch_kubectl(monkeypatch)
+    real = kubectl.run
+
+    def list_listing(argv: list[str], **kwargs: Any) -> Any:
+        if "get" in argv and "namespaces" in argv:
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", list_listing)
+
+    assert creds.teardown_agent_credentials("kind-c1") is False
+    assert _delete_kinds(calls)[-1] == "namespace"
+
+
+def test_teardown_counts_an_unserved_kind_as_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cluster without the policy API has no policies; that is clean, not residue."""
+    _patch_kubectl(monkeypatch)
+    real = kubectl.run
+
+    def no_policy_kinds(argv: list[str], **kwargs: Any) -> Any:
+        if "delete" in argv and argv[argv.index("delete") + 1] in (
+            creds._POLICY_KIND,
+            creds._POLICY_BINDING_KIND,
+        ):
+            raise SubprocessError(
+                argv, 1, stderr='error: the server doesn\'t have a resource type "x"'
+            )
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", no_policy_kinds)
+
+    assert creds.teardown_agent_credentials("kind-c1") is True
+
+
+def test_provisioning_cleans_up_after_an_unexpected_error_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pod listing runs after the policies land; a non-JSON reply must still trigger cleanup."""
+    calls = _patch_kubectl(monkeypatch)
+    real = kubectl.run
+
+    def garbage_pods(argv: list[str], **kwargs: Any) -> Any:
+        if "get" in argv and argv[argv.index("get") + 1] == "pods":
+            return SimpleNamespace(returncode=0, stdout="not json", stderr="")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", garbage_pods)
+
+    with pytest.raises(ValueError):
+        creds.provision_agent_credentials(_PINNED, tmp_path, token_ttl_sec=1500)
+
+    assert any(_applies(argv, "bench-agent-pod-security.yaml") for argv in calls)
+    kinds = _delete_kinds(calls)
+    assert kinds[0] == creds._POLICY_BINDING_KIND
+    assert kinds[-1] == "namespace"
+
+
 def test_failed_provisioning_cleans_up_its_partial_writes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

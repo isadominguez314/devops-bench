@@ -1232,7 +1232,10 @@ class DefaultEvalHarness(Harness):
         except Exception:
             # Provisioned, but no completed spec will carry the objects to the run-end teardown.
             if with_cluster:
-                agent_credentials.teardown_agent_credentials(plan.kubectl_context)
+                try:
+                    agent_credentials.teardown_agent_credentials(plan.kubectl_context)
+                except Exception:  # noqa: BLE001 - the original error must win
+                    _log.exception("sandbox credential teardown failed; continuing")
             raise
 
     def _inventory_sandbox_home(
