@@ -301,6 +301,11 @@ matrix_dispatch() {
       if [ -n "${BENCH_SANDBOX_IMAGE:-}" ]; then
         echo "export BENCH_SANDBOX_IMAGE='${BENCH_SANDBOX_IMAGE}'"
       fi
+      # Same reasoning: without the fixture path the runner sandboxes every
+      # fixture-dependent task without its fixture and scores it anyway.
+      if [ -n "${BENCH_AGENT_FIXTURES:-}" ]; then
+        echo "export BENCH_AGENT_FIXTURES='${BENCH_AGENT_FIXTURES}'"
+      fi
     fi
     echo 'run_one() {'
     echo '  local rid="$1" task="$2" kvs="$3" arm="$4" kv rc rdir'

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, NoReturn
 
 import pytest
 import yaml
@@ -88,7 +89,18 @@ def _patch_kubectl(
             # Read off the verb, not a fixed index: pinned calls put context flags before it.
             resource = argv[argv.index("get") + 1]
             if resource == "namespaces":
-                return SimpleNamespace(returncode=0, stdout=json.dumps(namespaces), stderr="")
+                listing = namespaces
+                if "-l" in argv:
+                    # Serve the selector the way the apiserver would: existence of the key.
+                    selector = argv[argv.index("-l") + 1]
+                    listing = {
+                        "items": [
+                            ns
+                            for ns in namespaces.get("items", [])
+                            if selector in (ns.get("metadata", {}).get("labels") or {})
+                        ]
+                    }
+                return SimpleNamespace(returncode=0, stdout=json.dumps(listing), stderr="")
             if resource == "pods":
                 return SimpleNamespace(returncode=0, stdout=json.dumps(pods), stderr="")
             if resource == creds._POLICY_API_RESOURCE:
@@ -785,6 +797,41 @@ def test_enforce_pod_security_labels_the_harness_namespace_too(
     assert labelled[0][:4] == ["kubectl", "label", "namespace", creds.AGENT_NAMESPACE]
 
 
+def test_enforce_pod_security_leaves_a_warn_or_audit_only_level_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An operator's warn/audit setting with no enforce would otherwise be overwritten
+    to baseline, marked, and stripped bare by teardown — gone for good."""
+    calls = _patch_kubectl(
+        monkeypatch,
+        namespaces={
+            "items": [
+                _ns("payments", **{"pod-security.kubernetes.io/warn": "restricted"}),
+                _ns("audited", **{"pod-security.kubernetes.io/audit": "restricted"}),
+                _ns("plain"),
+            ]
+        },
+    )
+
+    creds.enforce_pod_security(tmp_path)
+
+    labelled = [c for c in calls if "label" in c]
+    assert [c[3] for c in labelled] == ["plain"]
+
+
+def test_enforce_pod_security_warns_when_the_sandbox_namespace_already_exists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The objects have fixed names, so a live run on the same cluster loses its
+    identity to this run's teardown; the operator is told before the first write."""
+    _patch_kubectl(monkeypatch, namespaces={"items": [_ns(creds.AGENT_NAMESPACE)]})
+
+    with caplog.at_level("WARNING"):
+        creds.enforce_pod_security(tmp_path)
+
+    assert any("must not overlap" in r.message for r in caplog.records)
+
+
 def test_enforce_pod_security_leaves_a_declared_level_alone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1126,7 +1173,7 @@ def test_every_provisioning_and_teardown_kubectl_call_is_bounded(
     inner = kubectl.run
     timeouts: list[tuple[list[str], float | None]] = []
 
-    def recording_run(argv, **kwargs):
+    def recording_run(argv: list[str], **kwargs: Any) -> Any:
         timeouts.append((list(argv), kwargs.get("timeout")))
         return inner(argv, **kwargs)
 
@@ -1139,20 +1186,19 @@ def test_every_provisioning_and_teardown_kubectl_call_is_bounded(
     assert timeouts and unbounded == []
 
 
-def test_teardown_skips_an_unpinned_cluster_unless_told_to(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A sandboxed task with no cluster (no-op deployer) provisions nothing, so
-    its run-end teardown must not fire deletes at the operator's ambient
-    current-context; with the ambient opt-in the operator asked for exactly that."""
-    monkeypatch.delenv(creds.ALLOW_AMBIENT_ENV, raising=False)
+def test_teardown_always_skips_an_unpinned_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provisioning pins before its first write — the ambient opt-in included,
+    via pin_plan_context — so an unpinned context only ever means the no-cluster
+    path, which wrote nothing. A stale ALLOW_AMBIENT export must not turn that
+    into cluster-wide deletes on whatever current-context points at."""
     calls = _patch_kubectl(monkeypatch)
-    assert creds.teardown_agent_credentials(None) is True
-    assert calls == []
-
-    monkeypatch.setenv(creds.ALLOW_AMBIENT_ENV, "1")
-    assert creds.teardown_agent_credentials(None) is True
-    assert any("delete" in c for c in calls)
+    for ambient in (None, "1"):
+        if ambient is None:
+            monkeypatch.delenv(creds.ALLOW_AMBIENT_ENV, raising=False)
+        else:
+            monkeypatch.setenv(creds.ALLOW_AMBIENT_ENV, ambient)
+        assert creds.teardown_agent_credentials(None) is True
+        assert calls == []
 
 
 def test_provision_fails_loud_when_pod_security_cannot_be_applied(
@@ -1290,6 +1336,50 @@ def test_teardown_unlabels_only_the_namespaces_it_marked(
     for key in creds._PSA_LABEL_KEYS:
         assert f"{key}-" in labelled[0]
     assert f"{creds._PSA_MANAGED_LABEL}-" in labelled[0]
+    # Selected server-side by the marker, not by listing every namespace.
+    listed = next(argv for argv in calls if "get" in argv and "namespaces" in argv)
+    assert listed[listed.index("-l") + 1] == creds._PSA_MANAGED_LABEL
+
+
+def test_teardown_survives_a_non_json_namespace_listing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wrapper or proxy writing a non-JSON prefix on exit 0 raises JSONDecodeError
+    out of get_resource; teardown must log it, carry on with the deletes, and report
+    residue — not replace the caller's original error."""
+    calls = _patch_kubectl(monkeypatch)
+    real = kubectl.run
+
+    def garbage_listing(argv: list[str], **kwargs: Any) -> Any:
+        if "get" in argv and "namespaces" in argv:
+            calls.append(argv)
+            return SimpleNamespace(returncode=0, stdout="notice: plugin loaded\n{", stderr="")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", garbage_listing)
+
+    assert creds.teardown_agent_credentials("kind-c1") is False
+    deleted = [argv[argv.index("delete") + 1] for argv in calls if "delete" in argv]
+    assert deleted[-1] == "namespace"
+    assert "clusterrolebinding" in deleted
+
+
+def test_teardown_survives_kubectl_failing_to_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OSError (kubectl missing or unexecutable) is not a SubprocessError; it must
+    not abort the remaining deletes either."""
+    calls = _patch_kubectl(monkeypatch)
+    real = kubectl.run
+
+    def no_binary_for_bindings(argv: list[str], **kwargs: Any) -> Any:
+        if "delete" in argv and argv[argv.index("delete") + 1] == creds._POLICY_BINDING_KIND:
+            calls.append(argv)
+            raise OSError("kubectl: no such file or directory")
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(kubectl, "run", no_binary_for_bindings)
+
+    assert creds.teardown_agent_credentials("kind-c1") is False
+    deleted = [argv[argv.index("delete") + 1] for argv in calls if "delete" in argv]
+    assert deleted[0] == creds._POLICY_BINDING_KIND
+    assert deleted[-1] == "namespace"
 
 
 def test_teardown_is_best_effort_and_reports_residue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1308,7 +1398,7 @@ def test_teardown_survives_an_unlistable_cluster(monkeypatch: pytest.MonkeyPatch
     failure must not eclipse the first."""
     _patch_kubectl(monkeypatch)
 
-    def refuse_lists(argv, **kwargs):
+    def refuse_lists(argv: list[str], **kwargs: Any) -> NoReturn:
         raise SubprocessError(argv, 1, stderr="connection refused")
 
     monkeypatch.setattr(kubectl, "run", refuse_lists)

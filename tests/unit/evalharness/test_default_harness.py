@@ -1309,6 +1309,18 @@ def test_run_one_tears_down_sandbox_credentials_in_its_finally(
 
         assert record["status"] == "success"
         assert torn_down == ["kind-c1"]
+        assert "sandbox_teardown_clean" not in record
+
+        # Residue is a next-run problem on a reused cluster; it rides on the record.
+        monkeypatch.setattr(
+            harness_default.agent_credentials,
+            "teardown_agent_credentials",
+            lambda context=None: False,
+        )
+        run_dir_2 = tmp_path / "run_2"
+        run_dir_2.mkdir()
+        record, _ = harness._run_one(task, run_dir_2)  # noqa: SLF001
+        assert record["sandbox_teardown_clean"] is False
     finally:
         AGENTS._items.pop("fake-sandbox-teardown", None)  # noqa: SLF001
 
@@ -1372,6 +1384,23 @@ def test_empty_record_carries_the_task_scoped_sandboxed_flag(
 
     assert harness._empty_record(task)["sandboxed"] is False  # noqa: SLF001
     assert harness._empty_record(task, sandboxed=True)["sandboxed"] is True  # noqa: SLF001
+
+
+def test_sandbox_credential_teardown_only_runs_when_the_cluster_survives(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cluster the deployer destroys takes the sandbox objects with it; waiting
+    on finalizers first is pure latency. The reused cases are where it matters."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    survives = harness._cluster_survives  # noqa: SLF001
+
+    assert survives({"deployer": "kind"}) is False
+    assert survives({"deployer": "kind", "teardown": True}) is False
+    assert survives({"deployer": "kind", "teardown": False}) is True
+    assert survives({"deployer": "noop"}) is True
+
+    harness.no_teardown = True
+    assert survives({"deployer": "kind"}) is True
 
 
 def test_prepare_sandbox_spec_without_a_cluster_skips_the_plan_and_credential(

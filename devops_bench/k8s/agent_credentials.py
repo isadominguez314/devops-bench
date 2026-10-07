@@ -121,8 +121,8 @@ _PSA_LABEL_KEYS = (
 # label" cannot be answered from the PSA labels themselves (an operator or a
 # task may set identical values for reasons of their own), and an in-memory
 # list would not survive the crashed run whose leftovers teardown exists to
-# remove. Namespaces that already declared an ``enforce`` level are skipped by
-# the labeller, never carry the marker, and are therefore never unlabelled.
+# remove. Namespaces that already declared any pod-security level are skipped
+# by the labeller, never carry the marker, and are therefore never unlabelled.
 _PSA_MANAGED_LABEL = "devops-bench.io/psa-managed"
 
 # The agent's own apiserver username, as RBAC and admission see it.
@@ -541,7 +541,7 @@ def enforce_pod_security(
     """Apply the namespace guards and, unless ``privileged``, the pod policy and PSA labels.
 
     The guards always apply: they govern where the agent may write, not what its pods
-    may do. Namespaces already declaring an ``enforce`` level are left alone. Pre-existing
+    may do. Namespaces already declaring any pod-security level are left alone. Pre-existing
     non-conformant pods are handled by :func:`_deny_shell_into_nonconformant_pods`.
 
     Raises:
@@ -551,6 +551,7 @@ def enforce_pod_security(
     _require_policy_api(context)
     # Listed once; the exempt set, the shell-guard scan and the labeller all read it.
     namespaces = kubectl.get_resource("namespaces", context=context, timeout=60).get("items", [])
+    _warn_if_sandbox_already_present(namespaces)
 
     guards = work_dir / "bench-agent-namespace-guards.yaml"
     guards.write_text(_render_namespace_guard(pod_security) + _EXEMPT_NAMESPACE_GUARD_MANIFEST)
@@ -686,21 +687,36 @@ def _apply_shell_guard(work_dir: Path, pods: list[str], context: str | None) -> 
 
 
 def _labellable_namespaces(namespaces: list[dict]) -> list[str]:
-    """Pick namespaces to label, skipping system, cluster-managed, and already-enforcing ones."""
+    """Pick namespaces to label, skipping system, cluster-managed, and already-levelled ones."""
     names = []
     for item in namespaces:
         meta = item.get("metadata", {})
         name = meta.get("name", "")
         if not name or name in _LABEL_EXEMPT_NAMESPACES:
             continue
-        if _ADDON_MANAGER_LABEL in meta.get("labels", {}):
+        labels = meta.get("labels") or {}
+        if _ADDON_MANAGER_LABEL in labels:
             _log.debug("namespace %s is the cluster's own to manage; leaving it", name)
             continue
-        if meta.get("labels", {}).get(_PSA_ENFORCE_LABEL):
+        # Any level, not just enforce: a warn/audit-only namespace would otherwise be
+        # overwritten here and stripped bare by teardown, losing the operator's setting.
+        if any(labels.get(key) for key in _PSA_LABEL_KEYS):
             _log.debug("namespace %s already declares a pod-security level; leaving it", name)
             continue
         names.append(name)
     return names
+
+
+def _warn_if_sandbox_already_present(namespaces: list[dict]) -> None:
+    """Warn when the sandbox namespace already exists: residue, or a live run about to be broken."""
+    if any(item.get("metadata", {}).get("name") == AGENT_NAMESPACE for item in namespaces):
+        _log.warning(
+            "%s already exists on this cluster: a previous run left residue, or another "
+            "sandboxed run is live. The sandbox objects have fixed names, so this run's "
+            "end-of-task teardown removes that run's identity and pod-security policy too "
+            "— sandboxed runs sharing a cluster must not overlap",
+            AGENT_NAMESPACE,
+        )
 
 
 def mint_agent_token(ttl_sec: int, context: str | None = None) -> str:
@@ -896,12 +912,14 @@ def teardown_agent_credentials(context: str | None = None) -> bool:
     Returns:
         True when every object is confirmed removed (already-absent counts —
         the deletes ignore not-found); False when any step failed and the
-        cluster may still carry sandbox residue. An unpinned context without
-        :data:`ALLOW_AMBIENT_ENV` is skipped as clean: nothing was provisioned
-        there, and the deletes must not land on the operator's ambient cluster.
+        cluster may still carry sandbox residue. An unpinned context is always
+        skipped as clean: provisioning pins before its first write (see
+        :func:`pin_plan_context`, which snapshots even the ambient opt-in), so
+        ``None`` only ever reaches here from the no-cluster path, which wrote
+        nothing — and the deletes must never land on the operator's ambient cluster.
     """
-    if context is None and not get_bool(ALLOW_AMBIENT_ENV, False):
-        _log.info("sandbox teardown: no cluster pin and no ambient opt-in; nothing to remove")
+    if context is None:
+        _log.info("sandbox teardown: no cluster pin, so nothing was provisioned; nothing to remove")
         return True
     clean = True
 
@@ -909,7 +927,7 @@ def teardown_agent_credentials(context: str | None = None) -> bool:
         nonlocal clean
         try:
             kubectl.delete(kind, *names, context=context, timeout=timeout)
-        except SubprocessError as exc:
+        except (SubprocessError, OSError) as exc:
             clean = False
             _log.warning("teardown could not delete %s %s: %s", kind, ", ".join(names), exc)
 
@@ -943,7 +961,7 @@ def _remove_managed_pod_security_labels(context: str | None) -> bool:
     Only namespaces carrying :data:`_PSA_MANAGED_LABEL` are touched. A PSA
     label anyone else set — a task's own ``restricted`` assertion, an
     operator's standing policy — never carries the marker (the labeller skips
-    namespaces that already declare an ``enforce`` level) and is therefore
+    namespaces that already declare any pod-security level) and is therefore
     never removed here.
 
     Args:
@@ -954,22 +972,25 @@ def _remove_managed_pod_security_labels(context: str | None) -> bool:
         counts as clean.
     """
     try:
-        listing = kubectl.get_resource("namespaces", context=context, timeout=60)
-    except SubprocessError as exc:
+        # Server-side selection: the marker is the exact selector, and the full
+        # listing is the one call most likely to time out on a large cluster.
+        listing = kubectl.get_resource(
+            "namespaces", selector=_PSA_MANAGED_LABEL, context=context, timeout=60
+        )
+    except (SubprocessError, OSError, ValueError) as exc:  # ValueError: non-JSON stdout
         _log.warning("teardown could not list namespaces to remove PSA labels: %s", exc)
         return False
     removals: dict[str, str | None] = dict.fromkeys((*_PSA_LABEL_KEYS, _PSA_MANAGED_LABEL))
     ok = True
     for item in listing.get("items", []):
-        meta = item.get("metadata", {})
-        name = meta.get("name", "")
-        if not name or _PSA_MANAGED_LABEL not in (meta.get("labels") or {}):
+        name = item.get("metadata", {}).get("name", "")
+        if not name:
             continue
         try:
             kubectl.label(
                 "namespace", name, removals, context=context, timeout=_KUBECTL_TIMEOUT_SEC
             )
-        except SubprocessError as exc:
+        except (SubprocessError, OSError) as exc:
             ok = False
             _log.warning("teardown could not remove PSA labels from namespace %s: %s", name, exc)
     return ok

@@ -1160,21 +1160,25 @@ class DefaultEvalHarness(Harness):
             if safeguard_monitor is not None:
                 # Idempotent; covers any path that skipped the calls above.
                 safeguard_monitor.stop()
-            if completed_spec is not None:
-                # Before the infra teardown, while there is still a cluster to
-                # accept the deletes. On a cluster the deployer is about to
-                # destroy this is redundant but cheap; on a REUSED one
-                # (BENCH_NO_TEARDOWN, a kind dev loop, the vcluster host) it
-                # is correctness: the pod-security policy is not
-                # username-scoped, so left behind it denies the OPERATOR's own
-                # privileged workloads on the next run. Teardown never raises
-                # by design; the guard is for the finally block's sake.
+            if completed_spec is not None and self._cluster_survives(infra_config):
+                # Only on a cluster that outlives the run (BENCH_NO_TEARDOWN, a
+                # kind dev loop, the no-op deployer): there it is correctness —
+                # the pod-security policy is not username-scoped, so left behind
+                # it denies the OPERATOR's own privileged workloads on the next
+                # run. A cluster the deployer destroys takes the objects with it,
+                # and waiting on finalizers first is pure latency (minutes on a
+                # stalled apiserver). Teardown never raises by design; the guard
+                # is for the finally block's sake.
                 try:
-                    agent_credentials.teardown_agent_credentials(
+                    clean = agent_credentials.teardown_agent_credentials(
                         completed_spec.network.kubectl_context
                     )
                 except Exception:
                     _log.exception("sandbox credential teardown failed; continuing")
+                    clean = False
+                if not clean and result is not None:
+                    # Residue is a next-run problem; surface it where results are read.
+                    result["sandbox_teardown_clean"] = False
             if deployer is not None:
                 self._teardown(deployer, infra_config, task.name)
             if workspace_path is not None:
@@ -1462,6 +1466,12 @@ class DefaultEvalHarness(Harness):
             # get_reports() returned a private deep copy, so stamping it is safe.
             chaos_report["status"] = "timed_out"
         return chaos_report, perf_report
+
+    def _cluster_survives(self, infra_config: dict[str, Any]) -> bool:
+        """Whether the run's cluster outlives the run, so sandbox objects need removing by hand."""
+        if infra_config.get("deployer") == "noop":
+            return True
+        return self.no_teardown or not infra_config.get("teardown", True)
 
     def _teardown(self, deployer: Any, infra_config: dict[str, Any], name: str) -> None:
         """Tear down infrastructure unless disabled by config or env.
