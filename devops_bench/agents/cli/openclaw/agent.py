@@ -206,6 +206,34 @@ def _oc_model_id(config: AgentConfig) -> str:
     return f"{resolve_provider(config.provider).oc_provider}/{model}"
 
 
+def _effective_provider(config: AgentConfig) -> str | None:
+    """The provider the run's auth follows: a full ``provider/model`` id wins over ``config.provider``.
+
+    oc routes the call by the id's provider segment, so the key vars, the location,
+    the emulator and the auth profile must follow the same one. Both set and
+    disagreeing is a misconfiguration and raises rather than splitting the run.
+
+    Raises:
+        ConfigError: ``config.provider`` names a different provider than the model id.
+    """
+    model = (config.model or "").strip()
+    if "/" not in model:
+        return config.provider
+    wire = model.partition("/")[0]
+    try:
+        wire_provider = resolve_provider(wire, default=wire).oc_provider
+    except ConfigError:
+        return (
+            config.provider
+        )  # unknown wire: oc validates it; auth follows the configured provider
+    if config.provider and resolve_provider(config.provider).oc_provider != wire_provider:
+        raise ConfigError(
+            f"model {model!r} names provider {wire_provider!r} but the configured provider is "
+            f"{config.provider!r}; set one of them or make them agree"
+        )
+    return wire
+
+
 def _build_model_override(config: AgentConfig) -> dict:
     """Register a catalog entry for a model openclaw doesn't ship by default.
 
@@ -276,10 +304,10 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     sandboxed or not. The caller adds the ``OPENCLAW_*`` paths.
 
     Raises:
-        ConfigError: If ``config.provider`` is not a known provider.
+        ConfigError: An unknown provider, or one that disagrees with the model id.
     """
     # Resolve unconditionally so an unknown provider fails loud even keyless.
-    spec = resolve_provider(config.provider)
+    spec = resolve_provider(_effective_provider(config))
     overlay: dict[str, str] = {
         var: os.environ[var] for var in spec.api_key_envs if os.environ.get(var)
     }
@@ -318,7 +346,7 @@ def _sandbox_provider_env(config: AgentConfig, state_dir: Path) -> dict[str, str
         raise SandboxError("_sandbox_provider_env needs the task-completed sandbox spec")
     register = _write_node_fetch_shim(state_dir) / "register.mjs"
     overlay["NODE_OPTIONS"] = f"--import={sandbox.container_path(sandbox_spec.workspace, register)}"
-    spec = resolve_provider(config.provider)
+    spec = resolve_provider(_effective_provider(config))
     if spec.backend == "vertex" and not _vertex_key_present(config, spec):
         overlay.update(sandbox_credential_env(spec, project=vertex_project()))
     if spec.oc_provider == "anthropic-vertex":
@@ -348,7 +376,7 @@ def _vertex_auth_profile_provider(config: AgentConfig) -> str | None:
     A real key, configured or in the environment, gets no profile: it would be shadowed.
     """
     try:
-        spec = resolve_provider(config.provider)
+        spec = resolve_provider(_effective_provider(config))
     except ConfigError:
         return None
     if spec.backend != "vertex" or _vertex_key_present(config, spec):

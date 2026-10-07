@@ -215,6 +215,37 @@ def test_oc_model_id_passes_through_unknown_full_id_wire() -> None:
     assert _oc_model_id(AgentConfig(model="mystery/some-model")) == "mystery/some-model"
 
 
+def test_effective_provider_follows_a_full_model_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no provider configured, every auth decision follows the id's provider segment."""
+    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
+    cfg = AgentConfig(model="google-vertex/gemini-3.8-flash")
+    assert oc_mod._effective_provider(cfg) == "google-vertex"
+    assert "GOOGLE_CLOUD_LOCATION" in _build_env(cfg)
+    assert "paste-api-key --provider google-vertex" in oc_mod._build_local_command(
+        cfg, "hi", "operator", "oc"
+    )
+    anthropic = _build_env(AgentConfig(model="anthropic/claude-opus-4-7", api_key="k"))
+    assert anthropic == {"ANTHROPIC_API_KEY": "k"}
+
+
+def test_effective_provider_accepts_an_agreeing_alias() -> None:
+    cfg = AgentConfig(model="gemini/gemini-2.5-pro", provider="google")
+    assert oc_mod._effective_provider(cfg) == "gemini"
+    assert "GEMINI_API_KEY" not in _build_env(cfg)
+
+
+def test_effective_provider_rejects_a_disagreeing_provider() -> None:
+    """Splitting the run between two providers fails loud instead of half-configuring it."""
+    with pytest.raises(ConfigError, match="google-vertex.*google"):
+        _build_env(AgentConfig(model="google-vertex/gemini-3.8-flash", provider="google"))
+
+
+def test_effective_provider_leaves_an_unknown_wire_to_the_configured_provider() -> None:
+    cfg = AgentConfig(model="mystery/some-model", provider="google", api_key="k")
+    assert oc_mod._effective_provider(cfg) == "google"
+    assert _build_env(cfg)["GEMINI_API_KEY"] == "k"
+
+
 def test_oc_model_id_returns_empty_when_no_model() -> None:
     assert _oc_model_id(AgentConfig()) == ""
 
