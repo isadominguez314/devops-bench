@@ -39,7 +39,7 @@ class _DummyAgent(AgentHarness):
         raise NotImplementedError
 
 
-def _complete_spec(tmp_path: Path, **overrides) -> sandbox.SandboxSpec:
+def _complete_spec(tmp_path: Path, **overrides: object) -> sandbox.SandboxSpec:
     """A fully-populated spec rooted in ``tmp_path``."""
     workspace = tmp_path / "workspace-abc123"
     workspace.mkdir(exist_ok=True)
@@ -114,7 +114,7 @@ def test_image_digest_prefers_the_repo_digest(monkeypatch: pytest.MonkeyPatch) -
         }
     ]
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         assert argv == ["docker", "image", "inspect", "agent-sandbox:v1"]
         return SimpleNamespace(returncode=0, stdout=json.dumps(inspected), stderr="")
 
@@ -125,7 +125,7 @@ def test_image_digest_prefers_the_repo_digest(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_image_digest_falls_back_to_the_local_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(
             returncode=0, stdout=json.dumps([{"Id": "sha256:aaaa", "RepoDigests": []}]), stderr=""
         )
@@ -139,13 +139,13 @@ def test_image_digest_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     docker, malformed output all yield None (and the manifest records the
     absence honestly)."""
 
-    def unknown_image(argv, **kwargs):
+    def unknown_image(argv: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=1, stdout="", stderr="No such image")
 
     monkeypatch.setattr(sandbox, "run", unknown_image)
     assert sandbox.image_digest("nope:latest") is None
 
-    def malformed(argv, **kwargs):
+    def malformed(argv: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(returncode=0, stdout="not-json", stderr="")
 
     monkeypatch.setattr(sandbox, "run", malformed)
