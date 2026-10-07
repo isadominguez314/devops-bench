@@ -587,6 +587,11 @@ _MISSING_RESOURCE_MARKERS = (
 )
 
 
+def _is_missing_resource(exc: SubprocessError) -> bool:
+    """Whether kubectl failed because the apiserver serves no such resource type."""
+    return any(marker in (exc.stderr or "") for marker in _MISSING_RESOURCE_MARKERS)
+
+
 def _require_policy_api(context: str | None) -> None:
     """Refuse a cluster too old to serve the pod-security backstop at ``v1``.
 
@@ -598,7 +603,7 @@ def _require_policy_api(context: str | None) -> None:
     try:
         kubectl.get_resource(_POLICY_API_RESOURCE, context=context, timeout=60)
     except SubprocessError as exc:
-        if not any(marker in (exc.stderr or "") for marker in _MISSING_RESOURCE_MARKERS):
+        if not _is_missing_resource(exc):
             raise
         raise SandboxError(
             f"this cluster does not serve {_POLICY_API_RESOURCE} ({exc}); the sandbox's "
@@ -818,6 +823,17 @@ def provision_agent_credentials(
     """
     plan = pin_plan_context(plan)
     _preflight_render_inputs(plan)
+    try:
+        return _provision(plan, dest_dir, token_ttl_sec=token_ttl_sec, pod_security=pod_security)
+    except Exception:
+        # Any failure past the preflight may follow a cluster write; the original error still wins.
+        _log.info("provisioning failed after writing to the cluster; removing what it left")
+        teardown_agent_credentials(plan.kubectl_context)
+        raise
+
+
+def _provision(plan: NetworkPlan, dest_dir: Path, *, token_ttl_sec: int, pod_security: str) -> Path:
+    """The cluster writes of :func:`provision_agent_credentials`, whose caller cleans up on raise."""
     # One switch for both: an operator who cannot create cluster roles cannot create policies.
     allow_admin = get_bool(ALLOW_ADMIN_ENV, False)
 
@@ -826,7 +842,6 @@ def provision_agent_credentials(
     except SubprocessError as exc:
         # Caught here too, else the first cluster-scoped write makes the hatch unreachable.
         if not allow_admin:
-            _teardown_after_failed_provisioning(plan.kubectl_context)
             raise SandboxError(
                 f"could not enforce pod security for the sandboxed agent ({exc}); "
                 "refusing to run against a cluster where the privileged-pod and "
@@ -844,30 +859,19 @@ def provision_agent_credentials(
         token = mint_agent_token(token_ttl_sec, plan.kubectl_context)
     except SubprocessError as exc:
         if not allow_admin:
-            _teardown_after_failed_provisioning(plan.kubectl_context)
             raise SandboxError(
                 "could not mint a scoped ServiceAccount credential for the sandboxed "
                 f"agent ({exc}); refusing to fall back to the operator's admin "
                 f"credential — set {ALLOW_ADMIN_ENV}=1 to allow that explicitly"
             ) from exc
-        try:
-            return _render_admin_fallback_kubeconfig(plan, dest_dir)
-        except SandboxError:
-            # Policies already landed and no completed spec will carry them to the run-end teardown.
-            _teardown_after_failed_provisioning(plan.kubectl_context)
-            raise
+        return _render_admin_fallback_kubeconfig(plan, dest_dir)
     _log.info(
         "sandboxed agent will authenticate as %s/%s with a %ds token",
         AGENT_NAMESPACE,
         AGENT_SA_NAME,
         token_ttl_sec,
     )
-    try:
-        return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {json.dumps(token)}")
-    except SandboxError:
-        # Last raise site past the first cluster write.
-        _teardown_after_failed_provisioning(plan.kubectl_context)
-        raise
+    return render_agent_kubeconfig(plan, dest_dir, user_fields=f"token: {json.dumps(token)}")
 
 
 def teardown_agent_credentials(context: str | None = None) -> bool:
@@ -885,14 +889,23 @@ def teardown_agent_credentials(context: str | None = None) -> bool:
         nonlocal clean
         try:
             kubectl.delete(kind, *names, context=context, timeout=timeout)
-        except (SubprocessError, OSError) as exc:
+        except SubprocessError as exc:
+            if _is_missing_resource(exc):
+                return  # a kind the cluster does not serve has no objects to remove
             clean = False
             _log.warning("teardown could not delete %s %s: %s", kind, ", ".join(names), exc)
+        except Exception as exc:
+            clean = False
+            _log.warning("teardown could not delete %s %s: %r", kind, ", ".join(names), exc)
 
     _delete(_POLICY_BINDING_KIND, *_POLICY_BINDING_NAMES, timeout=120)
     _delete(_POLICY_KIND, *_POLICY_NAMES, timeout=120)
-    if not _remove_managed_pod_security_labels(context):
+    try:
+        if not _remove_managed_pod_security_labels(context):
+            clean = False
+    except Exception as exc:
         clean = False
+        _log.warning("teardown could not remove PSA labels: %r", exc)
     _delete("clusterrolebinding", *_CLUSTER_ROLE_BINDING_NAMES, timeout=120)
     _delete("clusterrole", *_CLUSTER_ROLE_NAMES, timeout=120)
     # The namespace carries the ServiceAccount away with it.
@@ -920,8 +933,8 @@ def _remove_managed_pod_security_labels(context: str | None) -> bool:
         listing = kubectl.get_resource(
             "namespaces", selector=_PSA_MANAGED_LABEL, context=context, timeout=60
         )
-    except (SubprocessError, OSError, ValueError) as exc:  # ValueError: non-JSON stdout
-        _log.warning("teardown could not list namespaces to remove PSA labels: %s", exc)
+    except Exception as exc:
+        _log.warning("teardown could not list namespaces to remove PSA labels: %r", exc)
         return False
     removals: dict[str, str | None] = dict.fromkeys((*_PSA_LABEL_KEYS, _PSA_MANAGED_LABEL))
     ok = True
@@ -933,16 +946,10 @@ def _remove_managed_pod_security_labels(context: str | None) -> bool:
             kubectl.label(
                 "namespace", name, removals, context=context, timeout=_KUBECTL_TIMEOUT_SEC
             )
-        except (SubprocessError, OSError) as exc:
+        except Exception as exc:
             ok = False
-            _log.warning("teardown could not remove PSA labels from namespace %s: %s", name, exc)
+            _log.warning("teardown could not remove PSA labels from namespace %s: %r", name, exc)
     return ok
-
-
-def _teardown_after_failed_provisioning(context: str | None) -> None:
-    """Remove a half-finished provisioning's writes; the caller's original error still wins."""
-    _log.info("provisioning failed after writing to the cluster; removing what it left")
-    teardown_agent_credentials(context)
 
 
 def pin_plan_context(plan: NetworkPlan) -> NetworkPlan:
