@@ -61,6 +61,7 @@ from pathlib import Path
 
 from devops_bench.agents.sandbox import SandboxExecutor, SandboxSpec, build_network_plan
 from devops_bench.core.context import ClusterInfo, NetworkPlan
+from devops_bench.core.errors import SandboxError, SubprocessError
 from devops_bench.k8s import agent_credentials as creds
 from devops_bench.providers.base import Provider
 from devops_bench.providers.gcp import GcpProvider
@@ -180,12 +181,14 @@ def _running_pod_in_kube_system(context: str) -> str | None:
         "kube-system",
         "--field-selector=status.phase=Running",
         "-o",
-        "jsonpath={.items[0].metadata.name}",
+        "jsonpath={.items[*].metadata.name}",
     )
     if completed.returncode != 0:
         print(f"    FAIL setup:exec-target ({completed.stderr.strip()})")
         return ""
-    return completed.stdout.strip() or None
+    # ``[*]`` prints nothing on an empty list; ``[0]`` would exit non-zero and read as a failed query.
+    names = completed.stdout.split()
+    return names[0] if names else None
 
 
 def _ensure_managed_namespace(context: str) -> bool:
@@ -211,31 +214,26 @@ def _ensure_managed_namespace(context: str) -> bool:
         do with the boundary.
     """
 
-    def kubectl(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["kubectl", "--context", context, *args],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_HOST_CMD_TIMEOUT_SEC,
+    for attempt in range(5):
+        phase = _kubectl(
+            context, "get", "namespace", _MANAGED_NAMESPACE, "-o", "jsonpath={.status.phase}"
         )
-
-    for _ in range(4):
-        phase = kubectl("get", "namespace", _MANAGED_NAMESPACE, "-o", "jsonpath={.status.phase}")
         if phase.returncode == 0 and phase.stdout.strip() == "Active":
             break
+        if attempt == 4:
+            # The last pass only re-reads the phase, so a create on the pass before still counts.
+            return False
         if phase.stdout.strip() == "Terminating":
             # A prune already in flight. Recreating now fails; wait it out.
             time.sleep(5)
             continue
-        created = kubectl("create", "namespace", _MANAGED_NAMESPACE)
+        created = _kubectl(context, "create", "namespace", _MANAGED_NAMESPACE)
         if created.returncode != 0 and "already exists" not in created.stderr:
             print(f"    {created.stderr.strip()}")
             time.sleep(2)
-    else:
-        return False
 
-    labelled = kubectl(
+    labelled = _kubectl(
+        context,
         "label",
         "namespace",
         _MANAGED_NAMESPACE,
@@ -250,13 +248,14 @@ def _ensure_managed_namespace(context: str) -> bool:
 
 def _kubectl(context: str, *args: str) -> subprocess.CompletedProcess[str]:
     """Run a host-side kubectl pinned to ``context``, never raising."""
-    return subprocess.run(
-        ["kubectl", "--context", context, *args],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_HOST_CMD_TIMEOUT_SEC,
-    )
+    argv = ["kubectl", "--context", context, *args]
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=_HOST_CMD_TIMEOUT_SEC
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        # A raise here would skip the teardown; a failed CompletedProcess reads as a FAIL instead.
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=str(exc))
 
 
 def _create_legacy_pods(context: str) -> bool:
@@ -330,7 +329,8 @@ def _create_legacy_pods(context: str) -> bool:
             f"pod/{name}",
             "-n",
             _LEGACY_NAMESPACE,
-            "--timeout=120s",
+            # Under the host bound, so a slow pull is a FAIL here rather than a timeout escaping.
+            f"--timeout={_HOST_CMD_TIMEOUT_SEC - 20}s",
         )
         if waited.returncode != 0:
             print(f"    {waited.stderr.strip()}")
@@ -658,7 +658,10 @@ def _run_probe(executor: SandboxExecutor, probe: Probe) -> tuple[bool, str]:
     if probe.setup and not probe.setup():
         return False, "[the probe's precondition could not be met; the boundary was never reached]"
 
-    completed = executor.run(probe.argv, check=False, timeout=120)
+    try:
+        completed = executor.run(probe.argv, check=False, timeout=120)
+    except (SandboxError, SubprocessError) as exc:
+        return False, f"[the probe could not be run to a verdict: {exc}]"
     out = ((completed.stdout or "") + (completed.stderr or "")).strip()
     denied = completed.returncode != 0
 
@@ -669,14 +672,6 @@ def _run_probe(executor: SandboxExecutor, probe: Probe) -> tuple[bool, str]:
         # binary, or an RBAC denial standing in for an admission denial.
         return False, f"[refused, but not by the expected control]\n{out}"
     return True, out
-
-
-_POLICY_NAMES = (
-    "bench-agent-pod-security",
-    "bench-agent-namespace-guard",
-    "bench-agent-exempt-namespace-guard",
-    "bench-agent-nonconformant-pod-guard",
-)
 
 
 def _check_policies(context: str) -> list[str]:
@@ -694,27 +689,16 @@ def _check_policies(context: str) -> list[str]:
         Human-readable problem lines; empty when every policy is healthy.
     """
     problems: list[str] = []
-    for name in _POLICY_NAMES:
-        completed = subprocess.run(
-            [
-                "kubectl",
-                "--context",
-                context,
-                "get",
-                "validatingadmissionpolicy",
-                name,
-                "-o",
-                "json",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_HOST_CMD_TIMEOUT_SEC,
-        )
+    for name in creds._POLICY_NAMES:
+        completed = _kubectl(context, "get", "validatingadmissionpolicy", name, "-o", "json")
         if completed.returncode != 0:
             problems.append(f"{name}: not present ({completed.stderr.strip()})")
             continue
-        status = json.loads(completed.stdout).get("status", {})
+        try:
+            status = json.loads(completed.stdout).get("status", {})
+        except (json.JSONDecodeError, AttributeError):
+            problems.append(f"{name}: unreadable status ({completed.stdout[:80]!r})")
+            continue
         for condition in status.get("typeChecking", {}).get("expressionWarnings", []):
             problems.append(f"{name}: CEL warning on {condition}")
         for condition in status.get("conditions", []):
@@ -743,23 +727,23 @@ def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) 
     token = loaded["users"][0]["user"].get("token")
     if not token:
         return "the agent kubeconfig carries no token -- it fell back to a certificate"
-    completed = subprocess.run(
-        [
-            "curl",
-            "-sk",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{http_code}",
-            "-H",
-            f"Authorization: Bearer {token}",
-            f"{host_apiserver.rstrip('/')}/api/v1/nodes",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=_HOST_CMD_TIMEOUT_SEC,
-    )
+    argv = [
+        "curl",
+        "-sk",
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+        "-H",
+        f"Authorization: Bearer {token}",
+        f"{host_apiserver.rstrip('/')}/api/v1/nodes",
+    ]
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, check=False, timeout=_HOST_CMD_TIMEOUT_SEC
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"the host apiserver replay could not run ({exc})"
     code = completed.stdout.strip()
     if code in {"401", "403"}:
         return ""
@@ -869,34 +853,31 @@ def main() -> int:
         creds_dir = Path(tmp) / "creds"
         creds_dir.mkdir()
 
-        # Before provisioning, so it is also in front of the PSA labeller,
-        # which must skip a namespace the cluster has claimed as its own.
-        print(f"==> creating the labelled namespace {_MANAGED_NAMESPACE}")
-        managed_setup: Callable[[], bool] | None = functools.partial(
-            _ensure_managed_namespace, context
-        )
-        if not managed_setup():
-            print("    FAIL setup:managed-namespace (the by-label binding stays untested)")
-            managed_setup = None
-
-        # Also before provisioning, and that ordering is the whole test: these
-        # pods exist because admission was not there yet to refuse them.
-        print(f"==> creating the pre-provisioning pods in {_LEGACY_NAMESPACE}")
-        legacy_setup: Callable[[str], bool] | None = functools.partial(
-            _legacy_pod_still_running, context
-        )
-        if not _create_legacy_pods(context):
-            print("    FAIL setup:legacy-pods (the shell guard stays untested)")
-            legacy_setup = None
-
         failures: list[str] = []
-        if managed_setup is None:
-            failures.append("setup:managed-namespace")
-        if legacy_setup is None:
-            failures.append("setup:legacy-pods")
-
         # One finally from the first cluster write on: a raising probe must still reach cleanup.
         try:
+            # Before provisioning, so it is also in front of the PSA labeller,
+            # which must skip a namespace the cluster has claimed as its own.
+            print(f"==> creating the labelled namespace {_MANAGED_NAMESPACE}")
+            managed_setup: Callable[[], bool] | None = functools.partial(
+                _ensure_managed_namespace, context
+            )
+            if not managed_setup():
+                print("    FAIL setup:managed-namespace (the by-label binding stays untested)")
+                failures.append("setup:managed-namespace")
+                managed_setup = None
+
+            # Also before provisioning, and that ordering is the whole test: these
+            # pods exist because admission was not there yet to refuse them.
+            print(f"==> creating the pre-provisioning pods in {_LEGACY_NAMESPACE}")
+            legacy_setup: Callable[[str], bool] | None = functools.partial(
+                _legacy_pod_still_running, context
+            )
+            if not _create_legacy_pods(context):
+                print("    FAIL setup:legacy-pods (the shell guard stays untested)")
+                failures.append("setup:legacy-pods")
+                legacy_setup = None
+
             print(f"==> provisioning the agent credential against {context}")
             kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
             print(f"    kubeconfig: {kubeconfig}")
