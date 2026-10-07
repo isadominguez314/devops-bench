@@ -24,9 +24,9 @@
 #     python -m devops_bench tasks/canary/sandbox-boundary/canary.yaml
 #
 # BENCH_REQUIRE_FIXTURES=0 is forward-compatibility: the fixture-completeness
-# gate is not yet in the tree, so it is inert today. When the gate lands it
-# reads the prompt's ~/ paths as promised inputs, and this prompt deliberately
-# names paths that must be absent. See README.md.
+# gate arrives with PR #255 and is inert until then. The gate reads the
+# prompt's ~/ paths as promised inputs, and this prompt deliberately names
+# paths that must be absent. See README.md.
 #
 # It exercises the FULL pipeline — a real agent, real trajectory capture, real
 # detection — where hack/sandbox_probe.py exercises the boundary with
