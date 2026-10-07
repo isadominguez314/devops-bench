@@ -33,7 +33,6 @@ import re
 import shlex
 import shutil
 import tempfile
-from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -91,71 +90,47 @@ def _ensure_node_on_path(env_overlay: dict[str, str]) -> dict[str, str]:
 
 _log = get_logger("agents.cli.openclaw.agent")
 
-# First version-shaped token in ``oc --version`` output, prerelease suffix
-# included (``2026.8.2``, ``2026.9.1-beta.1``).
+# Version token in ``oc --version`` output (``OpenClaw 2026.9.1-beta.1 (1d96e5a)``).
 _OC_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?")
+# The image probe only prints a version, so it gets no network and no capabilities.
+_IMAGE_PROBE_FLAGS = (
+    "--rm",
+    "--network=none",
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges=true",
+)
 
 
-@cache
+def _probe_oc_version(
+    argv: list[str], *, timeout: float, extra_env: dict[str, str] | None = None
+) -> str | None:
+    """Run ``argv`` and parse an ``oc`` version from its stdout, or ``None`` when inconclusive."""
+    try:
+        completed = run(argv, check=False, timeout=timeout, extra_env=extra_env)
+    except (OSError, SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _OC_VERSION_RE.search(completed.stdout or "")
+    return match[0] if match else None
+
+
 def _host_oc_version(oc_bin: str) -> str | None:
-    """Parse ``oc --version`` from the host binary, or ``None``.
-
-    Mirrors the ``claude_code`` version probe's philosophy: an unreadable
-    version is not an error (``config.target`` may be a wrapper with its own
-    ``--version`` surface), and refusing to run on a probe that merely failed
-    to parse would be worse than the risk it guards. Cached per binary — a
-    matrix run drives one binary across every task.
-    """
-    try:
-        completed = run([oc_bin, "--version"], check=False, timeout=30)
-    except (OSError, SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    match = _OC_VERSION_RE.search(completed.stdout or "")
-    return match[0] if match else None
+    """Version of the host ``oc``, probed with nvm's Node on ``PATH`` like the export calls."""
+    return _probe_oc_version([oc_bin, "--version"], timeout=30, extra_env=_ensure_node_on_path({}))
 
 
-@cache
 def _image_oc_version(image: str) -> str | None:
-    """Parse ``oc --version`` from the sandbox image's binary, or ``None``.
-
-    Runs a short-lived throwaway container. The generous timeout covers a
-    cold image pull; on a warm host the probe is sub-second, and it runs once
-    per image thanks to the cache.
-    """
-    try:
-        completed = run(
-            ["docker", "run", "--rm", "--entrypoint", "oc", image, "--version"],
-            check=False,
-            timeout=300,
-        )
-    except (OSError, SubprocessError):
-        return None
-    if completed.returncode != 0:
-        return None
-    match = _OC_VERSION_RE.search(completed.stdout or "")
-    return match[0] if match else None
+    """Version of the sandbox image's ``oc``; the timeout covers a cold pull."""
+    argv = ["docker", "run", *_IMAGE_PROBE_FLAGS, "--entrypoint", "oc", image, "--version"]
+    return _probe_oc_version(argv, timeout=300)
 
 
 def _oc_version_skew(oc_bin: str, image: str) -> str | None:
-    """Describe a host/image ``oc`` version mismatch, or ``None`` when safe.
-
-    On a sandboxed run the *container's* oc writes the session store and the
-    *host's* oc reads it back afterwards (see ``supports_sandbox``). oc
-    refuses a store written by a different version ("written by version X,
-    but this command is running Y"), and that refusal used to surface as an
-    empty trajectory on a record still stamped ``status: "success"`` — a
-    whole cluster spin-up spent producing nothing gradable. Equality is
-    required rather than an ordering: prerelease suffixes make "newer" a
-    guess, and the two binaries are meant to be pinned together anyway.
-
-    Returns:
-        A human-readable description of the skew, or ``None`` when the
-        versions match or either probe was inconclusive.
-    """
+    """Describe a host/image ``oc`` mismatch, or ``None`` on a match or an inconclusive probe."""
     host = _host_oc_version(oc_bin)
     image_version = _image_oc_version(image)
+    # Equality is a proxy: oc's real check is its state-store schema version, which it never prints.
     if host is None or image_version is None or host == image_version:
         return None
     return (
@@ -164,6 +139,14 @@ def _oc_version_skew(oc_bin: str, image: str) -> str | None:
         "session store the container wrote, leaving an empty trajectory. Align "
         "the host oc with the image before running."
     )
+
+
+def _resolve_oc_bin(config: AgentConfig) -> str:
+    """Pick the ``oc`` binary path from ``config.target`` or fall back to ``~/bin/oc`` then ``oc``."""
+    if config.target:
+        return os.path.expanduser(config.target)
+    candidate = os.path.expanduser("~/bin/oc")
+    return candidate if os.path.exists(candidate) else "oc"
 
 
 # The image ships its own oc on PATH; a host binary path means nothing inside.
@@ -485,12 +468,14 @@ class OpenClawAgent(AgentHarness):
         self.mcp_servers = caps.mcp_servers
         self.skills = caps.skills
 
-    def _resolve_oc_bin(self) -> str:
-        """Pick the ``oc`` binary path from config or fall back."""
-        if self.config.target:
-            return os.path.expanduser(self.config.target)
-        candidate = os.path.expanduser("~/bin/oc")
-        return candidate if os.path.exists(candidate) else "oc"
+    @classmethod
+    def sandbox_preflight(cls, config: AgentConfig) -> None:
+        """Refuse the batch before any cluster exists when the host and image ``oc`` versions differ."""
+        if config.sandbox is None or not config.sandbox.image:
+            return
+        skew = _oc_version_skew(_resolve_oc_bin(config), config.sandbox.image)
+        if skew:
+            raise SandboxError(skew)
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
         """Run ``oc agent --local`` with the granted capabilities and extract the trajectory.
@@ -499,16 +484,7 @@ class OpenClawAgent(AgentHarness):
         method owns) first: ``state/`` with skills, and ``openclaw.json`` for MCP.
         """
         caps = self.config.capabilities
-        oc_bin = self._resolve_oc_bin()
-
-        # Fail before the agent turn, not after: with a skewed pair the run
-        # itself would succeed and only the post-run export would refuse the
-        # container-written session store, burning a full turn (and, live, a
-        # cluster) to produce an empty trajectory.
-        if self.config.sandbox is not None and self.config.sandbox.image:
-            skew = _oc_version_skew(oc_bin, self.config.sandbox.image)
-            if skew:
-                return AgentResult.errored(skew)
+        oc_bin = _resolve_oc_bin(self.config)
 
         final_prompt = _prepend_rules(caps.rules.text, prompt)
 
