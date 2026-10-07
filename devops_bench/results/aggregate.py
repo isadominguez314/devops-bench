@@ -95,19 +95,24 @@ def _load_rows(files: Iterable[Path]) -> list[dict]:
 def _load_provenance(files: Iterable[Path]) -> dict[str, tuple[str | None, str | None]]:
     """Per-setup ``(sandbox_image, sandbox_image_digest)`` from the sibling ``manifest.json`` files.
 
-    A field the setup's manifests disagree on becomes ``None``: the batch did not run on one image.
+    A field the setup's manifests disagree on, or that a manifest-less rows file cannot
+    vouch for, becomes ``None``: the batch did not provably run on one image.
     """
     seen: dict[str, tuple[set[str | None], set[str | None]]] = {}
     for file in files:
         sibling = Path(file).with_name(_MANIFEST_FILENAME)
-        if not sibling.is_file():
-            continue
-        parsed = json.loads(sibling.read_text(encoding="utf-8"))
-        if not isinstance(parsed, dict):
-            continue
-        images, digests = seen.setdefault(str(parsed.get("setupId", "")), (set(), set()))
-        images.add(parsed.get("sandboxImage"))
-        digests.add(parsed.get("sandboxImageDigest"))
+        parsed = json.loads(sibling.read_text(encoding="utf-8")) if sibling.is_file() else None
+        if isinstance(parsed, dict):
+            setups = {str(parsed.get("setupId", ""))}
+            image, digest = parsed.get("sandboxImage"), parsed.get("sandboxImageDigest")
+        else:
+            # No manifest: this file's setups cannot borrow another file's image.
+            setups = {str(row.get("setupId", "")) for row in _load_rows([file])}
+            image = digest = None
+        for setup in setups:
+            images, digests = seen.setdefault(setup, (set(), set()))
+            images.add(image)
+            digests.add(digest)
 
     def sole(values: set[str | None]) -> str | None:
         return next(iter(values)) if len(values) == 1 else None

@@ -222,7 +222,7 @@ class ResultRow(BaseModel):
             leaderboard; ingest gates promotion on this (default ``False``).
         sandboxed: Whether this task actually ran inside the boundary; per-row because a
             ``requires_unsandboxed`` task in a sandboxed arm reads ``False``. ``None`` when
-            the record predates the field or the sandbox was never provisioned.
+            the record predates the field or the agent never ran inside the requested sandbox.
     """
 
     model_config = _MODEL_CONFIG

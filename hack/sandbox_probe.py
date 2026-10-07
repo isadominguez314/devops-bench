@@ -602,12 +602,18 @@ def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) 
         "-w",
         "%{http_code}",
         "-H",
-        f"Authorization: Bearer {token}",
+        "@-",
         f"{host_apiserver.rstrip('/')}/api/v1/nodes",
     ]
     try:
+        # The header arrives on stdin so the token never appears in the process list.
         completed = subprocess.run(
-            argv, capture_output=True, text=True, check=False, timeout=_HOST_CMD_TIMEOUT_SEC
+            argv,
+            input=f"Authorization: Bearer {token}\n",
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HOST_CMD_TIMEOUT_SEC,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"the host apiserver replay could not run ({exc})"

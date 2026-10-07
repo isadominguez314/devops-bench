@@ -602,6 +602,16 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     assert argv[-4:] == ["agent-image", "gemini", "-p", "hi"]
 
 
+def test_wrap_argv_launches_the_pinned_digest_over_the_tag(tmp_path: Path) -> None:
+    """The reference docker runs is the one the manifest records; the tag alone can move."""
+    spec = _complete_spec(tmp_path, image_digest="agent-image@sha256:feed")
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["gemini", "-p", "hi"])
+    assert argv[-4] == "agent-image@sha256:feed"
+    assert "agent-image" not in argv[:-4]
+    unpinned = sandbox.SandboxExecutor(_complete_spec(tmp_path)).wrap_argv(["gemini"])
+    assert unpinned[-2] == "agent-image"
+
+
 def test_wrap_argv_container_owned_env_flags_come_last(tmp_path: Path) -> None:
     """Defense in depth: the executor's own ``-e HOME``/``-e KUBECONFIG`` trail every
     overlay flag, so last-one-wins keeps them authoritative."""

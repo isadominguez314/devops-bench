@@ -90,11 +90,12 @@ comparison is a plain group-by on rows. Each row additionally carries its own
 `sandboxed` boolean, because the arm's token is not the per-task truth (a
 `requires_unsandboxed` task inside a sandboxed arm runs ambient and its row
 says `false`; records predating the field read `null` — unknown, which is not
-the claim `false` makes; a sandbox that was requested but failed before it
-was provisioned also reads `null`). The run manifest records the sandbox
-image **and its content digest**, resolved once when the batch starts, so
-"both runs used the same image" is checkable rather than a mutable-tag claim;
-`results.aggregate` carries both into the combined manifests.
+the claim `false` makes; a sandboxed run that failed before the agent ran
+also reads `null`). The run manifest records the sandbox image **and its
+content digest**, resolved once when the batch starts and used as the
+reference every container is launched from, so "both runs used the same
+image" is checkable rather than a mutable-tag claim; `results.aggregate`
+carries both into the combined manifests.
 
 ## Trusting it
 

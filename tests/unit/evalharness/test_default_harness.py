@@ -1439,10 +1439,11 @@ def test_failed_record_leaves_sandboxed_unknown_when_never_provisioned(
     exempt = Task.from_dict(
         {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
     )
-    assert harness._sandboxed_outcome(task, None) is None  # noqa: SLF001
     spec = harness_default.agent_sandbox.SandboxSpec(image="agent-sandbox:test")
-    assert harness._sandboxed_outcome(task, spec) is True  # noqa: SLF001
-    assert harness._sandboxed_outcome(exempt, None) is False  # noqa: SLF001
+    assert harness._sandboxed_outcome(task, None, False) is None  # noqa: SLF001
+    assert harness._sandboxed_outcome(task, spec, False) is None  # noqa: SLF001
+    assert harness._sandboxed_outcome(task, spec, True) is True  # noqa: SLF001
+    assert harness._sandboxed_outcome(exempt, None, True) is False  # noqa: SLF001
     record = harness._build_failed_record(task, RuntimeError("no plan"), sandboxed=None)  # noqa: SLF001
     assert record["sandboxed"] is None
 

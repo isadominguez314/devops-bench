@@ -891,14 +891,12 @@ class DefaultEvalHarness(Harness):
         self._agent_config = replace(self._agent_config, sandbox=pinned)
 
     def _sandboxed_outcome(
-        self, task: Task, completed_spec: agent_sandbox.SandboxSpec | None
+        self, task: Task, completed_spec: agent_sandbox.SandboxSpec | None, agent_started: bool
     ) -> bool | None:
-        """Per-record ``sandboxed`` for a failed run: ``None`` when requested but never provisioned."""
-        if completed_spec is not None:
-            return True
+        """Per-record ``sandboxed`` for a failed run; ``None`` unless the agent ran in the boundary."""
         if self._agent_config.sandbox is None or task.requires_unsandboxed:
             return False
-        return None
+        return True if completed_spec is not None and agent_started else None
 
     def _ambient_inventory_rules(
         self,
@@ -962,6 +960,7 @@ class DefaultEvalHarness(Harness):
         completed_spec: agent_sandbox.SandboxSpec | None = None
         sandbox_rules: tuple[SensitiveAccessRule, ...] = ()
         sandbox_exempt = False
+        agent_started = False
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
         # Tracked as computed so a failed record carries the same resolved strings.
@@ -1076,6 +1075,7 @@ class DefaultEvalHarness(Harness):
             # inside it; diff it separately (ambient runs collect home/ whole).
             home_dir = workspace_path / "home"
             before_home = snapshot_dir(home_dir) if completed_spec is not None else set()
+            agent_started = True
             agent_res = self.execute_agent(
                 prompt, context, sandbox_spec=completed_spec, sandbox_exempt=sandbox_exempt
             )
@@ -1153,7 +1153,7 @@ class DefaultEvalHarness(Harness):
             result = self._build_failed_record(
                 task,
                 exc,
-                sandboxed=self._sandboxed_outcome(task, completed_spec),
+                sandboxed=self._sandboxed_outcome(task, completed_spec, agent_started),
                 prompt=prompt,
                 expected_output=expected_output,
                 recoverable_safety=recoverable_safety,
@@ -1357,7 +1357,7 @@ class DefaultEvalHarness(Harness):
         Args:
             task: The task that failed.
             exc: The exception that aborted the run.
-            sandboxed: Per-record boundary truth; ``None`` when requested but never provisioned.
+            sandboxed: Per-record boundary truth; ``None`` when the agent never ran in the sandbox.
             prompt: The substituted prompt if computed, else the raw ``task.prompt``.
             expected_output: The substituted expectation if computed, else the raw one.
             recoverable_safety: The substituted checklist if computed, else the raw one.

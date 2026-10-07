@@ -151,6 +151,11 @@ class SandboxSpec:
     # Pinned by the harness at batch start, before the first container runs.
     image_digest: str | None = None
 
+    @property
+    def launch_image(self) -> str:
+        """The reference ``docker run`` gets: the pinned digest, else the tag."""
+        return self.image_digest or self.image
+
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
     """Read the sandbox opt-in and owner; ``None`` when off, :class:`SandboxError` on a typo."""
@@ -423,7 +428,14 @@ class SandboxExecutor:
         for host_path, mount_path in self._remap_mounts():
             argv += ["-v", f"{host_path}:{mount_path}"]
             targets.append(mount_path)
-        argv += [self.spec.image, "chown", "-R", f"--from={from_uid}", f"{uid}:{gid}", *targets]
+        argv += [
+            self.spec.launch_image,
+            "chown",
+            "-R",
+            f"--from={from_uid}",
+            f"{uid}:{gid}",
+            *targets,
+        ]
         return argv
 
     def _chown_before_remap(self) -> None:
@@ -496,7 +508,8 @@ class SandboxExecutor:
             argv += ["-e", name]
         argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
-        argv.append(spec.image)
+        # The digest the manifest records is the image that runs, even if the tag moves mid-batch.
+        argv.append(spec.launch_image)
         argv.extend(str(part) for part in cmd)
         return argv
 
