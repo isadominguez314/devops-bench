@@ -291,18 +291,13 @@ matrix_dispatch() {
     echo "export AGENT_TIMEOUT_SEC='${AGENT_TIMEOUT_SEC}'"
     echo "export BENCH_PARALLEL=true"
     if [ -n "${BENCH_AGENT_SANDBOX:-}" ]; then
-      # The sandbox opt-in rides into the detached runner explicitly: on the
-      # remote arm the runner's env is only what this script bakes in, so an
-      # operator export that stays behind on the workstation would silently
-      # produce an UNSANDBOXED matrix. The escape hatches
-      # (BENCH_SANDBOX_ALLOW_ADMIN_CREDS / _ALLOW_AMBIENT_CLUSTER) are
-      # deliberately not forwarded — never for scored runs.
+      # The runner's env is only what this script bakes in; a workstation-only export
+      # would silently produce an unsandboxed matrix. The escape hatches are never forwarded.
       echo "export BENCH_AGENT_SANDBOX='${BENCH_AGENT_SANDBOX}'"
       if [ -n "${BENCH_SANDBOX_IMAGE:-}" ]; then
         echo "export BENCH_SANDBOX_IMAGE='${BENCH_SANDBOX_IMAGE}'"
       fi
-      # Same reasoning: without the fixture path the runner sandboxes every
-      # fixture-dependent task without its fixture and scores it anyway.
+      # Same for the fixture path: without it, fixture tasks run and score fixtureless.
       if [ -n "${BENCH_AGENT_FIXTURES:-}" ]; then
         echo "export BENCH_AGENT_FIXTURES='${BENCH_AGENT_FIXTURES}'"
       fi
