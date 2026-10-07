@@ -1215,10 +1215,7 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
 def test_prepare_sandbox_spec_tears_down_when_completion_fails(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Provisioning wrote to the cluster, but the spec that would carry its
-    context to the run-end teardown never completes — so the failure path must
-    clean up itself, or a reused cluster keeps the policies with nothing
-    recording they exist."""
+    """No completed spec will carry the context to the run-end teardown, so this path cleans up."""
     from devops_bench.core import ClusterInfo, NetworkPlan
 
     harness = _sandboxed_harness(monkeypatch, tmp_path)
@@ -1257,17 +1254,13 @@ def test_prepare_sandbox_spec_tears_down_when_completion_fails(
 def test_run_one_tears_down_sandbox_credentials_in_its_finally(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The run-end teardown fires from ``_run_one``'s finally, pinned to the
-    run's own context. It is a correctness requirement on a reused cluster:
-    the pod-security policy is not username-scoped, so left behind it denies
-    the operator's next privileged workload too."""
+    """The run-end teardown fires from the finally, pinned to the run's own context."""
     from dataclasses import replace
 
     from devops_bench.core import NetworkPlan
 
     class _SandboxReadyAgent(_WorkspaceWritingAgent):
-        # Opt the fake onto the seam: base.run() refuses a sandboxed config on
-        # a harness that has not been migrated (supports_sandbox is False).
+        # base.run() refuses a sandboxed config on an unmigrated harness.
         supports_sandbox = True
 
     AGENTS.register("fake-sandbox-teardown")(_SandboxReadyAgent)
@@ -1327,8 +1320,7 @@ def test_run_one_tears_down_sandbox_credentials_in_its_finally(
 def test_sandbox_credential_teardown_only_runs_when_the_cluster_survives(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cluster the deployer destroys takes the sandbox objects with it; waiting
-    on finalizers first is pure latency. The reused cases are where it matters."""
+    """A destroyed cluster takes the objects with it; reused clusters are where teardown matters."""
     harness = _sandboxed_harness(monkeypatch, tmp_path)
     survives = harness._cluster_survives  # noqa: SLF001
 

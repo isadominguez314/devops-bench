@@ -1141,14 +1141,8 @@ class DefaultEvalHarness(Harness):
                 # Idempotent; covers any path that skipped the calls above.
                 safeguard_monitor.stop()
             if completed_spec is not None and self._cluster_survives(infra_config):
-                # Only on a cluster that outlives the run (BENCH_NO_TEARDOWN, a
-                # kind dev loop, the no-op deployer): there it is correctness —
-                # the pod-security policy is not username-scoped, so left behind
-                # it denies the OPERATOR's own privileged workloads on the next
-                # run. A cluster the deployer destroys takes the objects with it,
-                # and waiting on finalizers first is pure latency (minutes on a
-                # stalled apiserver). Teardown never raises by design; the guard
-                # is for the finally block's sake.
+                # Only on a cluster that outlives the run: residue there denies the operator's
+                # next privileged workload. A destroyed cluster takes the objects with it.
                 try:
                     clean = agent_credentials.teardown_agent_credentials(
                         completed_spec.network.kubectl_context
@@ -1192,8 +1186,7 @@ class DefaultEvalHarness(Harness):
             )
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
         if with_cluster:
-            # Pinned here (not only inside provisioning) so the spec — and the
-            # run-end teardown it feeds — target the same authorized cluster.
+            # Pinned here too, so the spec and the run-end teardown target the same cluster.
             plan = agent_credentials.pin_plan_context(
                 agent_sandbox.build_network_plan(provider, cluster_info)
             )
@@ -1217,10 +1210,7 @@ class DefaultEvalHarness(Harness):
                 fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
             )
         except Exception:
-            # The cluster objects are already provisioned, but the completed
-            # spec that would carry their context to the run-end teardown
-            # never comes to exist — so remove them here, keeping the original
-            # error as the one the caller sees (teardown never raises).
+            # Provisioned, but no completed spec will carry the objects to the run-end teardown.
             if with_cluster:
                 agent_credentials.teardown_agent_credentials(plan.kubectl_context)
             raise

@@ -419,9 +419,7 @@ def test_provision_refuses_the_fallback_for_an_exec_plugin_context(
 def test_provision_tears_down_when_the_fallback_render_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The exec-plugin refusal fires after the policies (and possibly the
-    identity) are on the cluster, and the completed spec the run-end teardown
-    keys off never comes to exist — so provisioning must clean up itself."""
+    """The exec-plugin refusal fires after cluster writes, so provisioning must clean up itself."""
     monkeypatch.setenv(creds.ALLOW_ADMIN_ENV, "1")
     calls = _patch_kubectl(monkeypatch, mint_fails=True, cert="", key="")
 
@@ -800,8 +798,7 @@ def test_enforce_pod_security_labels_the_harness_namespace_too(
 def test_enforce_pod_security_leaves_a_warn_or_audit_only_level_alone(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An operator's warn/audit setting with no enforce would otherwise be overwritten
-    to baseline, marked, and stripped bare by teardown — gone for good."""
+    """A warn/audit-only setting would otherwise be overwritten, marked, then stripped."""
     calls = _patch_kubectl(
         monkeypatch,
         namespaces={
@@ -822,8 +819,7 @@ def test_enforce_pod_security_leaves_a_warn_or_audit_only_level_alone(
 def test_enforce_pod_security_warns_when_the_sandbox_namespace_already_exists(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The objects have fixed names, so a live run on the same cluster loses its
-    identity to this run's teardown; the operator is told before the first write."""
+    """Fixed names: a live run on the same cluster would lose its identity to this teardown."""
     _patch_kubectl(monkeypatch, namespaces={"items": [_ns(creds.AGENT_NAMESPACE)]})
 
     with caplog.at_level("WARNING"):
@@ -1146,8 +1142,7 @@ def test_provision_uses_the_ambient_cluster_only_when_told_to(
     path = creds.provision_agent_credentials(NetworkPlan(), tmp_path, token_ttl_sec=1500)
 
     assert yaml.safe_load(path.read_text())["users"][0]["user"] == {"token": _TOKEN}
-    # Authorized once, then pinned: every write names the snapshotted context
-    # rather than re-reading current-context at each call.
+    # Pinned once: every write names the snapshotted context.
     writes = [c for c in calls if "apply" in c or "token" in c or "label" in c]
     assert writes and all("some-ambient-context" in c for c in writes)
 
@@ -1166,9 +1161,7 @@ def test_pin_plan_context_pins_the_authorized_ambient_context(
 def test_every_provisioning_and_teardown_kubectl_call_is_bounded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An apiserver that accepts the connection and never answers must not hang
-    _run_one: every kubectl call these paths make carries a subprocess timeout,
-    which is also what lets teardown keep its promise to return."""
+    """Every kubectl call on these paths carries a timeout, so a silent apiserver cannot hang the run."""
     _patch_kubectl(monkeypatch)
     inner = kubectl.run
     timeouts: list[tuple[list[str], float | None]] = []
@@ -1187,10 +1180,7 @@ def test_every_provisioning_and_teardown_kubectl_call_is_bounded(
 
 
 def test_teardown_always_skips_an_unpinned_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Provisioning pins before its first write — the ambient opt-in included,
-    via pin_plan_context — so an unpinned context only ever means the no-cluster
-    path, which wrote nothing. A stale ALLOW_AMBIENT export must not turn that
-    into cluster-wide deletes on whatever current-context points at."""
+    """Provisioning always pins, so None wrote nothing; a stale ambient opt-in adds no deletes."""
     calls = _patch_kubectl(monkeypatch)
     for ambient in (None, "1"):
         if ambient is None:
@@ -1251,12 +1241,7 @@ def _delete_kinds(calls: list[list[str]]) -> list[str]:
 
 
 def test_teardown_inventory_matches_the_manifests() -> None:
-    """The teardown name lists cannot drift from the manifests they mirror.
-
-    A policy or binding added to the manifests without a row in the teardown
-    inventory would survive every run on a reused cluster; this holds the two
-    in lockstep so the omission fails the suite instead.
-    """
+    """A policy added to the manifests without a teardown row fails here, not on a reused cluster."""
     # Joined on a document separator: the constants do not all end with one.
     rendered = "\n---\n".join(
         (
@@ -1284,9 +1269,7 @@ def test_teardown_inventory_matches_the_manifests() -> None:
 
 
 def test_teardown_deletes_everything_bindings_first(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bindings go first — a binding is what makes a policy enforce, so the
-    cluster stops denying anyone the moment they are gone — and the namespace
-    goes last, waited on, so a reused cluster's next apply cannot race it."""
+    """Bindings first so denial stops at once; the namespace last and waited on."""
     calls = _patch_kubectl(monkeypatch)
 
     assert creds.teardown_agent_credentials("kind-c1") is True
@@ -1313,9 +1296,7 @@ def test_teardown_deletes_everything_bindings_first(monkeypatch: pytest.MonkeyPa
 def test_teardown_unlabels_only_the_namespaces_it_marked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A PSA label someone else set never carries the marker and is never
-    removed — the labeller skips namespaces that already declare a level, so
-    the marker is a faithful record of exactly what enforcement wrote."""
+    """A level someone else set never carries the marker and is never removed."""
     namespaces = {
         "items": [
             _ns(
@@ -1342,9 +1323,7 @@ def test_teardown_unlabels_only_the_namespaces_it_marked(
 
 
 def test_teardown_survives_a_non_json_namespace_listing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A wrapper or proxy writing a non-JSON prefix on exit 0 raises JSONDecodeError
-    out of get_resource; teardown must log it, carry on with the deletes, and report
-    residue — not replace the caller's original error."""
+    """Non-JSON stdout on exit 0 raises JSONDecodeError; the remaining deletes still run."""
     calls = _patch_kubectl(monkeypatch)
     real = kubectl.run
 
@@ -1363,8 +1342,7 @@ def test_teardown_survives_a_non_json_namespace_listing(monkeypatch: pytest.Monk
 
 
 def test_teardown_survives_kubectl_failing_to_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
-    """OSError (kubectl missing or unexecutable) is not a SubprocessError; it must
-    not abort the remaining deletes either."""
+    """OSError is not a SubprocessError; it must not abort the remaining deletes either."""
     calls = _patch_kubectl(monkeypatch)
     real = kubectl.run
 
@@ -1383,8 +1361,7 @@ def test_teardown_survives_kubectl_failing_to_spawn(monkeypatch: pytest.MonkeyPa
 
 
 def test_teardown_is_best_effort_and_reports_residue(monkeypatch: pytest.MonkeyPatch) -> None:
-    """One failed delete must not stop the rest: every object that CAN come
-    off the cluster does, and the return value says residue remains."""
+    """One failed delete stops nothing else, and the return value reports the residue."""
     calls = _patch_kubectl(monkeypatch, delete_fails={creds._POLICY_BINDING_KIND})
 
     assert creds.teardown_agent_credentials("kind-c1") is False
@@ -1394,8 +1371,7 @@ def test_teardown_is_best_effort_and_reports_residue(monkeypatch: pytest.MonkeyP
 
 
 def test_teardown_survives_an_unlistable_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Teardown never raises: both its callers sit on paths where a second
-    failure must not eclipse the first."""
+    """Teardown never raises: a second failure must not eclipse the first."""
     _patch_kubectl(monkeypatch)
 
     def refuse_lists(argv: list[str], **kwargs: Any) -> NoReturn:
@@ -1409,10 +1385,7 @@ def test_teardown_survives_an_unlistable_cluster(monkeypatch: pytest.MonkeyPatch
 def test_failed_provisioning_cleans_up_its_partial_writes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A mint failure raises AFTER pod security and the identity landed on the
-    cluster, and the completed spec that would have carried their context to
-    the run-end teardown never exists — so provisioning removes them itself,
-    keeping the original error."""
+    """A mint failure lands after cluster writes; provisioning removes them, keeping its error."""
     calls = _patch_kubectl(monkeypatch, mint_fails=True)
 
     with pytest.raises(SandboxError, match="scoped ServiceAccount"):
@@ -1426,8 +1399,7 @@ def test_failed_provisioning_cleans_up_its_partial_writes(
 def test_marker_label_rides_along_with_enforcement(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Enforcement stamps the marker teardown keys off, on the same call that
-    sets the PSA levels — one write, so they cannot come apart."""
+    """The marker is set on the same write as the levels, so they cannot come apart."""
     calls = _patch_kubectl(monkeypatch, namespaces={"items": [_ns("default")]})
 
     creds.enforce_pod_security(tmp_path, "kind-c1")
