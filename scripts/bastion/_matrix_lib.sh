@@ -198,7 +198,7 @@ _runner_env() {
   if [ -n "${BENCH_VERTEX:-}" ]; then
     # Vertex mode: drop API keys so everything falls back to ADC; location must be
     # global (the gemini-3.x preview ids 404 on regional endpoints).
-    echo 'unset AGENT_API_KEY GEMINI_API_KEY GOOGLE_API_KEY JUDGE_API_KEY GOOGLE_GENAI_API_KEY'
+    echo 'unset AGENT_API_KEY GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_API_KEY'
     # Literal marker = "use ADC" for oc's google-vertex provider; via env so it
     # reaches every per-run OPENCLAW_STATE_DIR. Other consumers ignore it.
     echo 'export GOOGLE_CLOUD_API_KEY=gcp-vertex-credentials'
