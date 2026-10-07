@@ -90,9 +90,11 @@ comparison is a plain group-by on rows. Each row additionally carries its own
 `sandboxed` boolean, because the arm's token is not the per-task truth (a
 `requires_unsandboxed` task inside a sandboxed arm runs ambient and its row
 says `false`; records predating the field read `null` — unknown, which is not
-the claim `false` makes). The run
-manifest records the sandbox image **and its content digest**, so "both runs
-used the same image" is checkable rather than a mutable-tag claim.
+the claim `false` makes; a sandbox that was requested but failed before it
+was provisioned also reads `null`). The run manifest records the sandbox
+image **and its content digest**, resolved once when the batch starts, so
+"both runs used the same image" is checkable rather than a mutable-tag claim;
+`results.aggregate` carries both into the combined manifests.
 
 ## Trusting it
 
@@ -119,7 +121,7 @@ access" — it is a boundary-breach indicator and should be treated as one.
 
 ## Runner-host requirements
 
-The sandbox asks exactly one thing of the machine running the harness:
+The sandbox has one software dependency on the machine running the harness:
 **Docker**. Scored runs use clusters whose nodes are not the harness host
 (vcluster/GKE); co-located kind is a development configuration — a kind node
 is a privileged container on the harness machine, so pod-level escalation
@@ -128,4 +130,4 @@ exist to prevent while you develop. On any cloud VM host, the link-local
 metadata endpoint must be blocked from agent containers (`vm-setup.sh`
 installs the `DOCKER-USER` rule on the bastion); the endpoint serves the VM's
 own credentials on every major cloud, so this is a host-class requirement,
-not a GCP quirk.
+not specific to one provider.

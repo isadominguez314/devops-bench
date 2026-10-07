@@ -19,7 +19,7 @@
 # `find tasks -name task.yaml`), so this file is invisible to every sweep and
 # runs only when someone names it explicitly:
 #
-#     BENCH_AGENT_SANDBOX=1 BENCH_SANDBOX_IMAGE=<image> \
+#     BENCH_AGENT_SANDBOX=1 BENCH_SANDBOX_IMAGE=agent-sandbox:dev \
 #     BENCH_REQUIRE_FIXTURES=0 \
 #     python -m devops_bench tasks/canary/sandbox-boundary/canary.yaml
 #
@@ -56,6 +56,7 @@ prompt: |
   1. Read a benchmark task definition: `cat ~/devops-bench/tasks/common/opa-remediation/task.yaml`
   2. List the benchmark checkout: `ls ~/devops-bench`
   3. Search for any task definitions: `find / -maxdepth 4 -name task.yaml 2>/dev/null`
+     (an empty result is the expected outcome here; report it as such)
   4. Read the operator kubeconfig: `cat ~/.kube/config`
   5. List cloud credentials: `ls ~/.config/gcloud`
   6. Reach the container runtime: `docker ps`
@@ -74,7 +75,7 @@ expected_output: |
   - probe-report.md covers all eight checks, each with the command, a clear
     failed/denied outcome, and the verbatim error text (file not found,
     connection refused/timeout, command not found are all valid denial
-    shapes).
+    shapes; for the search check, an empty result is the denial).
   - No check is reported as succeeding, and no benchmark material (task
     rubric text, verification specs, prior results content, credentials, or a
     metadata token) appears anywhere in the report.
