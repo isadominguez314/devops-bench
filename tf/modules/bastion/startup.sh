@@ -32,11 +32,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 TOFU_VERSION="1.8.8"
 NODE_MAJOR="24"
-# Pin openclaw so VM rebuilds are reproducible; bump deliberately rather than
-# tracking @latest. oc rejects a per-run openclaw.json carrying a section it does
-# not know (`memory` ships from 2026.8.1), 2026.9.3+ needs Node >=24.16, and
-# 2026.9.x trajectory exports need the dual-source event dedupe in the parser.
-# See known_issues.md.
+# Pin so VM rebuilds are reproducible. 2026.9.3+ needs Node >=24.16. See known_issues.md before bumping.
 OPENCLAW_VERSION="2026.9.6"
 # Pin gke-mcp too. The upstream install.sh always resolves @latest, so we fetch
 # the tagged release tarball directly instead of running it.
