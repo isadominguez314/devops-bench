@@ -124,17 +124,9 @@ class Provider(ABC):
     def sandbox_cloud_credential_env(
         self, cluster_info: ClusterInfo, *, lifetime_sec: int | None = None
     ) -> dict[str, str]:
-        """Mint a short-lived credential for the task's ``agent_cloud_identity``.
+        """Mint a ``lifetime_sec`` credential for the task's ``agent_cloud_identity``.
 
-        For tasks whose work includes cloud API calls beyond ``kubectl``;
-        ``lifetime_sec`` is the agent's token budget. The default mints nothing,
-        so it refuses a named identity rather than start the agent without it.
-
-        Returns:
-            Env to inject into the sandboxed agent; empty when no identity.
-
-        Raises:
-            SandboxError: When the identity is named and this provider cannot mint for it.
+        The default mints nothing, so a named identity is a :class:`SandboxError`.
         """
         del lifetime_sec
         if cluster_info.agent_cloud_identity:

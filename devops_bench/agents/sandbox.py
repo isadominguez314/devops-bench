@@ -138,8 +138,8 @@ class SandboxSpec:
     the rest per task. ``fixture_mounts`` maps host path -> container path (RW);
     ``env_allowlist`` lets named vars cross despite a deny rule; ``owner`` scopes
     container names and the stray sweep to one attempt.
-    ``cloud_credential_env`` is the harness-minted, task-scoped cloud credential; it
-    bypasses the overlay filter and is empty for kubectl-only tasks.
+    ``cloud_credential_env`` is the harness-minted, task-scoped cloud credential
+    (allowlisted by name; empty for kubectl-only tasks).
     """
 
     image: str = ""
@@ -478,8 +478,9 @@ class SandboxExecutor:
         ``--cap-drop=ALL`` and ``no-new-privileges``; the network plan and
         ``host.docker.internal:host-gateway``; ``--user`` on Linux so workspace
         files stay operator-owned; workspace RW, kubeconfig RO, fixtures RW;
-        overlay env, then the minted cloud credential, as name-only ``-e`` (values ride the client env, never the
-        argv); ``HOME``/``KUBECONFIG`` last so they win; no ``-i``.
+        overlay env, then the minted cloud credential, as name-only ``-e`` (values
+        ride the client env, never the argv); ``HOME``/``KUBECONFIG`` last so they
+        win; no ``-i``.
         """
         spec = self.spec
         argv: list[str] = [CONTAINER_RUNTIME, "run", "--rm", "--name", self.container_name]
