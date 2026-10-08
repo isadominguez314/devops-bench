@@ -183,16 +183,9 @@ class GcpProvider(Provider):
     def sandbox_cloud_credential_env(
         self, cluster_info: ClusterInfo, *, lifetime_sec: int | None = None
     ) -> dict[str, str]:
-        """Impersonate the task's service account host-side and mint a token.
+        """Mint a token by impersonating the task's identity host-side; raises when it cannot.
 
-        No key file exists or is mounted and the operator's ADC never crosses.
-        The token is not refreshed in the container; ``lifetime_sec`` past an
-        hour is tried first and needs the lifetime-extension org policy, else
-        the mint falls back to an hour and warns. The provisioning identity
-        needs ``roles/iam.serviceAccountTokenCreator`` on the account.
-
-        Raises:
-            SandboxError: When the identity is named but no token was minted.
+        Lifetimes past an hour need the lifetime-extension org policy, else an hour plus a warning.
         """
         identity = cluster_info.agent_cloud_identity
         if not identity:
