@@ -67,6 +67,8 @@ class Manifest(BaseModel):
         sandbox_image_digest: Its content digest (repo digest, else local image ID), pinned
             at batch start because a tag says nothing after the fact; ``None`` when
             unsandboxed or unresolvable.
+        reasoning_effort: Reasoning tier the harness ran the model at, for
+            harnesses that name one apart from the model id; ``None`` otherwise.
     """
 
     model_config = _MODEL_CONFIG
@@ -80,6 +82,7 @@ class Manifest(BaseModel):
     augmentation: list[str]
     sandbox_image: str | None = None
     sandbox_image_digest: str | None = None
+    reasoning_effort: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``manifest.json``."""
@@ -157,6 +160,7 @@ class ResultRow(BaseModel):
         model: Model identifier; matches :attr:`Manifest.model`.
         harness: Canonical harness key; matches :attr:`Manifest.harness`.
         augmentation: Capability tokens; matches :attr:`Manifest.augmentation`.
+        reasoning_effort: Reasoning tier; matches :attr:`Manifest.reasoning_effort`.
         run_id: Run directory suffix; matches :attr:`Manifest.run_id`.
         t: UTC ISO-8601 run timestamp; matches :attr:`Manifest.t`.
         task_folder: The task's directory name.
@@ -238,6 +242,7 @@ class ResultRow(BaseModel):
     model: str
     harness: str
     augmentation: list[str]
+    reasoning_effort: str | None = None
     run_id: str
     t: str
     task_folder: str

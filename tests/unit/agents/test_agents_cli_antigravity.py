@@ -422,6 +422,38 @@ class TestDefaultEffort:
             agy_mod._default_effort()
 
 
+class TestReasoningEffort:
+    """The tier the run uses is reported for the arm identity, in every spelling."""
+
+    @pytest.mark.parametrize(
+        ("model", "want"),
+        [
+            ("google/gemini-3.1-pro-preview", "high"),
+            ("gemini-3.1-pro-preview-low", "low"),
+            ("gemini-3.8-flash-medium", "medium"),
+            ("Gemini 3.1 Pro (Low)", "low"),
+        ],
+    )
+    def test_reports_the_tier_for_every_spelling(
+        self, monkeypatch: pytest.MonkeyPatch, model: str, want: str
+    ) -> None:
+        monkeypatch.delenv(agy_mod._EFFORT_ENV, raising=False)
+        config = agents_config.AgentConfig(model=model)
+
+        assert agy_mod.AgyCliAgent.reasoning_effort(config) == want
+
+    def test_env_override_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(agy_mod._EFFORT_ENV, "low")
+
+        assert agy_mod.AgyCliAgent.reasoning_effort(agents_config.AgentConfig(model="m")) == "low"
+
+    def test_no_model_or_bad_env_reports_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Manifest writing must never raise; a bad tier already failed the run itself.
+        assert agy_mod.AgyCliAgent.reasoning_effort(agents_config.AgentConfig()) is None
+        monkeypatch.setenv(agy_mod._EFFORT_ENV, "maximum")
+        assert agy_mod.AgyCliAgent.reasoning_effort(agents_config.AgentConfig(model="m")) is None
+
+
 @pytest.mark.parametrize(
     ("model", "want_model_flag", "want_effort_flag"),
     [

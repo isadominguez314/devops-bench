@@ -167,6 +167,18 @@ def _resolve_model_name(model: str) -> tuple[str, str | None]:
     return name, effort or _default_effort()
 
 
+def _effective_effort(model: str) -> str | None:
+    """The tier a run of ``model`` uses, whichever of the three spellings names it."""
+    display = _DISPLAY_TIER_RE.search(model.split("/")[-1].strip())
+    if display:
+        return display.group(0).strip("() \t").lower()
+    try:
+        return _resolve_model_name(model)[1]
+    except core.ConfigError:
+        # A bad AGENT_MODEL_EFFORT already failed the run itself; the arm just goes unlabelled.
+        return None
+
+
 def _build_settings(
     mcp_servers: tuple[capabilities.McpBinding, ...],
     model: str | None,
@@ -266,6 +278,10 @@ class AgyCliAgent(base.AgentHarness):
         self.mcp_servers = caps.mcp_servers
         self.skills = caps.skills
         self.rules = caps.rules
+
+    @classmethod
+    def reasoning_effort(cls, config: agents_config.AgentConfig) -> str | None:
+        return _effective_effort(config.model) if config.model else None
 
     def _resolve_binary(self) -> str:
         """Resolve the absolute path to the ``agy`` binary."""
