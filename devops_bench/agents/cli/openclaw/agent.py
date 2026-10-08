@@ -262,8 +262,9 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
 
 
 def _vertex_key_present(config: AgentConfig, spec: ProviderSpec) -> bool:
-    """Whether the run carries a real Vertex key; the ADC marker in either place does not count."""
-    candidates = (config.api_key or "", *(os.environ.get(var, "") for var in spec.api_key_envs))
+    """Whether the agent receives a real Vertex key; the ADC marker never counts as one."""
+    env = {**os.environ, **config.extra_env}  # the precedence _build_env applies
+    candidates = (config.api_key or "", *(env.get(var, "") for var in spec.api_key_envs))
     return any(c.strip() and c.strip() != _VERTEX_CREDENTIALS_MARKER for c in candidates)
 
 
