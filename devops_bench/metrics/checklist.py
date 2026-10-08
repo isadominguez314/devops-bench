@@ -96,7 +96,8 @@ class ChecklistMetric:
 
     For each parsed checklist item the evaluator builds a per-item ``Check: …``
     GEval, scores it, and emits the aggregate ``ChecklistScore`` using
-    :data:`CHECKLIST_THRESHOLD` as the pass cutoff.
+    :data:`CHECKLIST_THRESHOLD` as the pass cutoff. An item the judge could not
+    evaluate is recorded with a null score and withholds the aggregate.
 
     Attributes:
         name: Identifier for logging; per-score keys come from each yielded
@@ -142,29 +143,30 @@ class ChecklistMetric:
                 # Null score: the record shows the item was skipped, not failed.
                 out.append(MetricScore(name=m.name, score=None, reason=f"Not judged: {e}"))
 
-        # Unjudged items leave the denominator; with nothing judged the aggregate abstains.
+        # Any unjudged item withholds the aggregate: a ratio over a subset is not comparable.
         unjudged = total - judged
-        if judged:
-            ratio = passed / judged
-            suffix = f" ({unjudged} could not be judged)" if unjudged else ""
+        if unjudged:
+            _log.error(
+                "the judge could not evaluate %d of %d checklist item(s); withholding ChecklistScore",
+                unjudged,
+                total,
+            )
+            partial = f" ({passed} of {judged} judged passed)" if judged else ""
+            out.append(
+                MetricScore(
+                    name="ChecklistScore",
+                    score=None,
+                    reason=f"Withheld: {unjudged} of {total} checks could not be judged{partial}.",
+                )
+            )
+        else:
+            ratio = passed / total
             out.append(
                 MetricScore(
                     name="ChecklistScore",
                     score=ratio,
                     success=ratio >= CHECKLIST_THRESHOLD,
-                    reason=f"Passed {passed} out of {judged} evaluated checks{suffix}.",
-                )
-            )
-        else:
-            _log.error(
-                "the judge evaluated none of %d checklist item(s); withholding ChecklistScore",
-                total,
-            )
-            out.append(
-                MetricScore(
-                    name="ChecklistScore",
-                    score=None,
-                    reason=f"None of {total} checks could be judged.",
+                    reason=f"Passed {passed} out of {total} checks.",
                 )
             )
         return out

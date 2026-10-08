@@ -77,14 +77,16 @@ def test_checklist_abstains_when_the_judge_evaluates_nothing(
 
     aggregate = scores["ChecklistScore"]
     assert aggregate.score is None and aggregate.success is None
-    assert aggregate.reason == "None of 3 checks could be judged."
+    assert aggregate.reason == "Withheld: 3 of 3 checks could not be judged."
     items = [ms for name, ms in scores.items() if name.startswith("Check: ")]
     assert len(items) == 3
     assert all(ms.score is None and "404" in (ms.reason or "") for ms in items)
 
 
-def test_checklist_scores_over_what_was_actually_judged(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A partial outage shrinks the denominator; the skipped item is recorded as null."""
+def test_checklist_is_withheld_when_any_item_could_not_be_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One unjudged item withholds the aggregate; 2 of 2 judged is never published as 1.0."""
     _stub_geval(monkeypatch)
     calls = {"n": 0}
 
@@ -99,9 +101,8 @@ def test_checklist_scores_over_what_was_actually_judged(monkeypatch: pytest.Monk
     scores = _by_name(list(cl.ChecklistMetric().evaluate(_ctx())))
 
     aggregate = scores["ChecklistScore"]
-    assert aggregate.score == 1.0, "both judged items passed, so the ratio is over 2 not 3"
-    assert aggregate.success is True
-    assert aggregate.reason == "Passed 2 out of 2 evaluated checks (1 could not be judged)."
+    assert aggregate.score is None and aggregate.success is None
+    assert aggregate.reason == "Withheld: 1 of 3 checks could not be judged (2 of 2 judged passed)."
     skipped = scores["Check: beta must hold"]
     assert skipped.score is None and skipped.success is None
     assert "judge blew up" in (skipped.reason or "")
@@ -119,5 +120,5 @@ def test_a_fully_judged_checklist_is_unchanged(monkeypatch: pytest.MonkeyPatch) 
     scores = _by_name(list(cl.ChecklistMetric().evaluate(_ctx())))
 
     assert scores["ChecklistScore"].score == 0.0
-    assert scores["ChecklistScore"].reason == "Passed 0 out of 3 evaluated checks."
+    assert scores["ChecklistScore"].reason == "Passed 0 out of 3 checks."
     assert all(ms.score == 0.0 for name, ms in scores.items() if name.startswith("Check: "))

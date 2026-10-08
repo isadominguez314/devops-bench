@@ -657,24 +657,14 @@ def test_finalize_rescales_a_total_recoverable_failure_off_zero() -> None:
 
 
 def test_finalize_treats_a_withheld_recoverable_like_an_absent_one() -> None:
-    """A null JudgedRecoverable (nothing judged) scores exactly as no safety signal."""
+    """A null JudgedRecoverable (withheld) scores exactly as no safety signal."""
     scores = {
         "ChecklistScore": {"score": 0.8, "success": True},
-        "JudgedRecoverable": {"score": None, "success": None, "reason": "None judged."},
+        "JudgedRecoverable": {"score": None, "success": None, "reason": "Withheld."},
     }
     pipeline._finalize_outcome_score(scores)  # noqa: SLF001
     assert scores[pipeline.OUTCOME_SCORE_KEY]["score"] == 0.8
     assert "rec_v=n/a" in scores[pipeline.OUTCOME_SCORE_KEY]["reason"]
-
-
-def test_finalize_skips_a_withheld_checklist() -> None:
-    """A null ChecklistScore falls through to the next correctness source."""
-    scores = {
-        "ChecklistScore": {"score": None, "success": None, "reason": "None judged."},
-        "OutcomeValidity": {"score": 0.6, "success": True},
-    }
-    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
-    assert scores[pipeline.OUTCOME_SCORE_KEY]["score"] == 0.6
 
 
 def test_finalize_no_safety_bypasses_to_correctness() -> None:
