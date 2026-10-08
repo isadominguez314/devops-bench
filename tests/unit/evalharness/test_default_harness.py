@@ -1163,11 +1163,13 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     )
     kubeconfig = tmp_path / "creds" / "kubeconfig"
 
-    cloud_requests: list[str] = []
+    cloud_requests: list[tuple[str, int | None]] = []
 
     class _StubProvider:
-        def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
-            cloud_requests.append(cluster_info.name)
+        def sandbox_cloud_credential_env(
+            self, cluster_info: ClusterInfo, *, lifetime_sec: int | None = None
+        ) -> dict[str, str]:
+            cloud_requests.append((cluster_info.name, lifetime_sec))
             return {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
 
     provider = _StubProvider()
@@ -1219,8 +1221,8 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     # kubeconfig), never the ambient current-context.
     assert plan_requests == [(provider, "c1")]
     # The provider's minted cloud credential lands on the spec, keyed to this
-    # run's cluster — empty for providers/tasks that mint nothing.
-    assert cloud_requests == ["c1"]
+    # run's cluster and sized to the same budget as the cluster token.
+    assert cloud_requests == [("c1", 1500)]
     assert spec.cloud_credential_env == {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
 
 
@@ -1697,6 +1699,49 @@ def test_sandbox_exempt_task_gets_the_ambient_inventory(
     report = results[0]["cheating_report"]
     assert report["status"] == "flagged"
     assert "prior-run-artifact" in report["categories"]
+
+
+def test_sandbox_exempt_task_warns_when_its_stack_also_names_a_cloud_identity(
+    isolated_env: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The identity goes unused on an exempt task; say so instead of minting nothing silently."""
+    from devops_bench.core import ClusterInfo
+
+    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
+    real_get_deployer = harness_default.get_deployer
+
+    def _with_identity(*args: Any, **kwargs: Any) -> Any:
+        deployer = real_get_deployer(*args, **kwargs)
+        monkeypatch.setattr(
+            deployer,
+            "get_cluster_info",
+            lambda: ClusterInfo(name="c", agent_cloud_identity="rot-x@p.iam.gserviceaccount.com"),
+        )
+        return deployer
+
+    monkeypatch.setattr(harness_default, "get_deployer", _with_identity)
+
+    class _SandboxAwareWriter(_WorkspaceWritingAgent):
+        supports_sandbox = True
+
+    AGENTS.register("fake-exempt-writer")(_SandboxAwareWriter)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-exempt-writer", no_infra=True
+        )
+        task = Task.from_dict(
+            {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+        )
+        with caplog.at_level(logging.WARNING):
+            harness.run([task])
+    finally:
+        AGENTS._items.pop("fake-exempt-writer", None)  # noqa: SLF001
+
+    assert "also names agent_cloud_identity rot-x@p.iam.gserviceaccount.com" in caplog.text
 
 
 def test_build_agent_config_rejects_a_spec_together_with_exempt(isolated_env: None) -> None:

@@ -591,9 +591,16 @@ name it in an `agent_cloud_identity` output. On a sandboxed run the provider
 mints a short-lived credential for that identity host-side and injects it into
 the container; the operator's own credentials never cross. On GCP this is an
 impersonated access token (`CLOUDSDK_AUTH_ACCESS_TOKEN` /
-`GOOGLE_OAUTH_ACCESS_TOKEN`), valid for at most an hour and not refreshed. A
-mint failure fails the run rather than letting the agent run without the
-credential its task depends on. Tasks with no such output are unaffected.
+`GOOGLE_OAUTH_ACCESS_TOKEN`, with `CLOUDSDK_CORE_PROJECT` pinned to the task's
+project), sized to the same budget as the cluster token above and not
+refreshed. A budget past an hour needs the organization policy that allows
+service-account credential lifetime extension; without it the mint falls back
+to an hour and warns that the credential expires before the agent's timeout.
+A mint failure, a hung `gcloud`, or a provider that cannot mint for a named
+identity fails the run rather than letting the agent run without the
+credential its task depends on. A task that also declares
+`requires_unsandboxed` runs ambient and the identity goes unused, with a
+warning. Tasks with no such output are unaffected.
 
 ## Adding your own harness
 

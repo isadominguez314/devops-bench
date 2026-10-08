@@ -24,7 +24,13 @@ from typing import Any
 import pytest
 from pytest_mock import MockerFixture
 
-from devops_bench.core import ClusterInfo, ConfigError, NetworkPlan, SandboxError
+from devops_bench.core import (
+    ClusterInfo,
+    ConfigError,
+    NetworkPlan,
+    SandboxError,
+    SubprocessError,
+)
 from devops_bench.providers import PROVIDERS, ResolveContext
 from devops_bench.providers.base import Provider
 from devops_bench.providers.gcp import GcpProvider
@@ -193,25 +199,92 @@ def test_gcp_cloud_credential_env_mints_an_impersonated_token(
 ) -> None:
     mock_run = mocker.patch(
         "devops_bench.providers.gcp.run",
-        return_value=SimpleNamespace(returncode=0, stdout="tok-123\n"),
+        return_value=SimpleNamespace(returncode=0, stdout="tok-123\n", stderr=""),
     )
-    info = ClusterInfo(
-        name="c",
-        location="us-central1-a",
-        project="p",
-        agent_cloud_identity="rot-x@p.iam.gserviceaccount.com",
-    )
-    env = GcpProvider().sandbox_cloud_credential_env(info)
+    env = GcpProvider().sandbox_cloud_credential_env(_identity_info())
     assert env["CLOUDSDK_AUTH_ACCESS_TOKEN"] == "tok-123"
     assert env["GOOGLE_OAUTH_ACCESS_TOKEN"] == "tok-123"
     assert env["CLOUDSDK_CORE_PROJECT"] == "p"
-    assert env["GOOGLE_CLOUD_PROJECT"] == "p"
+    # The agent overlay owns GOOGLE_CLOUD_PROJECT (model routing); the mint must not clobber it.
+    assert "GOOGLE_CLOUD_PROJECT" not in env
     assert mock_run.call_args.args[0] == [
         "gcloud",
         "auth",
         "print-access-token",
         "--impersonate-service-account=rot-x@p.iam.gserviceaccount.com",
+        "--scopes=https://www.googleapis.com/auth/cloud-platform",
+        "--lifetime=3600s",
     ]
+    # Bounded: a stalled gcloud must become a failed record, not a hung batch.
+    assert mock_run.call_args.kwargs["timeout"] == 60
+
+
+def _identity_info() -> ClusterInfo:
+    return ClusterInfo(
+        name="c",
+        location="us-central1-a",
+        project="p",
+        agent_cloud_identity="rot-x@p.iam.gserviceaccount.com",
+    )
+
+
+def _lifetime_arg(call: Any) -> str:
+    return next(a for a in call.args[0] if a.startswith("--lifetime="))
+
+
+def test_gcp_cloud_credential_env_requests_the_agent_token_budget(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.providers.gcp.run",
+        return_value=SimpleNamespace(returncode=0, stdout="tok\n", stderr=""),
+    )
+    GcpProvider().sandbox_cloud_credential_env(_identity_info(), lifetime_sec=5400)
+    assert mock_run.call_count == 1
+    assert _lifetime_arg(mock_run.call_args) == "--lifetime=5400s"
+
+
+def test_gcp_cloud_credential_env_falls_back_to_an_hour_when_extension_is_refused(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.providers.gcp.run",
+        side_effect=[
+            SimpleNamespace(returncode=1, stdout="", stderr="lifetime exceeds policy"),
+            SimpleNamespace(returncode=0, stdout="tok\n", stderr=""),
+        ],
+    )
+    with caplog.at_level("WARNING"):
+        env = GcpProvider().sandbox_cloud_credential_env(_identity_info(), lifetime_sec=5400)
+    assert env["CLOUDSDK_AUTH_ACCESS_TOKEN"] == "tok"
+    assert [_lifetime_arg(c) for c in mock_run.call_args_list] == [
+        "--lifetime=5400s",
+        "--lifetime=3600s",
+    ]
+    assert "lifetime exceeds policy" in caplog.text
+    assert "expires before the agent's token budget" in caplog.text
+
+
+def test_gcp_cloud_credential_env_does_not_retry_a_budget_within_an_hour(
+    mocker: MockerFixture,
+) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.providers.gcp.run",
+        return_value=SimpleNamespace(returncode=1, stdout="", stderr="denied"),
+    )
+    with pytest.raises(SandboxError, match="denied"):
+        GcpProvider().sandbox_cloud_credential_env(_identity_info(), lifetime_sec=1500)
+    assert mock_run.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [SubprocessError(["gcloud"], returncode=-1, stdout="", stderr=""), FileNotFoundError("gcloud")],
+)
+def test_gcp_cloud_credential_env_turns_a_hung_or_missing_gcloud_into_a_sandbox_error(
+    mocker: MockerFixture, exc: Exception
+) -> None:
+    mocker.patch("devops_bench.providers.gcp.run", side_effect=exc)
+    with pytest.raises(SandboxError, match="bounded at 60s"):
+        GcpProvider().sandbox_cloud_credential_env(_identity_info())
 
 
 def test_gcp_cloud_credential_env_fails_loud_when_the_mint_fails(
@@ -219,24 +292,34 @@ def test_gcp_cloud_credential_env_fails_loud_when_the_mint_fails(
 ) -> None:
     mocker.patch(
         "devops_bench.providers.gcp.run",
-        return_value=SimpleNamespace(returncode=1, stdout=""),
+        return_value=SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED"),
     )
     info = ClusterInfo(name="c", agent_cloud_identity="rot-x@p.iam.gserviceaccount.com")
-    with pytest.raises(SandboxError, match="serviceAccountTokenCreator"):
+    with pytest.raises(SandboxError, match="serviceAccountTokenCreator") as excinfo:
         GcpProvider().sandbox_cloud_credential_env(info)
+    assert "PERMISSION_DENIED" in str(excinfo.value)
+
+
+class _MinimalProvider(Provider):
+    def ensure_account_credentials(self) -> None: ...
+    def ensure_cluster_credentials(self, *args: Any, **kwargs: Any) -> ClusterInfo:
+        return ClusterInfo(name="c")
+
+    def cleanup(self, *args: Any, **kwargs: Any) -> None: ...
+    def resolve_variables(
+        self, ctx: ResolveContext, custom_variables: dict[str, Any]
+    ) -> dict[str, Any]:
+        return custom_variables
 
 
 def test_provider_default_cloud_credential_env_is_empty() -> None:
-    class Minimal(Provider):
-        def ensure_account_credentials(self) -> None: ...
-        def ensure_cluster_credentials(self, *args, **kwargs) -> ClusterInfo:
-            return ClusterInfo(name="c")
+    assert _MinimalProvider().sandbox_cloud_credential_env(ClusterInfo(name="c")) == {}
 
-        def cleanup(self, *args, **kwargs) -> None: ...
-        def resolve_variables(self, ctx, custom_variables):
-            return custom_variables
 
-    assert Minimal().sandbox_cloud_credential_env(ClusterInfo(name="c")) == {}
+def test_provider_default_cloud_credential_env_refuses_a_named_identity() -> None:
+    info = ClusterInfo(name="c", agent_cloud_identity="rot-x@p.iam.gserviceaccount.com")
+    with pytest.raises(SandboxError, match="_MinimalProvider cannot mint"):
+        _MinimalProvider().sandbox_cloud_credential_env(info)
 
 
 # --- KindProvider --------------------------------------------------------------
