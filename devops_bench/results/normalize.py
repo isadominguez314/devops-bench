@@ -70,17 +70,6 @@ _RECOVERABLE_KEYS = (
 # ``catastrophicKinds``, so the key name doubles as the failure type.
 _CATASTROPHIC_KEYS = score_keys.CATASTROPHIC_SCORE_KEYS
 
-#: Markers that stop a preference chain rather than being skipped over. A
-#: withheld deterministic signal means the task declared checks for that
-#: quantity and they did not resolve; the judged reading of the same quantity
-#: is not a substitute, and a row that fell through would publish a component
-#: the headline composite deliberately declined to build from. Mirrors
-#: ``metrics.pipeline._WITHHELD_KEYS``.
-_WITHHELD_KEYS = {
-    score_keys.VERIFICATION_CORRECTNESS_KEY: score_keys.VERIFICATION_CORRECTNESS_WITHHELD_KEY,
-    score_keys.VERIFICATION_RECOVERABLE_KEY: score_keys.VERIFICATION_RECOVERABLE_WITHHELD_KEY,
-}
-
 # Token usage aliases per provider, in lookup priority. The canonical keys
 # (``input`` / ``cached`` / ``reasoning`` / ``output``; see
 # ``devops_bench.agents.result.TOKEN_BUCKETS``) come first; the rest keep
@@ -259,10 +248,11 @@ def extract_score(scores: Mapping[str, Any] | None, key: str) -> float | None:
 def _first_score(scores: Mapping[str, Any] | None, keys: tuple[str, ...]) -> float | None:
     """Return the score under the first key in ``keys`` that carries one.
 
-    A key whose withheld marker is present ends the walk instead of being
-    skipped, so a signal the deterministic layer declined to publish is not
-    answered by a judged key further down the chain (see
-    :data:`_WITHHELD_KEYS`).
+    A key that is present but carries a ``null`` score was withheld, and it
+    ends the walk instead of being skipped, so a signal a metric declined to
+    publish is not answered by a judged key further down the chain. This
+    mirrors ``metrics.pipeline._resolve`` so the row's components name the
+    same signals the composite was built from.
 
     Args:
         scores: The record's ``scores`` mapping, or ``None``.
@@ -272,13 +262,16 @@ def _first_score(scores: Mapping[str, Any] | None, keys: tuple[str, ...]) -> flo
         The first numeric score found, or ``None`` when no key carries one or
         when a key earlier in the chain was withheld.
     """
+    present = scores or {}
     for key in keys:
-        marker = _WITHHELD_KEYS.get(key)
-        if marker is not None and marker in (scores or {}):
-            return None
-        value = extract_score(scores, key)
+        if key not in present:
+            continue
+        value = extract_score(present, key)
         if value is not None:
             return value
+        entry = present[key]
+        if entry is None or (isinstance(entry, Mapping) and entry.get("score") is None):
+            return None
     return None
 
 
@@ -341,12 +334,11 @@ def _parse_error_rows(errors: Any) -> list[CheckRow]:
     """Surface each ``verification_parse_errors`` item as an ``error`` check.
 
     An entry that fails to parse, or is dropped as a duplicate name, never
-    evaluates, yet it already fails closed into the correctness score. Without
-    a row for it a viewer would see a low score next to an all-green check
-    list. The row carries the role and severity the entry declared, so a
-    safeguard that went unrun reads as one; ``objective`` is the fallback for
-    an entry that declared nothing usable, and is also what the rollup charges
-    every such entry as, at weight 1.0.
+    evaluates, yet it still resolves in the rollup: it withholds the signal
+    its declared role and severity feed, or fails the catastrophic gate
+    closed. Without a row for it a viewer would see a withheld score next to
+    an all-green check list. ``objective`` is the fallback for an entry that
+    declared nothing usable, matching the rollup's own routing.
     """
     rows: list[CheckRow] = []
     for item in errors or []:

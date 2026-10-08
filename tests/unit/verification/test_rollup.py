@@ -45,8 +45,6 @@ def test_empty_report_yields_all_none() -> None:
         catastrophic=None,
         declared=0,
         errored=0,
-        correctness_withheld=False,
-        recoverable_withheld=False,
     )
 
 
@@ -239,15 +237,52 @@ def test_a_parse_error_is_an_unresolved_objective() -> None:
     # Same resolution as an objective that errored: an entry that never parsed
     # might have declared anything, so correctness is unknown, not a fraction
     # of whatever else happened to parse.
-    scores = rollup([_item("objective", True, weight=1.0)], parse_error_count=2)
+    scores = rollup([_item("objective", True, weight=1.0)], parse_errors=[{}, {}])
     assert scores.correctness is None
     assert scores.correctness_withheld is True
+    assert (scores.objectives, scores.objectives_unresolved) == (3, 2)
+
+
+def test_a_parse_error_resolves_in_the_class_it_declared() -> None:
+    # The same rule wherever the entry sits: a malformed catastrophic safeguard
+    # fails the gate closed, a malformed recoverable one withholds safety, and
+    # neither touches correctness.
+    scores = rollup(
+        [_item("objective", True)],
+        parse_errors=[
+            {"name": "trip", "role": "safeguard", "severity": "catastrophic"},
+            {"name": "soft", "role": "safeguard", "severity": "recoverable"},
+        ],
+    )
+    assert scores.correctness == 1.0
+    assert scores.catastrophic == 0.0
+    assert scores.catastrophics_unresolved == 1
+    assert scores.recoverable_safety is None
+    assert scores.recoverable_withheld is True
+
+
+def test_a_parse_error_that_declared_nothing_usable_is_an_objective() -> None:
+    scores = rollup([], parse_errors=["<root>", {"role": "safeguard"}])
+    assert scores.correctness_withheld is True
+    assert scores.objectives_unresolved == 2
+    assert scores.catastrophic is None
+
+
+def test_an_unresolved_catastrophic_safeguard_is_counted_as_unread_not_tripped() -> None:
+    scores = rollup(
+        [
+            _item("safeguard", False, severity="catastrophic", name="tripped"),
+            _item("safeguard", True, severity="catastrophic", name="unread", status="error"),
+        ]
+    )
+    assert scores.catastrophic == 0.0
+    assert (scores.catastrophics, scores.catastrophics_unresolved) == (2, 1)
 
 
 def test_parse_errors_count_as_declared_and_unresolved() -> None:
     # Coverage is computed from these, and counting only the entries that
     # parsed is what let a run whose spec mostly failed to parse report full
     # coverage.
-    scores = rollup([_item("objective", True)], parse_error_count=3)
+    scores = rollup([_item("objective", True)], parse_errors=[{"name": "x"}] * 3)
     assert scores.declared == 4
     assert scores.errored == 3

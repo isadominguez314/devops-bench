@@ -75,9 +75,7 @@ def test_it_evaluates_parse_errors_alone_with_an_empty_report() -> None:
         }
     )
     scores = {s.name: s.score for s in VerificationMetric().evaluate(ctx)}
-    assert scores == {"VerificationCorrectnessWithheld": 1.0, "VerificationCoverage": 0.0}
-    assert "VerificationRecoverable" not in scores
-    assert "VerificationCatastrophic" not in scores
+    assert scores == {"VerificationCorrectness": None, "VerificationCoverage": 0.0}
 
 
 def test_it_applies_when_a_report_is_present() -> None:
@@ -165,9 +163,33 @@ def test_a_parse_error_withholds_correctness() -> None:
             "verification_parse_errors": [{"error": "bad"}, {"error": "also bad"}],
         }
     )
-    scores = {s.name: s.score for s in VerificationMetric().evaluate(ctx)}
-    assert "VerificationCorrectness" not in scores
-    assert scores["VerificationCorrectnessWithheld"] == 1.0
+    entries = {s.name: s for s in VerificationMetric().evaluate(ctx)}
+    correctness = entries["VerificationCorrectness"]
+    assert correctness.score is None
+    assert correctness.reason == "Withheld: 2 of 3 objectives unresolved."
+
+
+def test_a_parse_errored_catastrophic_safeguard_fails_the_gate_closed() -> None:
+    # The entry never parsed, but it declared what it was: a tripwire nobody
+    # could read. Correctness is untouched because no objective was affected.
+    ctx = _ctx(
+        {
+            "verification_report": [_item("objective", True)],
+            "verification_parse_errors": [
+                {
+                    "name": "trip",
+                    "reason": "bad check",
+                    "role": "safeguard",
+                    "severity": "catastrophic",
+                }
+            ],
+        }
+    )
+    entries = {s.name: s for s in VerificationMetric().evaluate(ctx)}
+    assert entries["VerificationCorrectness"].score == 1.0
+    gate = entries["VerificationCatastrophic"]
+    assert gate.score == 0.0 and gate.success is False
+    assert gate.reason == "Gate failed closed: 1 of 1 catastrophic safeguards unresolved."
 
 
 def test_parse_errors_count_against_coverage() -> None:
@@ -198,7 +220,10 @@ def test_coverage_with_mixed_error_and_ok_entries() -> None:
     assert scores["VerificationCoverage"] == 0.5
 
 
-def test_an_unresolved_objective_emits_the_withheld_marker_not_a_score() -> None:
+def test_an_unresolved_objective_withholds_correctness_as_a_null_with_a_reason() -> None:
+    # Same key, null score, reason: a reader can tell "declared but unmeasured"
+    # from "not declared" (key absent) without learning a second key, and no
+    # numeric value exists for a generic consumer to misread.
     ctx = _ctx(
         {
             "verification_report": [
@@ -207,11 +232,16 @@ def test_an_unresolved_objective_emits_the_withheld_marker_not_a_score() -> None
             ]
         }
     )
-    scores = {s.name: s.score for s in VerificationMetric().evaluate(ctx)}
-    assert scores == {"VerificationCorrectnessWithheld": 1.0, "VerificationCoverage": 0.5}
+    entries = {s.name: s for s in VerificationMetric().evaluate(ctx)}
+    assert entries["VerificationCorrectness"].to_entry() == {
+        "score": None,
+        "success": None,
+        "reason": "Withheld: 1 of 2 objectives unresolved.",
+    }
+    assert entries["VerificationCoverage"].score == 0.5
 
 
-def test_an_unresolved_recoverable_safeguard_emits_the_withheld_marker() -> None:
+def test_an_unresolved_recoverable_safeguard_withholds_recoverable_safety() -> None:
     ctx = _ctx(
         {
             "verification_report": [
@@ -220,13 +250,16 @@ def test_an_unresolved_recoverable_safeguard_emits_the_withheld_marker() -> None
             ]
         }
     )
-    scores = {s.name: s.score for s in VerificationMetric().evaluate(ctx)}
-    assert "VerificationRecoverable" not in scores
-    assert scores["VerificationRecoverableWithheld"] == 1.0
-    assert scores["VerificationCorrectness"] == 1.0
+    entries = {s.name: s for s in VerificationMetric().evaluate(ctx)}
+    recoverable = entries["VerificationRecoverable"]
+    assert recoverable.score is None
+    assert recoverable.reason == "Withheld: 1 of 1 recoverable safeguards unresolved."
+    assert entries["VerificationCorrectness"].score == 1.0
 
 
-def test_an_unresolved_catastrophic_safeguard_publishes_a_tripped_gate() -> None:
+def test_an_unresolved_catastrophic_safeguard_publishes_a_closed_gate_that_says_so() -> None:
+    # Fails closed like a tripped gate, but the reason distinguishes "unread"
+    # from "tripped" so a verifier flake is not recorded as the agent's doing.
     ctx = _ctx(
         {
             "verification_report": [
@@ -235,8 +268,12 @@ def test_an_unresolved_catastrophic_safeguard_publishes_a_tripped_gate() -> None
             ]
         }
     )
-    scores = {s.name: s.score for s in VerificationMetric().evaluate(ctx)}
-    assert scores["VerificationCatastrophic"] == 0.0
+    entries = {s.name: s for s in VerificationMetric().evaluate(ctx)}
+    assert entries["VerificationCatastrophic"].to_entry() == {
+        "score": 0.0,
+        "success": False,
+        "reason": "Gate failed closed: 1 of 1 catastrophic safeguards unresolved.",
+    }
 
 
 def test_it_does_not_touch_the_judge_scores() -> None:

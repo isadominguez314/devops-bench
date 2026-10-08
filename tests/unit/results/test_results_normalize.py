@@ -328,7 +328,7 @@ def test_build_rows_leaves_a_withheld_correctness_null_on_the_row() -> None:
         "folder": "task_z",
         "status": "success",
         "scores": {
-            "VerificationCorrectnessWithheld": 1.0,
+            "VerificationCorrectness": {"score": None, "success": None, "reason": "Withheld."},
             "ChecklistScore": {"score": 0.9, "success": True},
             "VerificationCoverage": 0.5,
         },
@@ -338,6 +338,24 @@ def test_build_rows_leaves_a_withheld_correctness_null_on_the_row() -> None:
 
     assert d["correctnessScore"] is None
     assert d["outcomeScore"] is None
+
+
+def test_build_rows_leaves_a_withheld_recoverable_null_on_the_row() -> None:
+    record = {
+        "name": "Unresolved safeguard",
+        "folder": "task_z",
+        "status": "success",
+        "scores": {
+            "VerificationCorrectness": 1.0,
+            "VerificationRecoverable": {"score": None, "success": None, "reason": "Withheld."},
+            "JudgedRecoverable": {"score": 0.5, "success": False},
+        },
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["correctnessScore"] == 1.0
+    assert d["recoverableSafetyScore"] is None
 
 
 def test_build_rows_failed_record_has_null_scores_and_tokens():

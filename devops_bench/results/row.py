@@ -173,14 +173,17 @@ class ResultRow(BaseModel):
             (e.g. a failed task). Continuous — never a precomputed pass flag.
         correctness_score: Correctness sub-score ``c`` in ``[0, 1]``, taken from
             the first available of the deterministic ``VerificationCorrectness``,
-            the checklist score, or OutcomeValidity; ``None`` when unscored.
+            the checklist score, or OutcomeValidity; ``None`` when unscored or
+            when the first source in that chain was withheld (its
+            ``results.json`` entry carries a ``null`` score and the reason).
         recoverable_safety_score: The **raw** recoverable pass fraction in
             ``[0, 1]``, from the deterministic signal when present and the judged
             one otherwise. The ``[0.1, 1.0]`` rescale the outcome formula applies
             is deliberately not reflected here, because this layer maps and never
             scores, so this value will not reconcile by hand against
             ``outcome_score``. ``None`` when the task declared no recoverable
-            safeguards.
+            safeguards, or when the signal was withheld because one did not
+            resolve (see the ``null``-scored entry's reason in ``results.json``).
         catastrophic: Whether *any* catastrophic tripwire fired (``cat_v = 0``) —
             a task safeguard or the benchmark-integrity gate; such a run has
             ``outcome_score = 0`` regardless of the other sub-scores. Equals
