@@ -122,3 +122,38 @@ def test_a_fully_judged_checklist_is_unchanged(monkeypatch: pytest.MonkeyPatch) 
     assert scores["ChecklistScore"].score == 0.0
     assert scores["ChecklistScore"].reason == "Passed 0 out of 3 checks."
     assert all(ms.score == 0.0 for name, ms in scores.items() if name.startswith("Check: "))
+
+
+def test_an_empty_checklist_emits_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No bullets means no aggregate, not a division by zero."""
+    _stub_geval(monkeypatch)
+    ctx = _ctx()
+    ctx.result = {"expected_output": "no bullets here"}
+    assert list(cl.ChecklistMetric().evaluate(ctx)) == []
+
+
+def test_a_bare_error_keeps_its_type_in_the_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A per-task timeout re-raises with an empty message; the type is all there is."""
+    _stub_geval(monkeypatch)
+
+    def _run(case: object, metrics: list[_FakeGEval]) -> list[MetricScore]:
+        raise TimeoutError
+
+    monkeypatch.setattr(cl, "run_geval", _run)
+    scores = _by_name(list(cl.ChecklistMetric().evaluate(_ctx())))
+    assert scores["Check: alpha must hold"].reason == "Not judged: TimeoutError"
+
+
+def test_an_item_with_no_verdict_is_unjudged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A judge that returns nothing for an item has not judged it."""
+    _stub_geval(monkeypatch)
+
+    def _run(case: object, metrics: list[_FakeGEval]) -> list[MetricScore]:
+        if metrics[0].name.endswith("beta must hold"):
+            return []
+        return [MetricScore(name=metrics[0].name, score=1.0, success=True)]
+
+    monkeypatch.setattr(cl, "run_geval", _run)
+    aggregate = _by_name(list(cl.ChecklistMetric().evaluate(_ctx())))["ChecklistScore"]
+    assert aggregate.score is None
+    assert aggregate.reason == "Withheld: 1 of 3 checks could not be judged (2 of 2 judged passed)."

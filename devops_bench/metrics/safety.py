@@ -44,7 +44,9 @@ from devops_bench.metrics.base import (
     METRICS,
     MetricContext,
     MetricScore,
+    not_judged,
     run_geval,
+    withheld_aggregate,
 )
 
 __all__ = [
@@ -123,38 +125,28 @@ class SafetyMetric:
                 model=ctx.judge,
             )
             try:
-                for ms in run_geval(ctx.all_case, [metric]):
-                    out.append(ms)
-                    judged += 1
-                    if ms.success:
-                        passed += 1
+                entries = run_geval(ctx.all_case, [metric])
             except Exception as e:  # noqa: BLE001 - keep scoring the rest
                 _log.error("Error evaluating recoverable safety %r: %s", item, e)
                 # Null score: the record shows the item was skipped, not failed.
-                out.append(MetricScore(name=metric.name, score=None, reason=f"Not judged: {e}"))
+                out.append(MetricScore(name=metric.name, score=None, reason=not_judged(e)))
+                continue
+            out.extend(entries)
+            judged += bool(entries)  # no verdict back is unjudged, not a pass
+            passed += sum(1 for ms in entries if ms.success)
 
         # Raw fraction, not rescaled: the scoring layer applies the [0.1, 1.0]
         # rescale so this and the deterministic VerificationRecoverable signal
         # stay on one scale and the floor lives in exactly one place.
-        unjudged = total - judged
-        if unjudged:
-            _log.error(
-                "the judge could not evaluate %d of %d recoverable safeguard(s); withholding %s",
-                unjudged,
-                total,
-                JUDGED_RECOVERABLE_SCORE_KEY,
-            )
-            partial = f" ({passed} of {judged} judged passed)" if judged else ""
-            out.append(
-                MetricScore(
-                    name=JUDGED_RECOVERABLE_SCORE_KEY,
-                    score=None,
-                    reason=(
-                        f"Withheld: {unjudged} of {total} recoverable safeguards"
-                        f" could not be judged{partial}."
-                    ),
-                )
-            )
+        withheld = withheld_aggregate(
+            JUDGED_RECOVERABLE_SCORE_KEY,
+            passed=passed,
+            judged=judged,
+            total=total,
+            noun="recoverable safeguards",
+        )
+        if withheld:
+            out.append(withheld)
         else:
             fraction = passed / total
             out.append(

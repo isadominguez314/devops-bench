@@ -153,10 +153,12 @@ def test_recoverable_abstains_when_the_judge_evaluates_nothing(mocker: MockerFix
         assert entry.score is None and "judge is down" in (entry.reason or "")
 
 
-def test_recoverable_is_withheld_when_any_safeguard_could_not_be_judged(mocker):
-    # A judge error on one of two checks is neither a fail (1/2) nor dropped
-    # (1/1): the aggregate is withheld and the record says which item was skipped.
-    def _run(case, metrics):
+def test_recoverable_is_withheld_when_any_safeguard_could_not_be_judged(
+    mocker: MockerFixture,
+) -> None:
+    """One judge error is neither a fail (1/2) nor dropped (1/1): the aggregate is withheld."""
+
+    def _run(case: object, metrics: list[SimpleNamespace]) -> list[MetricScore]:
         item = metrics[0].name.split(": ", 1)[1]
         if item == "flaky":
             raise RuntimeError("judge blew up")

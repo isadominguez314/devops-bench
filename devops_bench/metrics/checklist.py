@@ -33,7 +33,9 @@ from devops_bench.metrics.base import (
     METRICS,
     MetricContext,
     MetricScore,
+    not_judged,
     run_geval,
+    withheld_aggregate,
 )
 
 __all__ = [
@@ -113,6 +115,8 @@ class ChecklistMetric:
     def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
         """Score each requirement and emit the aggregate ChecklistScore."""
         items = extract_checklist_items(ctx.result.get("expected_output", ""), ctx.use_mcp)
+        if not items:
+            return []
         dynamic_metrics = [
             GEval(
                 name=f"Check: {item}",
@@ -131,34 +135,23 @@ class ChecklistMetric:
         judged = 0
         total = len(dynamic_metrics)
         for m in dynamic_metrics:
+            _log.info("Evaluating metric: %s...", m.name)
             try:
-                _log.info("Evaluating metric: %s...", m.name)
-                for ms in run_geval(ctx.all_case, [m]):
-                    out.append(ms)
-                    if ms.success:
-                        passed += 1
-                judged += 1
+                entries = run_geval(ctx.all_case, [m])
             except Exception as e:  # noqa: BLE001 - keep scoring the rest
                 _log.error("Error evaluating metric %s: %s", m.name, e)
                 # Null score: the record shows the item was skipped, not failed.
-                out.append(MetricScore(name=m.name, score=None, reason=f"Not judged: {e}"))
+                out.append(MetricScore(name=m.name, score=None, reason=not_judged(e)))
+                continue
+            out.extend(entries)
+            judged += bool(entries)  # no verdict back is unjudged, not a pass
+            passed += sum(1 for ms in entries if ms.success)
 
-        # Any unjudged item withholds the aggregate: a ratio over a subset is not comparable.
-        unjudged = total - judged
-        if unjudged:
-            _log.error(
-                "the judge could not evaluate %d of %d checklist item(s); withholding ChecklistScore",
-                unjudged,
-                total,
-            )
-            partial = f" ({passed} of {judged} judged passed)" if judged else ""
-            out.append(
-                MetricScore(
-                    name="ChecklistScore",
-                    score=None,
-                    reason=f"Withheld: {unjudged} of {total} checks could not be judged{partial}.",
-                )
-            )
+        withheld = withheld_aggregate(
+            "ChecklistScore", passed=passed, judged=judged, total=total, noun="checks"
+        )
+        if withheld:
+            out.append(withheld)
         else:
             ratio = passed / total
             out.append(
