@@ -21,7 +21,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -964,6 +964,21 @@ def test_vertex_auth_profile_follows_the_effective_key(
     assert ("paste-api-key --provider google-vertex" in command) is seeded
 
 
+@pytest.mark.parametrize(
+    "host_key,extra_key,seeded",
+    [("", "real-express-key", False), ("real-express-key", "", True)],
+)
+def test_vertex_auth_profile_follows_the_key_extra_env_delivers(
+    monkeypatch: pytest.MonkeyPatch, host_key: str, extra_key: str, seeded: bool
+) -> None:
+    """``extra_env`` outranks the host env in _build_env, so the seed decision follows it too."""
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", host_key)
+    cfg = AgentConfig(provider="google-vertex", extra_env={"GOOGLE_CLOUD_API_KEY": extra_key})
+    assert _build_env(cfg)["GOOGLE_CLOUD_API_KEY"] == extra_key
+    command = oc_mod._build_local_command(cfg, "hi", "operator", "oc")
+    assert ("paste-api-key --provider google-vertex" in command) is seeded
+
+
 def test_vertex_auth_profile_skipped_for_a_non_vertex_provider() -> None:
     command = oc_mod._build_local_command(AgentConfig(provider="google"), "hi", "operator", "oc")
     assert "paste-api-key" not in command
@@ -1110,11 +1125,11 @@ def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
 ) -> None:
     """Unsandboxed runs use the host's own ADC; no emulator is started."""
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
-    monkeypatch.setattr(
-        oc_mod,
-        "sandbox_credential_env",
-        lambda *a, **k: pytest.fail("sandbox_credential_env called on an unsandboxed run"),
-    )
+
+    def no_emulator(*args: Any, **kwargs: Any) -> NoReturn:
+        pytest.fail("sandbox_credential_env called on an unsandboxed run")
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", no_emulator)
     monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
     captured: dict[str, Any] = {}
 
