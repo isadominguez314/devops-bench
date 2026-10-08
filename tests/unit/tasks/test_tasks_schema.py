@@ -212,10 +212,8 @@ def test_chaos_spec_is_opaque():
 
 
 def test_non_list_verification_spec_raises():
-    # verification_spec is a list of entry mappings; parse_entries downstream
-    # keeps a defensive non-list branch for callers outside Task, but the
-    # schema should reject the malformed shape at load time with a clear
-    # error rather than deferring it.
+    # verification_spec must be a list of entry mappings; reject the malformed shape
+    # at load time instead of deferring to parse_entries.
     with pytest.raises(ValidationError):
         Task.from_dict({"verification_spec": {"check": "ok"}}, name_default="d")
 
@@ -247,7 +245,9 @@ def test_to_dict_roundtrip_fields():
         "recoverable_safety",
         "infrastructure",
         "documentation",
+        "agent_pod_security",
         "validated",
+        "requires_unsandboxed",
     }
 
 
@@ -268,13 +268,54 @@ def test_validated_roundtrips_in_to_dict():
     assert Task.from_dict(_validated_raw()).to_dict()["validated"] is True
 
 
+def test_requires_unsandboxed_defaults_false():
+    assert Task.from_dict({"name": "n"}, name_default="d").requires_unsandboxed is False
+
+
+def test_requires_unsandboxed_parsed_from_spec():
+    # Task drops unknown keys silently, so this pins the from_dict wiring.
+    assert Task.from_dict({"name": "n", "requires_unsandboxed": True}).requires_unsandboxed is True
+
+
+def test_requires_unsandboxed_empty_block_coalesces_false():
+    # An empty YAML block (``requires_unsandboxed:`` with no value) parses to None.
+    task = Task.from_dict({"name": "n", "requires_unsandboxed": None})
+    assert task.requires_unsandboxed is False
+
+
 def test_safety_checklists_empty_block_coalesces_to_empty_list():
-    # An empty ``recoverable_safety:`` / ``catastrophic:`` block parses to None.
-    # Both entry points must coalesce it: from_dict, and direct
-    # model_validate/__init__, which only goes through the _coalesce_empty validator.
+    # An empty ``recoverable_safety:`` / ``catastrophic:`` block parses to None; both
+    # from_dict and direct model_validate must coalesce it.
     assert Task.from_dict({"name": "n", "recoverable_safety": None}).recoverable_safety == []
     direct = Task.model_validate({"name": "n", "recoverable_safety": None, "catastrophic": None})
     assert direct.recoverable_safety == []
+
+
+def test_agent_pod_security_defaults_to_baseline() -> None:
+    """An author who never heard of the key still gets the control."""
+    assert Task.from_dict({"name": "n"}).agent_pod_security == "baseline"
+
+
+def test_agent_pod_security_round_trips_an_opt_out() -> None:
+    """A declared ``privileged`` opt-out must survive from_dict -> to_dict, or
+    a re-serialized task would silently regain the enforcement it opted out of."""
+    task = Task.from_dict({"name": "n", "agent_pod_security": "privileged"})
+    assert task.agent_pod_security == "privileged"
+    assert task.to_dict()["agent_pod_security"] == "privileged"
+
+
+@pytest.mark.parametrize("value", ["Privileged", "privleged", "restricted", "none"])
+def test_unknown_agent_pod_security_is_rejected_at_load_time(value: str) -> None:
+    """A typo'd level must fail at load time, not silently ignore the opt-out."""
+    with pytest.raises(ValidationError):
+        Task.from_dict({"name": "n", "agent_pod_security": value})
+
+
+def test_empty_agent_pod_security_coalesces_to_the_default() -> None:
+    """A bare ``agent_pod_security:`` (None) must mean the default, not opt out."""
+    assert Task.from_dict({"name": "n", "agent_pod_security": None}).agent_pod_security == (
+        "baseline"
+    )
 
 
 # -- display metadata --------------------------------------------------------

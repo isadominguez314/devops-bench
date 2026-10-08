@@ -115,6 +115,31 @@ def test_get_resource_with_name(mocker: MockerFixture) -> None:
     assert argv == ["kubectl", "get", "deployment", "my-dep", "-o", "json"]
 
 
+def test_get_resource_lists_across_every_namespace(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout='{"items": []}'),
+    )
+
+    kubectl.get_resource("pods", all_namespaces=True)
+
+    assert mock_run.call_args.args[0] == ["kubectl", "get", "pods", "-o", "json", "-A"]
+
+
+def test_get_resource_prefers_an_explicit_namespace_over_all(mocker: MockerFixture) -> None:
+    """``-n`` and ``-A`` together are a kubectl error; ``-n`` wins."""
+    mock_run = mocker.patch(
+        "devops_bench.k8s.kubectl.run",
+        return_value=_completed(stdout='{"items": []}'),
+    )
+
+    kubectl.get_resource("pods", namespace="default", all_namespaces=True)
+
+    argv = mock_run.call_args.args[0]
+    assert argv[-2:] == ["-n", "default"]
+    assert "-A" not in argv
+
+
 def test_get_resource_forwards_timeout(mocker: MockerFixture) -> None:
     payload = {"items": []}
     mock_run = mocker.patch(
@@ -145,6 +170,85 @@ def test_apply_builds_argv(mocker: MockerFixture) -> None:
 
     argv = mock_run.call_args.args[0]
     assert argv == ["kubectl", "apply", "-f", "/manifests/app.yaml", "-n", "staging"]
+
+
+def test_delete_builds_argv_and_ignores_not_found_by_default(mocker: MockerFixture) -> None:
+    # Teardown callers treat "already gone" as success.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("clusterrolebinding", "a", "b", context="kind-bench")
+
+    argv = mock_run.call_args.args[0]
+    assert argv == [
+        "kubectl",
+        "delete",
+        "clusterrolebinding",
+        "a",
+        "b",
+        "--ignore-not-found",
+        "--context",
+        "kind-bench",
+    ]
+
+
+def test_delete_can_skip_waiting_and_surface_not_found(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("pod", "web-0", namespace="prod", ignore_not_found=False, wait=False)
+
+    argv = mock_run.call_args.args[0]
+    assert argv == ["kubectl", "delete", "pod", "web-0", "--wait=false", "-n", "prod"]
+
+
+def test_delete_threads_the_subprocess_timeout(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("namespace", "bench-system", timeout=300)
+
+    assert mock_run.call_args.kwargs["timeout"] == 300
+
+
+def test_apply_label_config_value_and_create_token_thread_the_timeout(
+    mocker: MockerFixture,
+) -> None:
+    """Provisioning and teardown calls must be bounded so a silent apiserver cannot hang the run."""
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed(stdout="v"))
+    kubectl.apply("m.yaml", timeout=60)
+    assert mock_run.call_args.kwargs["timeout"] == 60
+    kubectl.label("namespace", "ns", {"k": None}, timeout=61)
+    assert mock_run.call_args.kwargs["timeout"] == 61
+    kubectl.config_value("{.x}", timeout=62)
+    assert mock_run.call_args.kwargs["timeout"] == 62
+    kubectl.create_token("sa", namespace="ns", duration_sec=5, timeout=63)
+    assert mock_run.call_args.kwargs["timeout"] == 63
+
+
+def test_apply_and_label_omit_the_timeout_kwarg_when_unset(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+    kubectl.apply("m.yaml")
+    assert "timeout" not in mock_run.call_args.kwargs
+    kubectl.label("namespace", "ns", {"k": "v"})
+    assert "timeout" not in mock_run.call_args.kwargs
+
+
+def test_delete_refuses_an_empty_name_list(mocker: MockerFixture) -> None:
+    # No implicit --all.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    with pytest.raises(ValueError):
+        kubectl.delete("pod")
+
+    mock_run.assert_not_called()
+
+
+def test_label_renders_a_none_value_as_removal(mocker: MockerFixture) -> None:
+    # ``key-`` is kubectl's "remove this label".
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.label("namespace", "default", {"keep": "1", "drop": None})
+
+    argv = mock_run.call_args.args[0]
+    assert argv == ["kubectl", "label", "namespace", "default", "keep=1", "drop-"]
 
 
 def test_rollout_status_with_timeout(mocker: MockerFixture) -> None:
@@ -454,6 +558,61 @@ def test_is_not_found_matches_both_renderings_only(stderr: str, expected: bool) 
 
 def test_is_not_found_tolerates_an_exception_without_stderr() -> None:
     assert kubectl.is_not_found(RuntimeError("boom")) is False
+
+
+def test_apply_threads_context_into_argv(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.apply("/tmp/manifest.yaml", namespace="prod", context="kind-bench")
+
+    assert mock_run.call_args.args[0] == [
+        "kubectl",
+        "apply",
+        "-f",
+        "/tmp/manifest.yaml",
+        "-n",
+        "prod",
+        "--context",
+        "kind-bench",
+    ]
+
+
+def test_get_resource_pins_context_alongside_kubeconfig(mocker: MockerFixture) -> None:
+    # One kubeconfig can hold several contexts, so the file alone is not a pin.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed("{}"))
+
+    kubectl.get_resource("pods", kubeconfig="/tmp/kc", context="gke_p_us_c")
+
+    assert mock_run.call_args.args[0][-2:] == ["--context", "gke_p_us_c"]
+    assert mock_run.call_args.kwargs["extra_env"] == {"KUBECONFIG": "/tmp/kc"}
+
+
+def test_apply_and_get_resource_omit_the_flag_without_a_context(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed("{}"))
+
+    kubectl.apply("/tmp/manifest.yaml")
+    kubectl.get_resource("pods")
+
+    for call in mock_run.call_args_list:
+        assert "--context" not in call.args[0]
+
+
+# --context must precede a bare "--"; later args belong to the container command.
+
+
+def test_context_lands_before_a_bare_separator() -> None:
+    argv = kubectl._insert_context_args(
+        ["kubectl", "exec", "pod/web", "--", "sh", "-c", "echo hi"], "kind-bench"
+    )
+
+    assert argv.index("--context") < argv.index("--")
+
+
+@pytest.mark.parametrize("context", [None, ""])
+def test_no_context_leaves_argv_untouched(context: str | None) -> None:
+    argv = ["kubectl", "get", "pods"]
+
+    assert kubectl._insert_context_args(argv, context) == argv
 
 
 def test_exec_pod_builds_argv_and_returns_the_completed_process(mocker: MockerFixture) -> None:
