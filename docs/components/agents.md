@@ -132,10 +132,10 @@ run their model with no reasoning throttle. Override it with
 `AGENT_MODEL_EFFORT`.
 
 Tiers vary by model, and the harness only checks `AGENT_MODEL_EFFORT` against
-the tiers some model offers. In `agy` 1.2.0 the Flash models take `low`,
-`medium`, and `high`, but Gemini 3.1 Pro takes only `low` and `high`, so
-`medium` on Pro is rejected by `agy` itself at startup, before the agent takes
-any action. The default, `high`, is valid for every model.
+the union of tiers across models. The Flash models take `low`, `medium`, and
+`high`; Gemini 3.1 Pro takes only `low` and `high`, so `medium` on Pro is
+rejected by `agy` itself at startup, before the agent takes any action. The
+default, `high`, is valid for every model.
 
 A tier already spelled into `AGENT_MODEL` is honoured, and `AGENT_MODEL_EFFORT`
 is ignored. A slug suffix is split onto the flag — `gemini-3.1-pro-low`, or the
