@@ -1010,6 +1010,18 @@ def test_vertex_auth_profile_follows_the_key_extra_env_delivers(
     assert ("paste-api-key --provider google-vertex" in command) is seeded
 
 
+def test_a_stray_key_on_a_keyless_vertex_provider_still_seeds_and_starts_the_emulator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """anthropic-vertex declares no key var, so a configured key never reaches oc."""
+    cfg = _sandboxed(tmp_path, provider="anthropic-vertex", api_key="stray-gemini-key")
+    command = oc_mod._build_local_command(cfg, "hi", "operator", "oc")
+    assert "paste-api-key --provider anthropic-vertex" in command
+    calls = _install_fake_emulator(monkeypatch)
+    oc_mod._sandbox_provider_env(cfg, tmp_path)
+    assert calls
+
+
 def test_vertex_auth_profile_skipped_for_a_non_vertex_provider() -> None:
     command = oc_mod._build_local_command(AgentConfig(provider="google"), "hi", "operator", "oc")
     assert "paste-api-key" not in command
