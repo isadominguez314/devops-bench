@@ -121,17 +121,28 @@ class Provider(ABC):
             "wrote — override it, or run this provider unsandboxed"
         )
 
-    def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
+    def sandbox_cloud_credential_env(
+        self, cluster_info: ClusterInfo, *, lifetime_sec: int | None = None
+    ) -> dict[str, str]:
         """Mint a short-lived credential for the task's ``agent_cloud_identity``.
 
-        For tasks whose work includes cloud API calls beyond ``kubectl``. The
-        default mints nothing; an override must raise when the identity is
-        named but no credential can be produced.
+        For tasks whose work includes cloud API calls beyond ``kubectl``;
+        ``lifetime_sec`` is the agent's token budget. The default mints nothing,
+        so it refuses a named identity rather than start the agent without it.
 
         Returns:
             Env to inject into the sandboxed agent; empty when no identity.
+
+        Raises:
+            SandboxError: When the identity is named and this provider cannot mint for it.
         """
-        del cluster_info
+        del lifetime_sec
+        if cluster_info.agent_cloud_identity:
+            raise SandboxError(
+                f"provider {type(self).__name__} cannot mint a credential for the agent's "
+                f"cloud identity {cluster_info.agent_cloud_identity!r}; refusing to run the "
+                "agent without the credential its task needs"
+            )
         return {}
 
     def cleanup(
