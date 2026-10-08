@@ -609,6 +609,42 @@ def test_executor_run_hands_the_cloud_credential_value_to_the_docker_client(
     assert seen["extra_env"] == {"FOO": "bar", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
 
 
+def test_executor_run_refuses_an_overlay_that_collides_with_the_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        env_allowlist=("CLOUDSDK_CORE_PROJECT",),
+        cloud_credential_env={"CLOUDSDK_CORE_PROJECT": "bench-proj"},
+    )
+    monkeypatch.setattr(sandbox, "run", lambda *a, **k: pytest.fail("must not launch"))
+    with pytest.raises(SandboxError, match=r"both set \['CLOUDSDK_CORE_PROJECT'\]"):
+        sandbox.SandboxExecutor(spec).run(
+            ["agy"], extra_env={"CLOUDSDK_CORE_PROJECT": "vertex-proj"}, check=False
+        )
+
+
+def test_executor_filters_the_cloud_credential_once_per_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    spec = _complete_spec(
+        tmp_path, cloud_credential_env={"HOME": "/elsewhere", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
+    )
+    monkeypatch.setattr(
+        sandbox, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr="")
+    )
+    with caplog.at_level("WARNING"):
+        sandbox.SandboxExecutor(spec).run(["agy"], check=False)
+    # wrap_argv and the client env share one filtered copy, so one warning, not two.
+    assert sum("HOME" in r.message and "container-owned" in r.message for r in caplog.records) == 1
+
+
+def test_sandbox_spec_repr_hides_the_cloud_credential(tmp_path: Path) -> None:
+    spec = _complete_spec(tmp_path, cloud_credential_env={"CLOUDSDK_AUTH_ACCESS_TOKEN": "ya29.x"})
+    assert "ya29.x" not in repr(spec)
+    assert "cloud_credential_env" not in repr(spec)
+
+
 def test_wrap_argv_mounts_fixtures_read_write(tmp_path: Path) -> None:
     executor = sandbox.SandboxExecutor(
         _complete_spec(

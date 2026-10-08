@@ -33,6 +33,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -148,7 +149,7 @@ class SandboxSpec:
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
     owner: str = ""
-    cloud_credential_env: Mapping[str, str] = field(default_factory=dict)
+    cloud_credential_env: Mapping[str, str] = field(default_factory=dict, repr=False)
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
@@ -458,15 +459,11 @@ class SandboxExecutor:
                 " ".join(argv),
             )
 
-    def _cloud_credential_env(self) -> dict[str, str]:
-        """The spec's minted cloud credential, minus container-owned names."""
-        kept: dict[str, str] = {}
-        for name, value in self.spec.cloud_credential_env.items():
-            if name in _CONTAINER_OWNED_ENV:
-                _log.warning("cloud credential env %s is container-owned; dropped", name)
-            else:
-                kept[name] = value
-        return kept
+    @cached_property
+    def _credential_env(self) -> dict[str, str]:
+        """The spec's minted cloud credential, allowlisted by name; filtered once per run."""
+        names = tuple(self.spec.cloud_credential_env)
+        return filter_boundary_env(self.spec.cloud_credential_env, names)
 
     def wrap_argv(
         self,
@@ -503,7 +500,7 @@ class SandboxExecutor:
             argv += ["-v", f"{host_path}:{container_path}"]
         for name in filter_boundary_env(extra_env, spec.env_allowlist):
             argv += ["-e", name]
-        for name in self._cloud_credential_env():
+        for name in self._credential_env:
             argv += ["-e", name]
         argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
@@ -550,6 +547,12 @@ class SandboxExecutor:
             )
         # Filter once so the client env matches the names wrap_argv emits.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
+        if clash := sorted(set(crossing) & set(self._credential_env)):
+            # Neither side may silently win: the overlay routes the model, the credential the task.
+            raise SandboxError(
+                f"the agent env overlay and the minted cloud credential both set {clash}; "
+                "refusing to let one silently override the other"
+            )
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
         remap = self._needs_id_remap()
         try:
@@ -559,7 +562,7 @@ class SandboxExecutor:
             try:
                 completed = run(
                     wrapped,
-                    extra_env={**crossing, **self._cloud_credential_env()},
+                    extra_env={**crossing, **self._credential_env},
                     check=check,
                     capture=capture,
                     text=text,
