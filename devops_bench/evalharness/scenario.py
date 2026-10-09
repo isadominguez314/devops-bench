@@ -46,8 +46,8 @@ from devops_bench.verification import VerificationEntry, VerifierAgent
 __all__ = [
     "ScenarioManager",
     "VERIFICATION_TIMEOUT_SEC",
-    "VERIFICATION_TOTAL_BUDGET_SEC",
     "pick_free_port",
+    "verification_budget_sec",
 ]
 
 _log = get_logger("evalharness.scenario")
@@ -57,12 +57,6 @@ _log = get_logger("evalharness.scenario")
 # since single_shot always evaluates once with a zero budget regardless.
 VERIFICATION_TIMEOUT_SEC = 120
 
-# Total wall-clock budget for the whole post-run verification pass, across
-# every entry. Without a cap, a task with many failing converge objectives
-# burns entries x VERIFICATION_TIMEOUT_SEC (12 entries x 120s is 22+ minutes);
-# this bounds the pass as a whole. Assert-mode entries still always run, since
-# a safeguard that goes unchecked defeats the point of having it.
-VERIFICATION_TOTAL_BUDGET_SEC = 600
 
 # Seconds to wait for the target Service's external LoadBalancer IP to be
 # assigned by the cloud provider's load balancer controller. LB provisioning
@@ -86,6 +80,27 @@ def pick_free_port() -> int:
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
+
+
+def verification_budget_sec(
+    entries: list[VerificationEntry], timeout_sec: float = VERIFICATION_TIMEOUT_SEC
+) -> float:
+    """Total post-run verification budget a task's spec needs.
+
+    Every converging entry gets its full ``timeout_sec`` and every objective
+    hold its full window, so no entry is starved by the ones before it. A
+    fixed cap starved the tail of every large spec, and a starved entry
+    withholds the run's score. Assert entries and safeguard holds cost no
+    budget: they evaluate once, or score from observations taken during the
+    agent's turn.
+    """
+    converging = sum(1 for e in entries if e.resolved_mode == "converge")
+    soaks = sum(
+        e.hold_window_sec or 0.0
+        for e in entries
+        if e.resolved_mode == "hold" and e.role == "objective"
+    )
+    return converging * timeout_sec + soaks
 
 
 class ScenarioManager:
