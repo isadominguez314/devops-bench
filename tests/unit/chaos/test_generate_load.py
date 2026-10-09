@@ -128,6 +128,8 @@ def test_inject_returns_chaos_result_on_success() -> None:
     assert result.success is True
     assert result.injected_fault == "generate_load"
     assert result.output == "spike complete"
+    assert result.elapsed_time >= 0.0
+    assert result.error is None
     assert result.driver == {}, "a stub with no identity leaves the driver empty"
 
 
@@ -148,8 +150,6 @@ def test_inject_records_the_driver_that_ran() -> None:
         result = fault.inject(_make_ctx())
 
     assert result.driver == {"provider": "google", "model": "gemini-3.1-pro-preview"}
-    assert result.elapsed_time >= 0.0
-    assert result.error is None
 
 
 def test_inject_fails_closed_when_no_load_command_ran() -> None:
