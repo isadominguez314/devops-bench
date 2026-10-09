@@ -23,13 +23,24 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-__all__ = ["prompt_fixture_paths"]
+__all__ = ["carries_cluster_token", "prompt_fixture_paths"]
 
 # ``~/<name>`` or ``$HOME/<name>`` in prompt prose.
 _HOME_PATH = re.compile(r"[~]/([\w.\-]+)|\$HOME/([\w.\-]+)")
 
 # Sentence punctuation stripped from the tail of a captured name.
 _TRAILING_PUNCT = ".,;:!?'\"`)"
+
+
+def carries_cluster_token(name: str, cluster_name: str | None) -> bool:
+    """True when ``name`` holds ``cluster_name`` as a ``-``/``_``/``.``-delimited token.
+
+    The convention stacks use to name what they seed for a run; sandbox fixture
+    discovery applies the same boundary rule.
+    """
+    if not cluster_name:
+        return False
+    return re.search(rf"(^|[-_.]){re.escape(cluster_name)}([-_.]|$)", name) is not None
 
 
 def prompt_fixture_paths(prompt: str, home: Path | None = None) -> list[Path]:

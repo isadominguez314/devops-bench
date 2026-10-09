@@ -1021,6 +1021,7 @@ class DefaultEvalHarness(Harness):
                 inventory_rules,
                 prompt,
                 home=(workspace_path / "home") if completed_spec is not None else None,
+                cluster_name=active_cluster_name,
                 produced_in_batch=produced_in_batch,
             )
             # Resolved before the agent runs so a mid-run failure still records them.

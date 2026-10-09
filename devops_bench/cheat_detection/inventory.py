@@ -58,7 +58,7 @@ from pathlib import Path
 
 from devops_bench.cheat_detection.rules import SCAN_FIELDS, SensitiveAccessRule, compile_pattern
 from devops_bench.core import get_logger
-from devops_bench.core.prompt_paths import prompt_fixture_paths
+from devops_bench.core.prompt_paths import carries_cluster_token, prompt_fixture_paths
 
 __all__ = [
     "DEFAULT_BASELINE",
@@ -414,25 +414,23 @@ def drop_fingerprints_matching_inputs(
     prompt: str,
     home: Path | None = None,
     *,
+    cluster_name: str | None = None,
     produced_in_batch: frozenset[str] = frozenset(),
 ) -> tuple[SensitiveAccessRule, ...]:
-    """Drop content fingerprints matching a delivered input the prompt names.
+    """Strip fingerprint lines found in a delivered input the prompt names.
 
-    A stale copy of a delivered input fingerprints byte-identical to the fresh
-    one, so reading it proves nothing. A rule goes only when one input holds
-    every one of its lines: a copy, not a deliverable that quotes one line. Only
-    inventory content rules are eligible; static rules and path rules stay.
-    Entries in ``produced_in_batch`` (left by another task this batch) are
-    deliverables, not inputs, and stay covered. A prompt-named entry from before
-    the batch is an input by construction: the fixture pre-flight refuses to
-    start a run whose promised ``~/<name>`` is absent. Call this before the
-    agent runs; it reads the input from disk.
+    A line the agent was handed proves nothing when it surfaces, so it leaves
+    every content rule; a rule left with no lines is dropped. Static and path
+    rules stay. Only prompt-named paths carrying the run's cluster token count as
+    delivered inputs (the stacks' seeding convention), so an output the prompt
+    names keeps its fingerprint, as do ``produced_in_batch`` entries. Call this
+    before the agent runs; it reads the input from disk.
     """
     if not prompt:
         return rules
     texts: list[str] = []
     for path in prompt_fixture_paths(prompt, home):
-        if path.name in produced_in_batch:
+        if path.name in produced_in_batch or not carries_cluster_token(path.name, cluster_name):
             continue
         try:
             if path.is_file() and path.stat().st_size <= _MAX_FINGERPRINT_BYTES:
@@ -442,18 +440,26 @@ def drop_fingerprints_matching_inputs(
     if not texts:
         return rules
 
-    def matches_own_input(rule: SensitiveAccessRule) -> bool:
-        if rule.category != CATEGORY or rule.fields != _CONTENT_FIELDS:
-            return False
-        return any(all(compile_pattern(p).search(t) for p in rule.patterns) for t in texts)
+    def in_input(pattern: str) -> bool:
+        return any(compile_pattern(pattern).search(t) for t in texts)
 
-    kept = []
+    kept: list[SensitiveAccessRule] = []
     for rule in rules:
-        if matches_own_input(rule):
-            _log.info(
-                "dropping %s rule for this record: it matches the task's own declared input",
-                rule.category,
-            )
+        if rule.category != CATEGORY or rule.fields != _CONTENT_FIELDS:
+            kept.append(rule)
             continue
-        kept.append(rule)
+        remaining = tuple(p for p in rule.patterns if not in_input(p))
+        if remaining != rule.patterns:
+            _log.info(
+                "%s: %d of %d fingerprint line(s) are in the task's own input; stripped",
+                rule.description,
+                len(rule.patterns) - len(remaining),
+                len(rule.patterns),
+            )
+        if remaining:
+            kept.append(
+                rule
+                if remaining == rule.patterns
+                else rule.model_copy(update={"patterns": remaining})
+            )
     return tuple(kept)
