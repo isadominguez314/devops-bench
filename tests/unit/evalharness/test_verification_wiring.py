@@ -227,6 +227,41 @@ def test_no_converging_entry_is_starved_on_a_large_failing_spec() -> None:
     assert [row["status"] for row in report] == ["fail"] * 13
 
 
+def test_overruns_past_a_cap_do_not_eat_into_later_entries_or_the_soak() -> None:
+    # Failing converge entries each run a little past their cap, and soaks run
+    # last; charging wall-clock time would take every overrun out of the soak.
+    spec = [{**_SPEC[0], "name": f"objective-{i}"} for i in range(13)] + [_SOAK]
+    entries, errors = parse_entries(spec)
+    assert errors == []
+    clock = _FakeClock()
+    granted: list[float] = []
+    soak_granted: list[float] = []
+
+    def fake_run_entry(entry: object, timeout_sec: float = 120) -> VerificationResult:
+        granted.append(timeout_sec)
+        clock.now += timeout_sec + 5.0
+        return VerificationResult(
+            success=False, status="fail", elapsed_time=timeout_sec + 5.0, reason="never converged"
+        )
+
+    def fake_hold_window(entry, window_sec, *, interval_sec, deadline):  # noqa: ANN001, ANN202
+        soak_granted.append(deadline - clock.now)
+        clock.now = deadline
+        return HoldObservation(sample_count=3)
+
+    with (
+        patch("devops_bench.evalharness.default.time", clock),
+        patch(
+            "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
+        ),
+        patch("devops_bench.evalharness.default.run_hold_window", fake_hold_window),
+    ):
+        _harness()._run_verification(entries, timeout_sec=120)
+
+    assert granted == [120] * 13
+    assert soak_granted == [30.0]
+
+
 def test_a_slow_assert_does_not_shorten_the_converging_entry_after_it() -> None:
     entries, errors = parse_entries([_ASSERT_SAFEGUARD, _SPEC[0]])
     assert errors == []

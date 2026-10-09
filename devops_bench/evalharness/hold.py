@@ -461,12 +461,12 @@ def run_hold_window(
     ``window_sec``, folding every sample through the same :func:`_fold_sample`
     :class:`SafeguardMonitor` uses.
 
-    ``deadline`` is an absolute ``time.monotonic()`` value bounding the
-    caller's whole post-run verification pass (see
-    ``verification_budget_sec`` in ``devops_bench.evalharness.scenario``). The window stops at whichever of
-    ``window_sec`` or ``deadline`` is sooner, so one entry's soak can never
-    overrun the shared budget the rest of the task's verification draws
-    from.
+    ``deadline`` is an absolute ``time.monotonic()`` value: the share of the
+    post-run verification budget the caller granted this soak (see
+    ``verification_budget_sec`` in ``devops_bench.evalharness.scenario``).
+    The window stops at whichever of ``window_sec`` or ``deadline`` is
+    sooner, so one entry's soak can never overrun the budget the rest of the
+    task's verification draws from.
 
     On a violation, sampling does NOT stop early. It keeps sampling to the
     end of the window so the report can show whether the entry recovered.
