@@ -391,6 +391,27 @@ def test_build_rows_leaves_correctness_null_for_a_run_the_agent_never_completed(
     assert d["correctnessScore"] is None
 
 
+def test_build_rows_publishes_a_withheld_composite_as_null() -> None:
+    record = {
+        "name": "Agent crashed",
+        "folder": "task_z",
+        "status": "agent_error",
+        "scores": {
+            OUTCOME_SCORE_KEY: {
+                "score": None,
+                "success": None,
+                "version": "v1",
+                "reason": "withheld: the agent never completed its turn",
+            }
+        },
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["outcomeScore"] is None
+    assert d["scoringVersion"] == "v1"
+
+
 def test_build_rows_keeps_correctness_for_an_ordinary_completed_run() -> None:
     record = {
         "name": "Finished",

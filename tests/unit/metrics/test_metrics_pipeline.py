@@ -212,17 +212,21 @@ def test_a_completed_run_gets_a_composite(registry: Registry[Any]) -> None:
     ],
     ids=["agent_error", "errored_without_trajectory"],
 )
-def test_an_unscoreable_run_gets_no_composite(
+def test_an_unscoreable_run_gets_a_withheld_composite(
     registry: Registry[Any], overrides: dict[str, Any]
 ) -> None:
-    """A run the agent never completed keeps its sub-scores but publishes no composite."""
+    """A run the agent never completed keeps its sub-scores; the composite is null with a reason."""
     registry.register("correct")(_CorrectEvaluator)
     results = [{**_result(), **overrides}]
 
     evaluate_metrics_batch(results, None, use_mcp=False)
 
-    assert "VerificationCorrectness" in results[0]["scores"]
-    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+    scores = results[0]["scores"]
+    assert "VerificationCorrectness" in scores
+    entry = scores[pipeline.OUTCOME_SCORE_KEY]
+    assert entry["score"] is None
+    assert entry["version"] == pipeline.SCORING_VERSION
+    assert entry["reason"].startswith("withheld: the agent never completed its turn")
 
 
 # --- extract_checklist_items (pure logic) -------------------------------------
