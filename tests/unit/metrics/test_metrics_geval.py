@@ -99,6 +99,53 @@ def test_warning_survives_an_unknown_agent_provider(
     assert judge.provider == "ollama"
 
 
+def test_explicit_arguments_win_over_a_supplied_client(mocker: MockerFixture) -> None:
+    """Label and record agree, and both take the caller's provider and model."""
+    get_model = mocker.patch.object(geval, "get_model")
+    client = _fake_client(model_name="client-model", provider="anthropic")
+
+    judge = ModelLayerJudge(client=client, provider="gemini", model_name="explicit")
+
+    get_model.assert_not_called()
+    assert judge.get_model_name() == "explicit"
+    assert judge.identity == {"provider": "google", "model": "explicit"}
+    assert describe_judge(judge) == judge.identity
+
+
+def test_a_supplied_client_supplies_what_the_caller_omits(mocker: MockerFixture) -> None:
+    mocker.patch.object(geval, "get_model")
+    client = _fake_client(model_name="client-model", provider="anthropic")
+
+    assert describe_judge(ModelLayerJudge(client=client)) == {
+        "provider": "anthropic",
+        "model": "client-model",
+    }
+
+
+def test_build_path_resolves_through_judge_identity(mocker: MockerFixture) -> None:
+    """JUDGE_* unset: the client is built from the AGENT_* fallback, passed explicitly."""
+    get_model = mocker.patch.object(
+        geval, "get_model", return_value=_fake_client(model_name="arm", provider="anthropic")
+    )
+    mocker.patch.dict(os.environ, {"AGENT_PROVIDER": "anthropic", "AGENT_MODEL": "arm"}, clear=True)
+
+    ModelLayerJudge()
+
+    get_model.assert_called_once_with(provider="anthropic", model_name="arm")
+
+
+def test_explicit_model_argument_does_not_warn(
+    mocker: MockerFixture, caplog: pytest.LogCaptureFixture
+) -> None:
+    mocker.patch.object(geval, "get_model", return_value=_fake_client(provider="google"))
+    mocker.patch.dict(os.environ, {}, clear=True)
+
+    with caplog.at_level(logging.WARNING):
+        ModelLayerJudge(model_name="judge-x")
+
+    assert "JUDGE_MODEL unset" not in caplog.text
+
+
 def test_supplied_client_provider_alias_is_canonicalized(mocker: MockerFixture) -> None:
     get_model = mocker.patch.object(geval, "get_model")
 

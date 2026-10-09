@@ -229,11 +229,17 @@ class DefaultEvalHarness(Harness):
         if judge_model is None and get_env("JUDGE_MODEL") is None:
             # Configured, not built: the resolved judge is logged again at scoring time.
             configured = judge_identity()
-            _log.warning(
-                "JUDGE_MODEL unset; the judge is configured as %s/%s (AGENT_MODEL fallback)",
-                configured["provider"],
-                configured["model"],
-            )
+            if configured["model"]:
+                _log.warning(
+                    "JUDGE_MODEL unset; the judge is configured as %s/%s (AGENT_MODEL fallback)",
+                    configured["provider"],
+                    configured["model"],
+                )
+            else:
+                _log.warning(
+                    "JUDGE_MODEL and AGENT_MODEL unset; the judge uses the %s adapter's default model",
+                    configured["provider"],
+                )
         self.results_root = results_root
         resolved_agent_type = (
             agent_type

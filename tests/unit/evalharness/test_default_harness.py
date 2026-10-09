@@ -808,6 +808,24 @@ def test_harness_warns_at_init_with_the_configured_judge(
     assert "JUDGE_MODEL unset; the judge is configured as google/arm-model" in caplog.text
 
 
+def test_harness_init_names_the_adapter_default_when_no_model_is_set(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("JUDGE_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.setenv("AGENT_PROVIDER", "gemini")
+
+    with caplog.at_level(logging.WARNING):
+        DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    assert (
+        "JUDGE_MODEL and AGENT_MODEL unset; the judge uses the google adapter's default model"
+        in caplog.text
+    )
+    assert "None" not in caplog.text
+    assert "AGENT_MODEL fallback" not in caplog.text
+
+
 def test_harness_is_quiet_at_init_when_the_judge_is_pinned_or_injected(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
