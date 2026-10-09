@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -133,32 +134,33 @@ def test_image_digest_falls_back_to_the_local_id(monkeypatch: pytest.MonkeyPatch
     assert sandbox.image_digest("agent-sandbox:dev") == "sha256:aaaa"
 
 
-def test_image_digest_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unknown image, malformed output, a missing runtime, or a timeout all yield None."""
+def _unknown_image(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(returncode=1, stdout="", stderr="No such image")
 
-    def unknown_image(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(returncode=1, stdout="", stderr="No such image")
 
-    monkeypatch.setattr(sandbox, "run", unknown_image)
-    assert sandbox.image_digest("nope:latest") is None
+def _malformed(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(returncode=0, stdout="not-json", stderr="")
 
-    def malformed(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(returncode=0, stdout="not-json", stderr="")
 
-    monkeypatch.setattr(sandbox, "run", malformed)
-    assert sandbox.image_digest("nope:latest") is None
+def _missing_runtime(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    raise FileNotFoundError("docker")
 
-    def missing_docker(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        raise FileNotFoundError("docker")
 
-    monkeypatch.setattr(sandbox, "run", missing_docker)
-    assert sandbox.image_digest("nope:latest") is None
+def _wedged_daemon(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    assert kwargs.get("timeout"), "inspect must be bounded"
+    raise sandbox.SubprocessError(argv, returncode=-1, stdout="", stderr="")
 
-    def wedged_daemon(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        assert kwargs.get("timeout"), "inspect must be bounded"
-        raise sandbox.SubprocessError(argv, returncode=-1, stdout="", stderr="")
 
-    monkeypatch.setattr(sandbox, "run", wedged_daemon)
+@pytest.mark.parametrize(
+    "fake_run",
+    [_unknown_image, _malformed, _missing_runtime, _wedged_daemon],
+    ids=["unknown-image", "malformed-output", "missing-runtime", "timeout"],
+)
+def test_image_digest_never_raises(
+    monkeypatch: pytest.MonkeyPatch, fake_run: Callable[..., SimpleNamespace]
+) -> None:
+    """Every failure mode yields None rather than raising."""
+    monkeypatch.setattr(sandbox, "run", fake_run)
     assert sandbox.image_digest("nope:latest") is None
 
 

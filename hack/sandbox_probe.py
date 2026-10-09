@@ -92,6 +92,9 @@ _ORDINARY_POD = json.dumps(
     {"spec": {"containers": [{"name": "c", "image": "busybox", "command": ["sleep", "1d"]}]}}
 )
 
+# An exempt name the agent tries to claim; it exists on some providers, so cleanup checks first.
+_CLAIMED_EXEMPT_NAMESPACE = "gmp-system"
+
 _METADATA_URL = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
 
 # Bounds every host-side kubectl/curl call so a stalled apiserver cannot outlast teardown.
@@ -201,6 +204,12 @@ def _kubectl(context: str, *args: str) -> subprocess.CompletedProcess[str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         # A raise here would skip the teardown; a failed CompletedProcess reads as a FAIL instead.
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr=str(exc))
+
+
+def _namespace_exists(context: str, name: str) -> bool | None:
+    """Whether ``name`` exists; ``None`` when the query itself failed."""
+    completed = _kubectl(context, "get", "namespace", name, "--ignore-not-found", "-o", "name")
+    return bool(completed.stdout.strip()) if completed.returncode == 0 else None
 
 
 def _create_legacy_pods(context: str) -> bool:
@@ -382,7 +391,7 @@ def _probes(
             name="review:claim-exempt-namespace",
             why="exemptions are by name and several do not exist on every "
             "provider, so the agent could claim one and deploy there freely",
-            argv=["kubectl", "create", "namespace", "gmp-system"],
+            argv=["kubectl", "create", "namespace", _CLAIMED_EXEMPT_NAMESPACE],
             expect_stderr="reserved",
         ),
         # -- exempt namespaces that already exist: the trio that found the hole the guard closes --
@@ -589,9 +598,14 @@ def _check_token_is_useless_against_host(kubeconfig: Path, host_apiserver: str) 
     A vcluster-minted token is signed by a key the host does not trust, so it must get 401/403.
     """
     from ruamel.yaml import YAML  # local: only this check needs it
+    from ruamel.yaml.error import YAMLError
 
-    loaded = YAML(typ="safe").load(kubeconfig.read_text())
-    token = loaded["users"][0]["user"].get("token")
+    try:
+        loaded = YAML(typ="safe").load(kubeconfig.read_text())
+        token = loaded["users"][0]["user"].get("token")
+    except (OSError, YAMLError, KeyError, IndexError, TypeError, AttributeError) as exc:
+        first = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+        return f"the agent kubeconfig could not be read ({type(exc).__name__}: {first})"
     if not token:
         return "the agent kubeconfig carries no token -- it fell back to a certificate"
     argv = [
@@ -712,6 +726,7 @@ def main() -> int:
         creds_dir.mkdir()
 
         failures: list[str] = []
+        claimed_preexisted: bool | None = None
         # One finally from the first cluster write on: a raising probe must still reach cleanup.
         try:
             # Before provisioning: the PSA labeller must skip a namespace the cluster claims.
@@ -749,6 +764,9 @@ def main() -> int:
                     image=args.image, network=plan, workspace=workspace, kubeconfig=kubeconfig
                 )
             )
+
+            # Read before any probe runs, so cleanup never deletes a namespace the cluster owns.
+            claimed_preexisted = _namespace_exists(context, _CLAIMED_EXEMPT_NAMESPACE)
 
             exec_target = _running_pod_in_kube_system(context)
             if exec_target == "":
@@ -789,6 +807,19 @@ def main() -> int:
                     name,
                     "-n",
                     "kube-system",
+                    "--ignore-not-found",
+                    "--wait=false",
+                )
+
+            # Only if absent before and present now: the agent's claim worked and must not persist.
+            if claimed_preexisted is False and _namespace_exists(
+                context, _CLAIMED_EXEMPT_NAMESPACE
+            ):
+                _kubectl(
+                    context,
+                    "delete",
+                    "namespace",
+                    _CLAIMED_EXEMPT_NAMESPACE,
                     "--ignore-not-found",
                     "--wait=false",
                 )

@@ -50,10 +50,10 @@ Exactly four things:
 1. the per-run **workspace** (`/workspace`, with `HOME=/workspace/home`);
 2. the task's **seeded fixtures**, discovered by the run-unique cluster token;
 3. a generated single-cluster **kubeconfig** (CA + bearer token, no `exec:`
-   plugin — which is also what makes GKE reachable from a container at all);
+   plugin — which is also what makes exec-plugin clusters reachable from a container at all);
 4. an explicit **env allowlist** (`BENCH_*`/`TF_*` and ambient cloud
-   credentials never cross; for Vertex, a host-side metadata emulator serves
-   a narrowly-scoped token instead).
+   credentials never cross; a model provider that authenticates through the
+   metadata server gets a narrowly-scoped token from a host-side emulator instead).
 
 Everything absent is the point: the repo checkout, `results/`, the operator's
 kubeconfig, ADC, and the Docker socket do not exist inside.
@@ -95,7 +95,10 @@ also reads `null`). The run manifest records the sandbox image **and its
 content digest**, resolved once when the batch starts and used as the
 reference every container is launched from, so "both runs used the same
 image" is checkable rather than a mutable-tag claim; `results.aggregate`
-carries both into the combined manifests.
+carries both into the combined manifests. The digest takes one of two shapes:
+`repo@sha256:…` is the registry digest and compares across hosts, while a bare
+`sha256:…` is the local image ID of a never-pushed image and only compares on
+the host that built it.
 
 ## Trusting it
 
@@ -119,11 +122,11 @@ access" — it is a boundary-breach indicator and should be treated as one.
 
 The sandbox has one software dependency on the machine running the harness:
 **Docker**. Scored runs use clusters whose nodes are not the harness host
-(vcluster/GKE); co-located kind is a development configuration — a kind node
+(vcluster or a remote cluster); co-located kind is a development configuration — a kind node
 is a privileged container on the harness machine, so pod-level escalation
 there lands on the host, which is precisely what the pod-security controls
 exist to prevent while you develop. On any cloud VM host, the link-local
-metadata endpoint must be blocked from agent containers (`vm-setup.sh`
-installs the `DOCKER-USER` rule on the bastion); the endpoint serves the VM's
+metadata endpoint must be blocked from agent containers (for example with a
+`DOCKER-USER` firewall rule); the endpoint serves the VM's
 own credentials on every major cloud, so this is a host-class requirement,
 not specific to one provider.
