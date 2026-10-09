@@ -276,6 +276,40 @@ def test_an_unresolved_catastrophic_safeguard_publishes_a_closed_gate_that_says_
     }
 
 
+def test_a_tripped_gate_with_an_unread_safeguard_says_it_tripped() -> None:
+    ctx = _ctx(
+        {
+            "verification_report": [
+                _item("safeguard", False, severity="catastrophic"),
+                _item("safeguard", True, severity="catastrophic", status="error"),
+            ]
+        }
+    )
+    entries = {s.name: s for s in VerificationMetric().evaluate(ctx)}
+    assert entries["VerificationCatastrophic"].to_entry() == {
+        "score": 0.0,
+        "success": False,
+        "reason": "Gate tripped: 1 of 2 catastrophic safeguards failed; 1 more unresolved.",
+    }
+
+
+def test_a_tripped_gate_alone_stays_a_bare_zero() -> None:
+    ctx = _ctx({"verification_report": [_item("safeguard", False, severity="catastrophic")]})
+    entries = {s.name: s for s in VerificationMetric().evaluate(ctx)}
+    assert entries["VerificationCatastrophic"].to_entry() == 0.0
+
+
+def test_it_does_not_apply_on_a_no_infra_run_with_parse_errors() -> None:
+    ctx = _ctx(
+        {
+            "verification_status": "skipped_no_infra",
+            "verification_report": [],
+            "verification_parse_errors": [{"role": "safeguard", "severity": "catastrophic"}],
+        }
+    )
+    assert VerificationMetric().applies(ctx) is False
+
+
 def test_it_does_not_touch_the_judge_scores() -> None:
     ctx = _ctx({"verification_report": [_item("objective", True)]})
     names = {s.name for s in VerificationMetric().evaluate(ctx)}

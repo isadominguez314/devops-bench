@@ -52,7 +52,10 @@ In the record's `scores` map, read the entries in the order that matters:
   `ChecklistScore`, which wins over `OutcomeValidity`. A signal that is
   present with a `null` score was **withheld** (its reason says how many
   entries were unresolved); the chain stops there and `OutcomeScore` is
-  withheld too. **`VerificationCoverage`** says how much of the spec resolved.
+  withheld too, unless a catastrophic gate scored zero, which still gives
+  `0.0` (`c=n/a`). A gate reading `cat_v=0 (VerificationCatastrophic: failed
+  closed)` had no safeguard trip, only one that could not be read: suspect the
+  harness. **`VerificationCoverage`** says how much of the spec resolved.
 - **`OutcomeValidity.reason`** — the headline "did it work" judgment.
 - **`ToolInvocation.reason`** — did it call the right tools / take a sane
   trajectory (present only when MCP is on).

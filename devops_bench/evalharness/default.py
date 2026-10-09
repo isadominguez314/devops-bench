@@ -1014,8 +1014,8 @@ class DefaultEvalHarness(Harness):
             )
             if verification_parse_errors:
                 _log.warning(
-                    "%d verification entry/entries failed to parse and will not be "
-                    "scored, which lowers the objective denominator: %s",
+                    "%d verification entry/entries failed to parse; each withholds its "
+                    "signal or fails the catastrophic gate closed: %s",
                     len(verification_parse_errors),
                     verification_parse_errors,
                 )

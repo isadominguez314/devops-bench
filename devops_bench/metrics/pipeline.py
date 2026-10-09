@@ -134,11 +134,6 @@ def _score_value(entry: Any) -> float | None:
     return float(entry) if isinstance(entry, (int, float)) else None
 
 
-def _is_withheld(entry: Any) -> bool:
-    """A present key with a ``null`` score was withheld: declared, but not measured."""
-    return entry is None or (isinstance(entry, dict) and entry.get("score") is None)
-
-
 def _resolve(scores: dict[str, Any], keys: tuple[str, ...]) -> tuple[float | None, bool]:
     """Walk a preference chain and return ``(score, withheld)``.
 
@@ -162,7 +157,7 @@ def _resolve(scores: dict[str, Any], keys: tuple[str, ...]) -> tuple[float | Non
         value = _score_value(scores[key])
         if value is not None:
             return value, False
-        if _is_withheld(scores[key]):
+        if score_keys.is_withheld(scores[key]):
             return None, True
     return None, False
 
@@ -185,6 +180,9 @@ def _finalize_outcome_score(scores: dict[str, Any]) -> None:
             :data:`OUTCOME_SCORE_KEY`.
     """
     fired = [k for k in _CATASTROPHIC_KEYS if _score_value(scores.get(k)) == 0.0]
+    fired_labels = [
+        f"{k}: failed closed" if score_keys.failed_closed(scores.get(k)) else k for k in fired
+    ]
     catastrophic = bool(fired)
 
     measured_correctness, _ = _resolve(scores, _CORRECTNESS_KEYS)
@@ -234,7 +232,7 @@ def _finalize_outcome_score(scores: dict[str, Any]) -> None:
             # this string is the record's only diagnostic surface.
             f"c={'n/a' if measured_correctness is None else format(correctness, '.3f')}, "
             f"rec_v={'n/a' if recoverable is None else format(recoverable, '.3f')}, "
-            f"cat_v={0 if catastrophic else 1}" + (f" ({', '.join(fired)})" if fired else "")
+            f"cat_v={0 if catastrophic else 1}" + (f" ({', '.join(fired_labels)})" if fired else "")
             # Name the gate that fired, so a zero in results.json explains
             # itself without cross-referencing the per-metric scores.
         ),

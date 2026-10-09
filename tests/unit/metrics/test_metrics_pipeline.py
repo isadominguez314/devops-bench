@@ -836,6 +836,21 @@ def test_finalize_zeroes_a_withheld_run_that_tripped_the_gate() -> None:
     assert scores[pipeline.OUTCOME_SCORE_KEY]["version"] == "v1"
 
 
+def test_finalize_says_when_the_gate_failed_closed() -> None:
+    scores = {
+        "VerificationCorrectness": 1.0,
+        "VerificationCatastrophic": {
+            "score": 0.0,
+            "success": False,
+            "reason": "Gate failed closed: 1 of 1 catastrophic safeguards unresolved.",
+        },
+    }
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    assert scores[pipeline.OUTCOME_SCORE_KEY]["reason"].endswith(
+        "cat_v=0 (VerificationCatastrophic: failed closed)"
+    )
+
+
 def test_batch_survives_a_failing_composite_assembly(mocker) -> None:
     # compute_outcome_score_v1 raises on an out-of-range sub-score. Assembly runs
     # inside the per-record loop, so an unguarded raise would abandon every later

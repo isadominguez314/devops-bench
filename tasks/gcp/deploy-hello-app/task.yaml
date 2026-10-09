@@ -295,8 +295,8 @@ verification_spec:
   #
   # NOT YET IMPLEMENTED. external_http_probe is not a verifier type in the
   # deterministic-verification MVP, so this entry fails to parse and lands in
-  # verification_parse_errors. Parse errors now fail closed into the
-  # correctness score, so leaving it in actively drags the score. Commented
+  # verification_parse_errors. A parse error withholds the correctness
+  # score, so leaving it in would null every run's score. Commented
   # out rather than left to fail; it returns once the external_http_probe
   # verifier exists.
   # - name: serving-http

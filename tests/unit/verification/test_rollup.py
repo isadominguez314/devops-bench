@@ -16,6 +16,8 @@
 
 from typing import Any
 
+import pytest
+
 from devops_bench.verification.rollup import RollupScores, rollup
 
 
@@ -262,10 +264,21 @@ def test_a_parse_error_resolves_in_the_class_it_declared() -> None:
 
 
 def test_a_parse_error_that_declared_nothing_usable_is_an_objective() -> None:
-    scores = rollup([], parse_errors=["<root>", {"role": "safeguard"}])
+    scores = rollup([], parse_errors=["<root>", {"role": "bogus"}])
     assert scores.correctness_withheld is True
     assert scores.objectives_unresolved == 2
     assert scores.catastrophic is None
+
+
+@pytest.mark.parametrize("severity", [None, "", "fatal"])
+def test_a_parse_error_safeguard_without_a_valid_severity_fails_the_gate_closed(
+    severity: str | None,
+) -> None:
+    err = {"role": "safeguard"} if severity is None else {"role": "safeguard", "severity": severity}
+    scores = rollup([], parse_errors=[err])
+    assert scores.catastrophic == 0.0
+    assert scores.catastrophics_unresolved == 1
+    assert scores.correctness_withheld is False
 
 
 def test_an_unresolved_catastrophic_safeguard_is_counted_as_unread_not_tripped() -> None:
@@ -277,6 +290,7 @@ def test_an_unresolved_catastrophic_safeguard_is_counted_as_unread_not_tripped()
     )
     assert scores.catastrophic == 0.0
     assert (scores.catastrophics, scores.catastrophics_unresolved) == (2, 1)
+    assert scores.catastrophics_tripped == 1
 
 
 def test_parse_errors_count_as_declared_and_unresolved() -> None:

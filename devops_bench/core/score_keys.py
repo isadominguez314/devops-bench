@@ -23,9 +23,13 @@ creating a ``metrics`` <-> ``results`` edge.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 __all__ = [
     "CATASTROPHIC_SCORE_KEYS",
     "CHECKLIST_SCORE_KEY",
+    "GATE_FAILED_CLOSED_PREFIX",
     "INTEGRITY_CATASTROPHIC_KEY",
     "JUDGED_RECOVERABLE_KEY",
     "OUTCOME_SCORE_KEY",
@@ -35,6 +39,9 @@ __all__ = [
     "VERIFICATION_CORRECTNESS_KEY",
     "VERIFICATION_COVERAGE_KEY",
     "VERIFICATION_RECOVERABLE_KEY",
+    "failed_closed",
+    "is_withheld",
+    "parse_error_class",
 ]
 
 #: The v1 composite assembled from the sub-scores below; the leaderboard row's
@@ -53,6 +60,10 @@ VERIFICATION_CORRECTNESS_KEY = "VerificationCorrectness"
 VERIFICATION_RECOVERABLE_KEY = "VerificationRecoverable"
 VERIFICATION_CATASTROPHIC_KEY = "VerificationCatastrophic"
 VERIFICATION_COVERAGE_KEY = "VerificationCoverage"
+
+#: Reason prefix on a ``VerificationCatastrophic`` zero that no safeguard
+#: tripped: the gate failed closed because one could not be read.
+GATE_FAILED_CLOSED_PREFIX = "Gate failed closed"
 
 # --- judged signals, from prose checklists on the task ------------------------
 #: Correctness, and its fallback for tasks that author no checklist.
@@ -88,3 +99,28 @@ CATASTROPHIC_SCORE_KEYS: tuple[str, ...] = (
 
 #: Tool-invocation score, carried on the row beside the composite.
 TOOL_INVOCATION_KEY = "ToolInvocation"
+
+
+def is_withheld(entry: Any) -> bool:
+    """A present key with a ``null`` score was withheld: declared, but not measured."""
+    return entry is None or (isinstance(entry, Mapping) and entry.get("score") is None)
+
+
+def failed_closed(entry: Any) -> bool:
+    """A gate entry that scored zero because a safeguard was unread, not tripped."""
+    reason = entry.get("reason") if isinstance(entry, Mapping) else None
+    return isinstance(reason, str) and reason.startswith(GATE_FAILED_CLOSED_PREFIX)
+
+
+def parse_error_class(err: Any) -> str:
+    """Route a ``verification_parse_errors`` item to the signal it withholds or gates.
+
+    Returns ``"objective"``, ``"recoverable"`` or ``"catastrophic"``. A
+    safeguard without a valid severity is catastrophic, so an unreadable
+    tripwire fails closed; anything else unusable is an objective. Shared so
+    the rollup and the row route an entry alike.
+    """
+    role = err.get("role") if isinstance(err, Mapping) else None
+    if role != "safeguard":
+        return "objective"
+    return "recoverable" if err.get("severity") == "recoverable" else "catastrophic"
