@@ -17,10 +17,9 @@
 import time
 from unittest.mock import patch
 
-import pytest
-
 from devops_bench.evalharness.default import DefaultEvalHarness
 from devops_bench.evalharness.hold import HoldObservation
+from devops_bench.evalharness.scenario import verification_budget_sec
 from devops_bench.verification.base import MIN_LEAF_BUDGET_SECONDS, VerificationResult
 from devops_bench.verification.spec import parse_entries
 
@@ -166,13 +165,97 @@ def test_the_report_feeds_rollup_directly() -> None:
     assert scores.recoverable_safety is None
 
 
-def test_converge_entries_get_the_min_of_per_entry_and_remaining_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+_ASSERT_SAFEGUARD = {**_SPEC[1], "name": "slow-assert", "mode": "assert"}
+_SOAK = {
+    "name": "soak",
+    "role": "objective",
+    "mode": "hold",
+    "hold_window_sec": 30.0,
+    "check": {
+        "type": "resource_property",
+        "kind": "deployment",
+        "resource_name": "a",
+        "op": "exists",
+    },
+}
+
+
+class _FakeClock:
+    """A ``time`` stand-in that only moves when a fake verifier spends time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_the_budget_covers_every_converging_entry_and_objective_soak() -> None:
+    entries, errors = parse_entries(
+        [_SPEC[0], {**_SPEC[0], "name": "web-ready-2"}, _ASSERT_SAFEGUARD, _SOAK]
+    )
+    assert errors == []
+    # Two converging entries at the cap plus the soak; the assert costs nothing.
+    assert verification_budget_sec(entries, timeout_sec=120) == 2 * 120 + 30.0
+
+
+def test_no_converging_entry_is_starved_on_a_large_failing_spec() -> None:
+    # Thirteen objectives that each poll out their full cap: the shape that
+    # used to exhaust a fixed 600s budget after five entries.
+    spec = [{**_SPEC[0], "name": f"objective-{i}"} for i in range(13)]
+    entries, errors = parse_entries(spec)
+    assert errors == []
+    clock = _FakeClock()
+    granted: list[float] = []
+
+    def fake_run_entry(entry: object, timeout_sec: float = 120) -> VerificationResult:
+        granted.append(timeout_sec)
+        clock.now += timeout_sec
+        return VerificationResult(
+            success=False, status="fail", elapsed_time=timeout_sec, reason="never converged"
+        )
+
+    with (
+        patch("devops_bench.evalharness.default.time", clock),
+        patch(
+            "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
+        ),
+    ):
+        report = _harness()._run_verification(entries, timeout_sec=120)
+
+    assert granted == [120] * 13
+    assert [row["status"] for row in report] == ["fail"] * 13
+
+
+def test_a_slow_assert_does_not_shorten_the_converging_entry_after_it() -> None:
+    entries, errors = parse_entries([_ASSERT_SAFEGUARD, _SPEC[0]])
+    assert errors == []
+    clock = _FakeClock()
+    granted: dict[str, float] = {}
+
+    def fake_run_entry(entry: object, timeout_sec: float = 120) -> VerificationResult:
+        name = entry.name  # type: ignore[attr-defined]
+        granted[name] = timeout_sec
+        spent = 90.0 if name == "slow-assert" else timeout_sec
+        clock.now += spent
+        return VerificationResult(success=True, status="pass", elapsed_time=spent, reason="ok")
+
+    with (
+        patch("devops_bench.evalharness.default.time", clock),
+        patch(
+            "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
+        ),
+    ):
+        report = _harness()._run_verification(entries, timeout_sec=120)
+
+    assert granted["web-ready"] == 120
+    assert [row["status"] for row in report] == ["pass", "pass"]
+
+
+def test_converge_entries_get_the_min_of_per_entry_and_remaining_budget() -> None:
     """A tight total budget caps each converging entry below its per-entry timeout."""
     entries, errors = parse_entries(_SPEC[:1] + [{**_SPEC[0], "name": "web-ready-2"}])
     assert errors == []
-    monkeypatch.setattr("devops_bench.evalharness.default.VERIFICATION_TOTAL_BUDGET_SEC", 5.0)
 
     seen_timeouts: list[float] = []
 
@@ -183,23 +266,18 @@ def test_converge_entries_get_the_min_of_per_entry_and_remaining_budget(
     with patch(
         "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
     ):
-        _harness()._run_verification(entries, timeout_sec=120)
+        _harness()._run_verification(entries, timeout_sec=120, total_budget_sec=5.0)
 
     assert len(seen_timeouts) == 2
     assert all(0 < t <= 5.0 for t in seen_timeouts)
 
 
-def test_converge_entry_is_recorded_as_budget_exhausted_once_the_total_is_gone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_converge_entry_is_recorded_as_budget_exhausted_once_the_total_is_gone() -> None:
     entries, errors = parse_entries(_SPEC[:1] + [{**_SPEC[0], "name": "web-ready-2"}])
     assert errors == []
     # Above MIN_LEAF_BUDGET_SECONDS so the first entry clears the guard; the
     # sleep below then drops the remainder under it for the second entry.
     total_budget = MIN_LEAF_BUDGET_SECONDS * 1.2
-    monkeypatch.setattr(
-        "devops_bench.evalharness.default.VERIFICATION_TOTAL_BUDGET_SEC", total_budget
-    )
 
     def fake_run_entry(entry: object, timeout_sec: float = 120) -> VerificationResult:
         sleep_sec = MIN_LEAF_BUDGET_SECONDS * 0.3  # outruns the tiny total budget
@@ -209,7 +287,9 @@ def test_converge_entry_is_recorded_as_budget_exhausted_once_the_total_is_gone(
     with patch(
         "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
     ):
-        report = _harness()._run_verification(entries, timeout_sec=120)
+        report = _harness()._run_verification(
+            entries, timeout_sec=120, total_budget_sec=total_budget
+        )
 
     assert report[0]["success"] is True
     assert report[1]["success"] is False
@@ -217,9 +297,7 @@ def test_converge_entry_is_recorded_as_budget_exhausted_once_the_total_is_gone(
     assert report[1]["reason"] == "verification total budget exhausted before evaluation"
 
 
-def test_converge_entry_is_recorded_as_budget_exhausted_in_the_sub_second_window(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_converge_entry_is_recorded_as_budget_exhausted_in_the_sub_second_window() -> None:
     """A remaining budget under _MIN_LEAF_BUDGET_SECONDS must not reach run_entry.
 
     A remaining budget of, say, 0.4s is > 0 and so passed the old ``remaining
@@ -233,7 +311,6 @@ def test_converge_entry_is_recorded_as_budget_exhausted_in_the_sub_second_window
     assert errors == []
     # Above _MIN_LEAF_BUDGET_SECONDS so the first entry clears the guard; the
     # sleep below leaves a sub-second, but strictly positive, remainder.
-    monkeypatch.setattr("devops_bench.evalharness.default.VERIFICATION_TOTAL_BUDGET_SEC", 1.2)
 
     calls: list[str] = []
 
@@ -245,7 +322,7 @@ def test_converge_entry_is_recorded_as_budget_exhausted_in_the_sub_second_window
     with patch(
         "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
     ):
-        report = _harness()._run_verification(entries, timeout_sec=120)
+        report = _harness()._run_verification(entries, timeout_sec=120, total_budget_sec=1.2)
 
     assert calls == ["web-ready"]  # the second entry never reached run_entry
     assert report[1]["success"] is False
@@ -253,9 +330,7 @@ def test_converge_entry_is_recorded_as_budget_exhausted_in_the_sub_second_window
     assert report[1]["reason"] == "verification total budget exhausted before evaluation"
 
 
-def test_hold_entry_bypasses_the_total_budget_and_run_entry_entirely(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_hold_entry_bypasses_the_total_budget_and_run_entry_entirely() -> None:
     """A hold entry is scored from the monitor's observations, not budget-gated like converge."""
     hold_spec = {
         **_SPEC[0],
@@ -268,12 +343,14 @@ def test_hold_entry_bypasses_the_total_budget_and_run_entry_entirely(
     assert errors == []
     # An exhausted total budget still starves the first (converging) entry;
     # the hold entry must not be affected by it at all.
-    monkeypatch.setattr("devops_bench.evalharness.default.VERIFICATION_TOTAL_BUDGET_SEC", 0.0)
     obs = HoldObservation(sample_count=3, violated=False)
 
     with patch("devops_bench.evalharness.default.VerifierAgent.run_entry") as run_entry_mock:
         report = _harness()._run_verification(
-            entries, timeout_sec=120, hold_observations={"web-stays-ready": obs}
+            entries,
+            timeout_sec=120,
+            hold_observations={"web-stays-ready": obs},
+            total_budget_sec=0.0,
         )
 
     run_entry_mock.assert_not_called()
@@ -284,14 +361,11 @@ def test_hold_entry_bypasses_the_total_budget_and_run_entry_entirely(
     assert report[1]["status"] == "pass"
 
 
-def test_assert_entry_still_evaluates_after_the_total_budget_is_exhausted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_assert_entry_still_evaluates_after_the_total_budget_is_exhausted() -> None:
     entries, errors = parse_entries(_SPEC)  # [0] objective (converge), [1] safeguard (assert)
     assert errors == []
     # Above _MIN_LEAF_BUDGET_SECONDS so the first (converge) entry clears the
     # guard; the sleep below then drops the remainder under it before [1].
-    monkeypatch.setattr("devops_bench.evalharness.default.VERIFICATION_TOTAL_BUDGET_SEC", 1.2)
 
     called: list[str] = []
 
@@ -303,7 +377,7 @@ def test_assert_entry_still_evaluates_after_the_total_budget_is_exhausted(
     with patch(
         "devops_bench.evalharness.default.VerifierAgent.run_entry", side_effect=fake_run_entry
     ):
-        report = _harness()._run_verification(entries, timeout_sec=120)
+        report = _harness()._run_verification(entries, timeout_sec=120, total_budget_sec=1.2)
 
     assert called == ["web-ready", "nothing-in-default"]
     assert report[1]["mode"] == "assert"

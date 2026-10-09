@@ -463,8 +463,7 @@ def run_hold_window(
 
     ``deadline`` is an absolute ``time.monotonic()`` value bounding the
     caller's whole post-run verification pass (see
-    ``VERIFICATION_TOTAL_BUDGET_SEC`` in
-    ``devops_bench.evalharness.scenario``). The window stops at whichever of
+    ``verification_budget_sec`` in ``devops_bench.evalharness.scenario``). The window stops at whichever of
     ``window_sec`` or ``deadline`` is sooner, so one entry's soak can never
     overrun the shared budget the rest of the task's verification draws
     from.

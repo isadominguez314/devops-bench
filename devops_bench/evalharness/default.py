@@ -70,9 +70,9 @@ from devops_bench.evalharness.hold import (
 from devops_bench.evalharness.reporter import ResultReporter
 from devops_bench.evalharness.scenario import (
     VERIFICATION_TIMEOUT_SEC,
-    VERIFICATION_TOTAL_BUDGET_SEC,
     ScenarioManager,
     pick_free_port,
+    verification_budget_sec,
 )
 from devops_bench.k8s import agent_credentials
 from devops_bench.tasks import Task
@@ -475,14 +475,17 @@ class DefaultEvalHarness(Harness):
         timeout_sec: float = VERIFICATION_TIMEOUT_SEC,
         *,
         hold_observations: dict[str, HoldObservation] | None = None,
+        total_budget_sec: float | None = None,
     ) -> list[dict[str, Any]]:
         """Evaluate every entry against the live cluster after the agent finishes.
 
         Every entry runs; one that raises is recorded as a failure and the rest
-        continue. Converging entries share one wall-clock deadline from
-        :data:`VERIFICATION_TOTAL_BUDGET_SEC` and get ``min(timeout_sec,
-        remaining)`` each; one with under :data:`MIN_LEAF_BUDGET_SECONDS` left is
-        recorded as budget-exhausted. Assert entries ignore the total budget.
+        continue. Converging entries share one wall-clock deadline sized by
+        :func:`~devops_bench.evalharness.scenario.verification_budget_sec`, so
+        each gets its full ``timeout_sec``; one with under
+        :data:`MIN_LEAF_BUDGET_SECONDS` left is recorded as budget-exhausted.
+        Assert entries ignore the deadline, and the time each takes pushes it
+        out so a slow assert cannot shorten the converging entries after it.
         Safeguard hold entries take their outcome from ``hold_observations``
         (sampled during the agent's turn); objective hold entries are soaked here
         against the same deadline. A hold with zero samples is an error, never a pass.
@@ -492,6 +495,7 @@ class DefaultEvalHarness(Harness):
             timeout_sec: Per-entry budget for converging entries.
             hold_observations: Name-keyed safeguard-hold observations; ``None``
                 or a missing name counts as zero samples.
+            total_budget_sec: Overrides the spec-sized total deadline.
 
         Returns:
             One mapping per entry, in declaration order, in the shape
@@ -499,7 +503,9 @@ class DefaultEvalHarness(Harness):
         """
         agent = VerifierAgent()
         report: list[dict[str, Any]] = []
-        total_deadline = time.monotonic() + VERIFICATION_TOTAL_BUDGET_SEC
+        if total_budget_sec is None:
+            total_budget_sec = verification_budget_sec(entries, timeout_sec)
+        total_deadline = time.monotonic() + total_budget_sec
         hold_observations = hold_observations or {}
 
         # Objective holds soak last so converging entries claim the budget first.
@@ -513,7 +519,11 @@ class DefaultEvalHarness(Harness):
             if entry.resolved_mode == "hold" and entry.role == "objective":
                 objective_holds.append(index)
                 continue
+            started = time.monotonic()
             rows[index] = self._evaluate_entry(agent, entry, timeout_sec, total_deadline)
+            if entry.resolved_mode == "assert":
+                # Outside the budget, so it must not spend it either.
+                total_deadline += time.monotonic() - started
 
         for index in objective_holds:
             entry = entries[index]
