@@ -116,8 +116,7 @@ class VerificationMetric:
 
         # ``declared``/``errored`` already count the entries that never parsed,
         # so coverage answers "how much of the declared spec resolved?" rather
-        # than "how much of what parsed resolved?" — the older reading could
-        # report 1.0 on a run where most of the spec never ran at all.
+        # than "how much of what parsed resolved?".
         coverage = 1.0 if scores.declared == 0 else 1 - (scores.errored / scores.declared)
         out.append(MetricScore(name=COVERAGE_SCORE_KEY, score=coverage))
 
