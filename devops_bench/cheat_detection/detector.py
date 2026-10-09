@@ -66,8 +66,11 @@ __all__ = [
 # and a mid-batch home entry left by a *differently named* task now
 # content-fingerprints (same-name iterations stay path-only), so a
 # prompt-named entry whose path rule is dropped still flags when the earlier
-# task's content surfaces.
-DETECTOR_VERSION = 7
+# task's content surfaces. v8: a prompt that sends the agent into home narrows
+# the home-listing rules to args, and fingerprint lines found in the task's own
+# delivered input (a prompt-named path carrying the cluster token) are stripped
+# per record; a rule with no lines left is dropped.
+DETECTOR_VERSION = 8
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1
 
