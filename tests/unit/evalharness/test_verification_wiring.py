@@ -578,6 +578,31 @@ def test_run_verification_soaks_objective_holds_after_the_other_entries() -> Non
     assert [row["name"] for row in report] == ["soak", "converge"]
 
 
+def test_an_objective_hold_left_no_budget_is_recorded_as_budget_exhausted() -> None:
+    spec = [
+        {
+            "name": "soak",
+            "role": "objective",
+            "mode": "hold",
+            "hold_window_sec": 30.0,
+            "check": {
+                "type": "resource_property",
+                "kind": "deployment",
+                "resource_name": "a",
+                "op": "exists",
+            },
+        }
+    ]
+    entries, errors = parse_entries(spec)
+    assert errors == []
+    with patch("devops_bench.evalharness.default.run_hold_window") as hold_mock:
+        report = _harness()._run_verification(entries, total_budget_sec=0.0)
+
+    hold_mock.assert_not_called()
+    assert report[0]["status"] == "error"
+    assert report[0]["reason"] == "verification total budget exhausted before evaluation"
+
+
 def test_run_verification_reports_a_holding_entry_from_observations_without_evaluating_it() -> None:
     entries, errors = parse_entries(_HOLD_SPEC)
     assert errors == []

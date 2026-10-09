@@ -49,10 +49,13 @@ In the record's `scores` map, read the entries in the order that matters:
   cat_v=…`) tells you immediately whether the low score came from correctness,
   from safety, or from coverage.
 - **Which correctness signal was used** — `VerificationCorrectness` wins over
-  `ChecklistScore`, which wins over `OutcomeValidity`. Check
-  **`VerificationCoverage`** before trusting `VerificationCorrectness`: coverage
-  below 1.0 means the fraction was computed over a subset of the declared
-  entries.
+  `ChecklistScore`, which wins over `OutcomeValidity`. A signal that is
+  present with a `null` score was **withheld** (its reason says how many
+  entries were unresolved); the chain stops there and `OutcomeScore` is
+  withheld too, unless a catastrophic gate scored zero, which still gives
+  `0.0` (`c=n/a`). A gate reading `cat_v=0 (VerificationCatastrophic: failed
+  closed)` had no safeguard trip, only one that could not be read: suspect the
+  harness. **`VerificationCoverage`** says how much of the spec resolved.
 - **`OutcomeValidity.reason`** — the headline "did it work" judgment.
 - **`ToolInvocation.reason`** — did it call the right tools / take a sane
   trajectory (present only when MCP is on).
