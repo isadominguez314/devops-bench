@@ -94,6 +94,10 @@ def check_prompt_fixtures(
 ) -> list[str]:
     """Fail loudly when a promised fixture did not reach the agent.
 
+    Contract: every ``~/<name>`` or ``$HOME/<name>`` in the prompt is a required
+    input that must exist before the agent starts. A task that names an output
+    under home must name it another way or set :data:`REQUIRE_FIXTURES_ENV` to 0.
+
     Args:
         prompt: The substituted prompt handed to the agent.
         task_name: Task name, for the message.

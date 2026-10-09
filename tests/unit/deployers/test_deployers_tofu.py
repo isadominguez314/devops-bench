@@ -229,7 +229,7 @@ def test_up_holds_default_state_private(
     tf_deployer.up()
 
     assert _mode(state) == 0o600
-    assert _mode(state.with_suffix(".tfstate.backup")) == 0o600
+    assert _mode(state.with_name(f"{state.name}.backup")) == 0o600
 
 
 def test_up_precreates_isolated_state_private_before_apply(
@@ -250,7 +250,7 @@ def test_up_precreates_isolated_state_private_before_apply(
 
     # The file already existed, private, when apply ran.
     assert seen == [0o600]
-    assert _mode(state.with_suffix(".tfstate.backup")) == 0o600
+    assert _mode(state.with_name(f"{state.name}.backup")) == 0o600
 
 
 def test_down_holds_state_private_even_when_destroy_fails(
@@ -269,7 +269,14 @@ def test_down_holds_state_private_even_when_destroy_fails(
         tf_deployer.down()
 
     assert _mode(state) == 0o600
-    assert _mode(state.with_suffix(".tfstate.backup")) == 0o600
+    assert _mode(state.with_name(f"{state.name}.backup")) == 0o600
+
+
+def test_backup_path_is_the_state_name_plus_backup(tmp_path: Path) -> None:
+    # OpenTofu names the backup <state>.backup whatever the state file is called.
+    state = tmp_path / "run-state"
+    TFDeployer._protect_state(state)  # noqa: SLF001
+    assert _mode(tmp_path / "run-state.backup") == 0o600
 
 
 def _output_process(location):

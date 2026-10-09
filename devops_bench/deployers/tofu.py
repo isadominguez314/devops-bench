@@ -289,7 +289,7 @@ class TFDeployer(Deployer):
         tofu writes in place and keeps the inode's mode, so pre-creating them private
         covers the command itself; the chmod after covers a pre-existing file. Best effort.
         """
-        for path in (state_path, state_path.with_suffix(".tfstate.backup")):
+        for path in (state_path, state_path.with_name(f"{state_path.name}.backup")):
             try:
                 path.touch(mode=0o600, exist_ok=True)
                 path.chmod(0o600)
