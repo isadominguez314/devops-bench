@@ -25,7 +25,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-__all__ = ["UNSCOREABLE_RUN_STATUSES", "is_unscoreable_run"]
+from devops_bench.core import score_keys
+
+__all__ = ["UNSCOREABLE_RUN_STATUSES", "is_unscoreable_run", "tripped_gates"]
 
 #: Statuses that say outright that the agent did not complete its turn.
 #: Historical records use these; see :func:`is_unscoreable_run` for why the
@@ -59,3 +61,18 @@ def is_unscoreable_run(record: Mapping[str, Any]) -> bool:
     if str(record.get("status") or "") in UNSCOREABLE_RUN_STATUSES:
         return True
     return bool(record.get("errors")) and not record.get("trajectory")
+
+
+def tripped_gates(scores: Mapping[str, Any] | None) -> list[str]:
+    """Catastrophic keys whose check ran and failed, excluding gates that failed closed.
+
+    On an unscoreable run only a tripped gate counts: it is observed destruction,
+    while a gate that failed closed only says the check could not run.
+    """
+    tripped = []
+    for key in score_keys.CATASTROPHIC_SCORE_KEYS:
+        entry = (scores or {}).get(key)
+        value = entry.get("score") if isinstance(entry, Mapping) else entry
+        if value == 0.0 and not isinstance(value, bool) and not score_keys.failed_closed(entry):
+            tripped.append(key)
+    return tripped
