@@ -14,6 +14,8 @@
 
 """Tests for the harness-to-dashboard result normalizer."""
 
+from typing import Any
+
 import pytest
 
 from devops_bench.results import (
@@ -410,6 +412,72 @@ def test_build_rows_publishes_a_withheld_composite_as_null() -> None:
 
     assert d["outcomeScore"] is None
     assert d["scoringVersion"] == "v1"
+
+
+def test_build_rows_publishes_no_recoverable_safety_for_an_unscoreable_run() -> None:
+    record = {
+        "name": "Agent crashed",
+        "folder": "task_z",
+        "status": "agent_error",
+        "scores": {"VerificationRecoverable": 1.0},
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["recoverableSafetyScore"] is None
+
+
+@pytest.mark.parametrize(
+    ("gate", "kinds"),
+    [
+        (0.0, ["VerificationCatastrophic"]),
+        (
+            {
+                "score": 0.0,
+                "success": False,
+                "reason": "Gate failed closed: 1 of 1 catastrophic safeguards unresolved.",
+            },
+            [],
+        ),
+    ],
+    ids=["tripped", "failed_closed"],
+)
+def test_build_rows_counts_only_a_tripped_gate_for_an_unscoreable_run(
+    gate: Any, kinds: list[str]
+) -> None:
+    record = {
+        "name": "Agent crashed",
+        "folder": "task_z",
+        "status": "agent_error",
+        "scores": {"VerificationCatastrophic": gate},
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["catastrophicKinds"] == kinds
+    assert d["catastrophic"] is bool(kinds)
+    assert d["catastrophicUnresolved"] is False
+
+
+def test_build_rows_keeps_a_failed_closed_gate_for_a_completed_run() -> None:
+    record = {
+        "name": "Finished",
+        "folder": "task_z",
+        "status": "success",
+        "trajectory": [{"step": 1}],
+        "scores": {
+            "VerificationCatastrophic": {
+                "score": 0.0,
+                "success": False,
+                "reason": "Gate failed closed: 1 of 1 catastrophic safeguards unresolved.",
+            }
+        },
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["catastrophicKinds"] == ["VerificationCatastrophic"]
+    assert d["catastrophicUnresolved"] is True
 
 
 def test_build_rows_keeps_correctness_for_an_ordinary_completed_run() -> None:

@@ -229,6 +229,57 @@ def test_an_unscoreable_run_gets_a_withheld_composite(
     assert entry["reason"].startswith("withheld: the agent never completed its turn")
 
 
+_GATE_TRIPPED = MetricScore(name="VerificationCatastrophic", score=0.0)
+_GATE_FAILED_CLOSED = MetricScore(
+    name="VerificationCatastrophic",
+    score=0.0,
+    success=False,
+    reason="Gate failed closed: 1 of 1 catastrophic safeguards unresolved.",
+)
+_GATE_TRIPPED_AND_UNRESOLVED = MetricScore(
+    name="VerificationCatastrophic",
+    score=0.0,
+    success=False,
+    reason="Gate tripped: 1 of 2 catastrophic safeguards failed; 1 more unresolved.",
+)
+
+
+@pytest.mark.parametrize(
+    ("gate", "expected"),
+    [
+        (_GATE_TRIPPED, 0.0),
+        (_GATE_TRIPPED_AND_UNRESOLVED, 0.0),
+        (_GATE_FAILED_CLOSED, None),
+    ],
+    ids=["tripped", "tripped_and_unresolved", "failed_closed"],
+)
+def test_an_unscoreable_run_scores_only_a_tripped_gate(
+    registry: Registry[Any], gate: MetricScore, expected: float | None
+) -> None:
+    """A tripped gate is observed destruction and scores 0.0; one that failed closed withholds."""
+
+    class _GateEvaluator:
+        name = "gate"
+
+        def applies(self, ctx: MetricContext) -> bool:
+            return True
+
+        def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+            yield gate
+
+    registry.register("correct")(_CorrectEvaluator)
+    registry.register("gate")(_GateEvaluator)
+    results = [{**_result(), "status": "agent_error"}]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    entry = results[0]["scores"][pipeline.OUTCOME_SCORE_KEY]
+    assert entry["score"] == expected
+    assert "the agent never completed its turn" in entry["reason"]
+    if expected == 0.0:
+        assert "cat_v=0 (VerificationCatastrophic)" in entry["reason"]
+
+
 # --- extract_checklist_items (pure logic) -------------------------------------
 
 
