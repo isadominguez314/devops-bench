@@ -161,6 +161,27 @@ def _entry_display_fields(entry: VerificationEntry) -> dict[str, Any]:
     }
 
 
+def _budget_exhausted_row(entry: VerificationEntry) -> dict[str, Any]:
+    """Report item for an entry the shared verification budget never reached.
+
+    Never evaluated, not a condition observed false, so it stays unresolved
+    rather than counting against the agent.
+    """
+    return {
+        "name": entry.name,
+        **_entry_display_fields(entry),
+        "role": entry.role,
+        "severity": entry.severity,
+        "weight": entry.weight,
+        "mode": entry.resolved_mode,
+        "success": False,
+        "status": "error",
+        "reason": "verification total budget exhausted before evaluation",
+        "elapsed_time": 0.0,
+        "children": [],
+    }
+
+
 def _task_metadata(task: Task) -> dict[str, Any]:
     """The task-level display metadata snapshotted onto every record."""
     return {
@@ -485,8 +506,8 @@ class DefaultEvalHarness(Harness):
         each is granted ``min(its cap, budget left)`` and charged only the time
         it actually spent, up to that grant, so overruns past a cap and harness
         work between entries never starve a later entry. One granted under
-        :data:`MIN_LEAF_BUDGET_SECONDS` is recorded as budget-exhausted. Assert
-        entries cost nothing. Safeguard hold entries take their outcome from
+        :data:`MIN_LEAF_BUDGET_SECONDS` is recorded as budget-exhausted, as is an
+        objective hold granted no time at all. Assert entries cost nothing. Safeguard hold entries take their outcome from
         ``hold_observations`` (sampled during the agent's turn); objective hold
         entries are soaked here, last. A hold with zero samples is an error,
         never a pass.
@@ -539,6 +560,9 @@ class DefaultEvalHarness(Harness):
                     "hold_window_sec set; this should have been rejected at "
                     "spec-validation time"
                 )
+            if budget_left <= 0:
+                rows[index] = _budget_exhausted_row(entry)
+                continue
             granted = min(entry.hold_window_sec, budget_left)
             started = time.monotonic()
             obs = run_hold_window(
@@ -561,20 +585,7 @@ class DefaultEvalHarness(Harness):
     ) -> dict[str, Any]:
         """Evaluate one converge or assert entry within its granted ``timeout_sec``."""
         if entry.resolved_mode != "assert" and timeout_sec < MIN_LEAF_BUDGET_SECONDS:
-            # Never evaluated, not a condition observed false.
-            return {
-                "name": entry.name,
-                **_entry_display_fields(entry),
-                "role": entry.role,
-                "severity": entry.severity,
-                "weight": entry.weight,
-                "mode": entry.resolved_mode,
-                "success": False,
-                "status": "error",
-                "reason": "verification total budget exhausted before evaluation",
-                "elapsed_time": 0.0,
-                "children": [],
-            }
+            return _budget_exhausted_row(entry)
 
         try:
             result = agent.run_entry(entry, timeout_sec=timeout_sec)
