@@ -385,13 +385,18 @@ def evaluate_metrics_batch(
         # remaining records in the batch.
         if is_unscoreable_run(res):
             # The agent never completed its turn: keep sub-scores for triage, withhold the composite.
-            _log.warning(
-                "no composite outcome score for %s: status=%r, errors=%d, trajectory steps=%d",
-                res.get("name"),
-                res.get("status"),
-                len(res.get("errors") or []),
-                len(res.get("trajectory") or []),
+            reason = (
+                "withheld: the agent never completed its turn "
+                f"(status={res.get('status')!r}, errors={len(res.get('errors') or [])}, "
+                f"trajectory steps={len(res.get('trajectory') or [])})"
             )
+            _log.warning("no composite outcome score for %s: %s", res.get("name"), reason)
+            scores[OUTCOME_SCORE_KEY] = {
+                "score": None,
+                "success": None,
+                "version": SCORING_VERSION,
+                "reason": reason,
+            }
             res["scores"] = scores
             continue
         try:
