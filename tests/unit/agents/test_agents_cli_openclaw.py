@@ -507,14 +507,34 @@ def test_oc_version_skew_names_both_versions(monkeypatch: pytest.MonkeyPatch) ->
     assert "2026.9.1-beta.1" in skew
 
 
-def test_oc_version_skew_silent_on_match_or_inconclusive_probe(
+def test_oc_version_skew_silent_on_match_and_warns_on_an_inconclusive_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(oc_mod._log, "warning", lambda msg, *args: warnings.append(msg % args))
     monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: "2026.9.1-beta.1")
     monkeypatch.setattr(oc_mod, "_image_oc_version", lambda i: "2026.9.1-beta.1")
     assert oc_mod._oc_version_skew("oc", "img") is None
+    assert warnings == []
     monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: None)
     assert oc_mod._oc_version_skew("oc", "img") is None
+    assert warnings == ["oc version skew check skipped: the host probe was inconclusive"]
+
+
+def test_oc_version_probe_anchors_on_the_product_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A version-shaped token printed before oc's own line must not be taken for it."""
+    monkeypatch.setattr(
+        oc_mod,
+        "run",
+        lambda argv, **kw: _make_subprocess_result(
+            "Node v24.21.0 is available\nOpenClaw 2026.9.6 (eb377ac)\n", "", 0
+        ),
+    )
+    assert oc_mod._host_oc_version("oc") == "2026.9.6"
+    monkeypatch.setattr(
+        oc_mod, "run", lambda argv, **kw: _make_subprocess_result("wrapper 1.2.3\n", "", 0)
+    )
+    assert oc_mod._host_oc_version("oc") is None
 
 
 def test_sandbox_preflight_refuses_a_skewed_pair(monkeypatch: pytest.MonkeyPatch) -> None:

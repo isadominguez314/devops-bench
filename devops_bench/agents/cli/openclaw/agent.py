@@ -90,8 +90,9 @@ def _ensure_node_on_path(env_overlay: dict[str, str]) -> dict[str, str]:
 
 _log = get_logger("agents.cli.openclaw.agent")
 
-# Version token in ``oc --version`` output (``OpenClaw 2026.9.1-beta.1 (1d96e5a)``).
-_OC_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?")
+# ``oc --version`` prints ``OpenClaw 2026.9.1-beta.1 (1d96e5a)``; anchor on the name so a
+# stray version-shaped token (a Node notice, say) can never be mistaken for oc's.
+_OC_VERSION_RE = re.compile(r"\bOpenClaw\s+(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)")
 # The image probe only prints a version, so it gets no network and no capabilities.
 _IMAGE_PROBE_FLAGS = (
     "--rm",
@@ -112,7 +113,7 @@ def _probe_oc_version(
     if completed.returncode != 0:
         return None
     match = _OC_VERSION_RE.search(completed.stdout or "")
-    return match[0] if match else None
+    return match[1] if match else None
 
 
 def _host_oc_version(oc_bin: str) -> str | None:
@@ -130,8 +131,17 @@ def _oc_version_skew(oc_bin: str, image: str) -> str | None:
     """Describe a host/image ``oc`` mismatch, or ``None`` on a match or an inconclusive probe."""
     host = _host_oc_version(oc_bin)
     image_version = _image_oc_version(image)
+    inconclusive = [
+        name for name, found in (("host", host), ("image", image_version)) if found is None
+    ]
+    if inconclusive:
+        _log.warning(
+            "oc version skew check skipped: the %s probe was inconclusive",
+            " and ".join(inconclusive),
+        )
+        return None
     # Equality is a proxy: oc's real check is its state-store schema version, which it never prints.
-    if host is None or image_version is None or host == image_version:
+    if host == image_version:
         return None
     return (
         f"oc version skew: host oc is {host} but sandbox image {image} ships oc "
