@@ -308,14 +308,15 @@ metadata endpoint when its model credential is missing.
 The agent does **not** get your kubeconfig. Before it starts, the harness
 creates a `bench-agent` ServiceAccount in the `bench-system` namespace, binds it
 to the built-in `edit` role cluster-wide plus a small cluster-scoped supplement
-(namespaces CRUD; nodes, PVs, storage classes, CRDs read-only), mints a
-short-lived token for it, and renders a single-cluster kubeconfig containing
-that token and nothing else. The RBAC deliberately grants no write on
-`rbac.authorization.k8s.io` or `admissionregistration.k8s.io`, so the agent
-cannot grant itself permissions through RBAC objects or remove the admission
-policy below. That closes the direct route, not every route: `edit` itself
-carries permissions that can reach a stronger identity — see [Known gaps in
-the RBAC scope](#known-gaps-in-the-rbac-scope).
+(namespaces CRUD; nodes, PVs, storage classes, CRDs read-only) and, unless the
+task sets `agent_quota_writes: false`, a `ResourceQuota`/`LimitRange` write
+role, mints a short-lived token for it, and renders a single-cluster
+kubeconfig containing that token and nothing else. The RBAC deliberately grants
+no write on `rbac.authorization.k8s.io` or `admissionregistration.k8s.io`, so
+the agent cannot grant itself permissions through RBAC objects or remove the
+admission policy below. That closes the direct route, not every route: `edit`
+itself carries permissions that can reach a stronger identity — see [Known gaps
+in the RBAC scope](#known-gaps-in-the-rbac-scope).
 
 Two consequences worth knowing:
 
@@ -394,8 +395,10 @@ Overlapping controls, applied at the same point:
    `pods/proxy` and `services/proxy` too, because `edit` grants all five and
    these are precisely the namespaces whose pods are legitimately privileged;
    the proxy subresources are an HTTP path into the same pods, arriving as the
-   same `CONNECT`. It does not touch config: a ConfigMap in `kube-system` is a
-   blast-radius question rather than an escape.
+   same `CONNECT`. It matches `ResourceQuota` and `LimitRange` writes as well:
+   the quota role is bound cluster-wide, and a `LimitRange` in `kube-system`
+   would starve the cluster's own pods. It does not touch config: a ConfigMap
+   in `kube-system` is a blast-radius question rather than an escape.
 5. **A fourth policy denying the agent a shell into pods that predate all of
    the above.** Admission only sees requests, so nothing here retracts a pod
    that already exists — and the deployer runs *before* credentials are
@@ -466,8 +469,6 @@ opt-out drops exactly two things: policy 2 and the PSA labels (including policy
 3's label requirement). Policies 3 and 4 still apply, because where the agent
 may write is unrelated to what its pods may do, and policy 5 is still applied
 with an empty list so a reused cluster does not keep the previous run's.
-The credential's `ResourceQuota`/`LimitRange` write grant is on by default too;
-a task declines it with `agent_quota_writes: false`.
 
 **All of this is torn down at the end of a run whose cluster survives it**
 (`BENCH_NO_TEARDOWN`, a task with `teardown: false`, the no-op deployer). A

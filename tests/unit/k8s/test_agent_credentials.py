@@ -145,15 +145,18 @@ def test_ensure_agent_identity_applies_the_rendered_manifest(
     assert manifest.exists() and quota_manifest.exists()
 
 
-def test_ensure_agent_identity_pins_the_apply_to_the_runs_context(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("quota_writes", [True, False], ids=["granted", "declined"])
+def test_ensure_agent_identity_pins_every_call_to_the_runs_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, quota_writes: bool
 ) -> None:
-    """Under vcluster both clusters share one kubeconfig; unpinned applies could hit the wrong one."""
+    """Under vcluster both clusters share one kubeconfig; an unpinned apply, or the
+    decline path's delete, could hit the wrong one."""
     calls = _patch_kubectl(monkeypatch)
 
-    creds.ensure_agent_identity(tmp_path, "vcluster-c1")
+    creds.ensure_agent_identity(tmp_path, "vcluster-c1", quota_writes=quota_writes)
 
-    assert calls[0][-2:] == ["--context", "vcluster-c1"]
+    assert len(calls) == 2
+    assert all(c[c.index("--context") + 1] == "vcluster-c1" for c in calls)
 
 
 def _rbac_docs(
@@ -250,21 +253,23 @@ def test_rbac_grants_quota_writes_by_default(
     ]
 
 
-def test_a_task_that_declines_quota_writes_gets_the_grant_removed(
+def test_a_task_that_declines_quota_writes_gets_the_binding_removed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A task whose premise is an operator who cannot touch the quota must not
     inherit the grant from an earlier task on a reused cluster, so declining
-    deletes it rather than merely not applying it."""
+    deletes the binding rather than merely not applying it. The role stays:
+    unbound, it grants nothing, and teardown owns it either way."""
     calls = _patch_kubectl(monkeypatch)
     creds.ensure_agent_identity(tmp_path, quota_writes=False)
 
     assert not (tmp_path / "bench-agent-quota-rbac.yaml").exists()
     deletes = [argv for argv in calls if "delete" in argv]
-    assert any("clusterrolebinding" in argv and creds._QUOTA_ROLE_NAME in argv for argv in deletes)
-    assert any("clusterrole" in argv and creds._QUOTA_ROLE_NAME in argv for argv in deletes)
+    assert [argv[argv.index("delete") + 1 :][:2] for argv in deletes] == [
+        ["clusterrolebinding", creds._QUOTA_ROLE_NAME]
+    ]
     role, binding = _quota_grant(_rbac_docs(tmp_path, monkeypatch, quota_writes=False))
-    assert role is None and binding is None
+    assert role is not None and binding is None
 
 
 def test_provision_passes_the_tasks_quota_decision_through(
@@ -822,6 +827,16 @@ def test_exempt_namespace_guard_covers_every_kind_that_makes_a_pod(
     } <= matched
 
 
+@pytest.mark.parametrize("operation", ["CREATE", "UPDATE", "DELETE"])
+def test_exempt_namespace_guard_covers_the_quota_grant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str
+) -> None:
+    """The quota role is cluster-wide; a LimitRange in kube-system would starve its pods."""
+    matched = _exempt_guard_resources(_policy_docs(tmp_path, monkeypatch), operation)
+
+    assert {"/resourcequotas", "/limitranges"} <= matched
+
+
 def test_exempt_namespace_guard_covers_exec_into_the_clusters_own_pods(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1348,9 +1363,8 @@ def test_teardown_inventory_matches_the_manifests() -> None:
     assert by_kind["ValidatingAdmissionPolicyBinding"] == set(creds._POLICY_BINDING_NAMES)
 
     rbac = [d for d in yaml.safe_load_all(creds._RBAC_MANIFEST) if d]
-    # The quota grant is a separate manifest a task may decline, but teardown
-    # must remove it whether or not the task took it.
-    rbac += [d for d in yaml.safe_load_all(creds._QUOTA_RBAC_MANIFEST) if d]
+    # The quota binding is a separate manifest a task may decline; teardown removes it regardless.
+    rbac += [d for d in yaml.safe_load_all(creds._QUOTA_BINDING_MANIFEST) if d]
     rbac_by_kind: dict[str, set[str]] = {}
     for doc in rbac:
         rbac_by_kind.setdefault(doc["kind"], set()).add(doc["metadata"]["name"])

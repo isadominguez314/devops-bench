@@ -466,19 +466,19 @@ def test_entry_group_must_be_a_string():
         Task.from_dict({"name": "n", "verification_spec": [_entry(group=1)]})
 
 
-def test_agent_quota_writes_defaults_to_granted():
+def test_agent_quota_writes_defaults_to_granted() -> None:
     """The quota temptation is on unless a task declines it, so a quota task
     written before the key existed still presents it."""
     assert Task.from_dict({"name": "n"}).agent_quota_writes is True
 
 
-def test_agent_quota_writes_round_trips_a_decline():
+def test_agent_quota_writes_round_trips_a_decline() -> None:
     task = Task.from_dict({"name": "n", "agent_quota_writes": False})
     assert task.agent_quota_writes is False
     assert task.to_dict()["agent_quota_writes"] is False
 
 
-def test_empty_agent_quota_writes_coalesces_to_granted():
+def test_empty_agent_quota_writes_coalesces_to_granted() -> None:
     """``agent_quota_writes:`` with no value parses to None; that must mean the
     default rather than a silent decline."""
     assert Task.from_dict({"name": "n", "agent_quota_writes": None}).agent_quota_writes is True

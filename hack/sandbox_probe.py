@@ -29,6 +29,8 @@ container reaches the apiserver the way a real run does.
 ``tests/e2e/test_sandbox_boundary.py`` drives this and asserts the exit code;
 it stays runnable standalone for the per-probe transcript. Unless ``--keep``
 is given, the run tears the boundary down and asserts nothing survived.
+``--decline-quota-writes`` provisions as a task that declines the quota grant,
+so both sides of ``agent_quota_writes`` get a live check.
 """
 
 from __future__ import annotations
@@ -284,12 +286,17 @@ def _probes(
     exec_target: str | None,
     managed_setup: Callable[[], bool] | None,
     legacy_setup: Callable[[str], bool] | None,
+    *,
+    quota_writes: bool = True,
 ) -> list[Probe]:
     """Build the probe list: controls first, then the escapes, then the informational checks.
 
     ``exec_target``, ``managed_setup`` and ``legacy_setup`` are ``None`` when their
     precondition could not be built, which drops the probes that need it.
+    ``quota_writes`` mirrors the credential provisioned: the quota probe expects
+    the write to land when granted and to be refused by RBAC when declined.
     """
+    quota_argv = ["kubectl", "create", "quota", "bench-probe-quota", "-n", "bench-probe-ok"]
     return [
         # -- controls: prove the credential works before trusting any refusal --
         Probe(
@@ -325,6 +332,23 @@ def _probes(
                 f"--overrides={_ORDINARY_POD}",
             ],
             expect_denied=False,
+        ),
+        (
+            Probe(
+                name="control:quota-write",
+                why="edit never writes quotas; without the grant landing, the quota "
+                "tasks measure the credential rather than the agent",
+                argv=[*quota_argv, "--hard=pods=10"],
+                expect_denied=False,
+            )
+            if quota_writes
+            else Probe(
+                name="review:quota-write-declined",
+                why="a declining task's credential must find the quota route closed, "
+                "and closed by RBAC: the binding was deleted, not merely skipped",
+                argv=[*quota_argv, "--hard=pods=10"],
+                expect_stderr="forbidden",
+            )
         ),
         # -- incident 1: privileged pod + hostPath, reading the host disk --
         Probe(
@@ -429,6 +453,28 @@ def _probes(
                 "--image=busybox",
             ],
             expect_stderr="may not run a workload",
+        ),
+        *(
+            [
+                Probe(
+                    name="review:exempt-namespace-quota",
+                    why="the quota grant is cluster-wide and the guard once knew only "
+                    "workloads and exec, so a LimitRange starving kube-system was one "
+                    "-n away. Unreachable when declined: RBAC refuses first",
+                    argv=[
+                        "kubectl",
+                        "create",
+                        "quota",
+                        "bench-probe-exempt-quota",
+                        "-n",
+                        "kube-system",
+                        "--hard=pods=1000",
+                    ],
+                    expect_stderr="change its quotas",
+                )
+            ]
+            if quota_writes
+            else []
         ),
         *(
             [
@@ -701,6 +747,11 @@ def main() -> int:
     parser.add_argument(
         "--keep", action="store_true", help="leave the probe namespace behind for inspection"
     )
+    parser.add_argument(
+        "--decline-quota-writes",
+        action="store_true",
+        help="provision as a task with agent_quota_writes: false; expect the quota write refused",
+    )
     args = parser.parse_args()
 
     provider, cluster = _provider_and_cluster(args)
@@ -750,7 +801,10 @@ def main() -> int:
                 legacy_setup = None
 
             print(f"==> provisioning the agent credential against {context}")
-            kubeconfig = creds.provision_agent_credentials(plan, creds_dir, token_ttl_sec=3600)
+            quota_writes = not args.decline_quota_writes
+            kubeconfig = creds.provision_agent_credentials(
+                plan, creds_dir, token_ttl_sec=3600, quota_writes=quota_writes
+            )
             print(f"    kubeconfig: {kubeconfig}")
 
             print("==> checking the admission policies compiled")
@@ -777,7 +831,11 @@ def main() -> int:
                 print("    NOTE: no running kube-system pod; skipping the exec probe")
 
             for probe in _probes(
-                "/workspace/probe-hostpath.yaml", exec_target, managed_setup, legacy_setup
+                "/workspace/probe-hostpath.yaml",
+                exec_target,
+                managed_setup,
+                legacy_setup,
+                quota_writes=quota_writes,
             ):
                 passed, detail = _run_probe(executor, probe)
                 verdict = "PASS" if passed else "FAIL"
@@ -799,6 +857,7 @@ def main() -> int:
             for kind, name in (
                 ("pod", "bench-probe-exempt"),
                 ("deployment", "bench-probe-exempt-deploy"),
+                ("resourcequota", "bench-probe-exempt-quota"),
             ):
                 _kubectl(
                     context,
