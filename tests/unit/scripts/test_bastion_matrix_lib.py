@@ -31,9 +31,10 @@ pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash is no
 
 # A stand-in ``devops_bench.models`` whose client replies with $FAKE_REPLY.
 _FAKE_MODELS = """
-import os
+import asyncio, os
 class _Client:
     async def generate_content(self, contents, tools, system_instruction):
+        await asyncio.sleep(float(os.environ.get("FAKE_DELAY", "0")))
         return {"reply": os.environ.get("FAKE_REPLY", "")}
     def get_text_content(self, response):
         return response["reply"]
@@ -126,3 +127,47 @@ def test_preflight_probe_rejects_an_empty_reply(tmp_path: Path) -> None:
     assert "model returned no text" in result.stderr
     assert "ERROR: judge model google/jm did not answer." in result.stderr
     assert "ERROR: chaos model google/cm did not answer." in result.stderr
+
+
+def test_preflight_probe_times_out_on_a_hanging_model(tmp_path: Path) -> None:
+    env = {
+        **_shim_models(tmp_path),
+        "FAKE_REPLY": "ok",
+        "FAKE_DELAY": "5",
+        "MODEL_PREFLIGHT_TIMEOUT_SEC": "1",
+        "JUDGE_MODEL": "jm",
+        "CHAOS_MODEL": "cm",
+    }
+    result = _bash("preflight_models", env, tmp_path)
+    assert result.returncode == 1
+    assert "no reply within 1s" in result.stderr
+    assert "ERROR: judge model google/jm did not answer." in result.stderr
+
+
+def test_dispatch_aborts_with_rc_2_before_staging_a_runner(tmp_path: Path) -> None:
+    """A failed preflight stops matrix_dispatch before any runner file exists."""
+    env = {"PROJECT_ID": "proj", "JUDGE_MODEL": "jm", "TMPDIR": str(tmp_path)}
+    script = (
+        'preflight_models() { echo "stub: preflight failed" >&2; return 1; }\n'
+        'COMBOS=("r1|tasks/x/task.yaml|AGENT_MODEL=m|refactored")\n'
+        'matrix_dispatch "unit"'
+    )
+    result = _bash(script, env, tmp_path)
+    assert result.returncode == 2
+    assert "ERROR: aborting before provisioning" in result.stderr
+    assert not list(tmp_path.glob(".matrix-runner-*.sh")), "runner staged under HOME"
+    assert not list(tmp_path.glob("matrix-runner-*")), "runner mktemp'd under TMPDIR"
+    assert "launching" not in result.stdout
+
+
+def test_dispatch_skips_the_preflight_when_asked(tmp_path: Path) -> None:
+    """SKIP_MODEL_PREFLIGHT=1 never calls preflight_models (the stub would abort)."""
+    env = {"PROJECT_ID": "proj", "SKIP_MODEL_PREFLIGHT": "1", "TMPDIR": str(tmp_path)}
+    script = (
+        'preflight_models() { echo "stub: must not run" >&2; return 1; }\n'
+        "COMBOS=()\n"  # empty matrix exits 2 before the preflight gate either way; prove the order
+        'matrix_dispatch "unit"'
+    )
+    result = _bash(script, env, tmp_path)
+    assert result.returncode == 2
+    assert "stub: must not run" not in result.stderr

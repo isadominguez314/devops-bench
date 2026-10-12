@@ -31,7 +31,8 @@
 # MCP_SERVER_BIN, SKILLS_PATHS, SKIP_SYNC, DRY_RUN, MATRIX_TASKS, MATRIX_MODELS.
 # RESUME_STAMP=<stamp>: skip launching; re-poll + pull an existing remote run.
 # BENCH_VERTEX=1: agents + judges use Vertex AI via the VM SA's ADC (API keys
-#   unset, location 'global'); legacy oc arm also needs AGENT_PROVIDER=google-vertex.
+#   unset, location 'global'); legacy oc arm also needs AGENT_PROVIDER=google-vertex
+#   and oc's google-vertex provider registered once (configure-oc.sh --vertex).
 # BENCH_REMOTE=1: run on the bastion over ssh; unset runs every combo locally.
 
 BASTION_VM="${BASTION_VM:-bench-bastion}"
@@ -198,7 +199,8 @@ _runner_env() {
   if [ -n "${BENCH_VERTEX:-}" ]; then
     # Vertex mode: drop API keys so everything falls back to ADC; location must be
     # global (the gemini-3.x preview ids 404 on regional endpoints).
-    echo 'unset AGENT_API_KEY GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_API_KEY'
+    # JUDGE_API_KEY is unread, but an old secrets.env may still export a live key.
+    echo 'unset AGENT_API_KEY GEMINI_API_KEY GOOGLE_API_KEY JUDGE_API_KEY GOOGLE_GENAI_API_KEY'
     # Literal marker = "use ADC" for oc's google-vertex provider; via env so it
     # reaches every per-run OPENCLAW_STATE_DIR. Other consumers ignore it.
     echo 'export GOOGLE_CLOUD_API_KEY=gcp-vertex-credentials'
@@ -210,6 +212,9 @@ _runner_env() {
   echo "export AGENT_PROVIDER='${AGENT_PROVIDER}' JUDGE_PROVIDER='${JUDGE_PROVIDER}' JUDGE_MODEL='${JUDGE_MODEL}'"
   echo "export CHAOS_PROVIDER='${CHAOS_PROVIDER}' CHAOS_MODEL='${CHAOS_MODEL}'"
 }
+
+# Per-model cap on the preflight call, so a hanging endpoint cannot hang the launch.
+MODEL_PREFLIGHT_TIMEOUT_SEC="${MODEL_PREFLIGHT_TIMEOUT_SEC:-60}"
 
 # One call to each of the judge and chaos models, in the runner's env, before anything is provisioned.
 preflight_models() {
@@ -223,7 +228,11 @@ python3 -c \"
 import asyncio
 from devops_bench.models import get_model
 c = get_model(provider='${provider}', model_name='${model}')
-r = asyncio.run(c.generate_content([{'role': 'user', 'content': 'reply: ok'}], None, None))
+call = c.generate_content([{'role': 'user', 'content': 'reply: ok'}], None, None)
+try:
+    r = asyncio.run(asyncio.wait_for(call, timeout=${MODEL_PREFLIGHT_TIMEOUT_SEC}))
+except TimeoutError:
+    raise RuntimeError('no reply within ${MODEL_PREFLIGHT_TIMEOUT_SEC}s') from None
 text = c.get_text_content(r)
 if not text:
     raise RuntimeError('model returned no text')
