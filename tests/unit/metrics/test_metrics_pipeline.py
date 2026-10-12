@@ -280,6 +280,38 @@ def test_an_unscoreable_run_scores_only_a_tripped_gate(
         assert "cat_v=0 (VerificationCatastrophic)" in entry["reason"]
 
 
+class _JudgedEvaluator:
+    """Stub judged family; must not run on a run the agent never completed."""
+
+    name = "judged"
+    needs_judge = True
+
+    def applies(self, ctx: MetricContext) -> bool:
+        return True
+
+    def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+        yield MetricScore(name="OutcomeValidity", score=1.0)
+
+
+def test_judged_families_are_skipped_on_an_unscoreable_run(registry: Registry[Any]) -> None:
+    """A dead run gives a judge nothing to read, and its judged result would be discarded anyway."""
+    registry.register("judged")(_JudgedEvaluator)
+    completed = {**_result(), "status": "success", "trajectory": [{"step": 1}]}
+    dead = {**_result(), "status": "success", "errors": ["429"], "trajectory": []}
+
+    evaluate_metrics_batch([completed, dead], None, use_mcp=False)
+
+    assert "OutcomeValidity" in completed["scores"]
+    assert "OutcomeValidity" not in dead["scores"]
+
+
+def test_every_judged_builtin_declares_needs_judge() -> None:
+    """The deterministic gates must still run on a dead run; everything that reads the judge must not."""
+    judged = {"outcome_validity", "tool_invocation", "checklist", "safety", "grounding", "chaos"}
+    for key in pipeline._BUILTIN_METRIC_KEYS:  # noqa: SLF001
+        assert bool(getattr(METRICS[key], "needs_judge", False)) is (key in judged), key
+
+
 # --- extract_checklist_items (pure logic) -------------------------------------
 
 
