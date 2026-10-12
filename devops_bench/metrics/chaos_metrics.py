@@ -110,6 +110,7 @@ class ChaosMetric:
     """
 
     name = "chaos"
+    needs_judge = True
 
     def applies(self, ctx: MetricContext) -> bool:
         """Run only when the harness recorded a chaos spec on the result."""
