@@ -1270,7 +1270,11 @@ class DefaultEvalHarness(Harness):
         try:
             # A mint failure raises: a failed record, never a run missing its credential.
             cloud_credential_env = (
-                provider.sandbox_cloud_credential_env(cluster_info, lifetime_sec=token_ttl_sec)
+                provider.sandbox_cloud_credential_env(
+                    cluster_info,
+                    lifetime_sec=token_ttl_sec,
+                    agent_timeout_sec=self._agent_config.timeout_sec,
+                )
                 if with_cluster and provider is not None
                 else {}
             )

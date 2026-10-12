@@ -627,15 +627,24 @@ mints a short-lived credential for that identity host-side and injects it into
 the container; the operator's own credentials never cross. On GCP this is an
 impersonated access token (`CLOUDSDK_AUTH_ACCESS_TOKEN` /
 `GOOGLE_OAUTH_ACCESS_TOKEN`, with `CLOUDSDK_CORE_PROJECT` pinned to the task's
-project), sized to the same budget as the cluster token above and not
-refreshed. A budget past an hour needs the organization policy that allows
-service-account credential lifetime extension; without it the mint falls back
-to an hour and warns that the credential expires before the agent's timeout.
-A mint failure, a hung `gcloud`, or a provider that cannot mint for a named
-identity fails the run rather than letting the agent run without the
-credential its task depends on. A task that also declares
-`requires_unsandboxed` runs ambient and the identity goes unused, with a
-warning. Tasks with no such output are unaffected.
+project), requested with the same budget as the cluster token above. A mint
+failure, a hung `gcloud`, or a provider that cannot mint for a named identity
+fails the run rather than letting the agent run without the credential its
+task depends on. A task that also declares `requires_unsandboxed` runs ambient
+and the identity goes unused, with a warning. Tasks with no such output are
+unaffected.
+
+**Lifetime tradeoff.** The container holds the token as a static variable and
+cannot refresh it, and impersonated tokens are capped at one hour unless the
+project grants `constraints/iam.allowServiceAccountCredentialLifetimeExtension`.
+When a longer request is refused, the harness asks whether an hour still covers
+the agent's `timeout_sec`. If it does (only the slack after the timeout is
+lost), it takes the hour and warns. If it does not, the run fails before the
+agent starts, naming the policy: grant it, or shorten the timeout. The
+alternative, serving the task identity through the metadata emulator so the
+container refreshes on its own, was deliberately not built: the emulator serves
+one identity and the container's `gcloud` reads the static token. Revisit it if
+a task genuinely needs more than an hour of cloud API access; today none does.
 
 ## Adding your own harness
 

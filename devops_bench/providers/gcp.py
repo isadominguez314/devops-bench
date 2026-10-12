@@ -36,7 +36,8 @@ __all__ = ["GcpProvider"]
 
 _log = get_logger("providers.gcp")
 
-# Impersonation's ceiling without constraints/iam.allowServiceAccountCredentialLifetimeExtension.
+_LIFETIME_EXTENSION_POLICY = "constraints/iam.allowServiceAccountCredentialLifetimeExtension"
+# Impersonation's ceiling without that org policy.
 _DEFAULT_TOKEN_LIFETIME_SEC = 3600
 _REFUSAL = "refusing to run the agent without the credential its task needs"
 
@@ -154,11 +155,16 @@ class GcpProvider(Provider):
         )
 
     def sandbox_cloud_credential_env(
-        self, cluster_info: ClusterInfo, *, lifetime_sec: int | None = None
+        self,
+        cluster_info: ClusterInfo,
+        *,
+        lifetime_sec: int | None = None,
+        agent_timeout_sec: float | None = None,
     ) -> dict[str, str]:
         """Mint a token by impersonating the task's identity host-side; raises when it cannot.
 
-        Lifetimes past an hour need the lifetime-extension org policy, else an hour plus a warning.
+        Lifetimes past an hour need the lifetime-extension org policy. Refused, the mint
+        falls back to an hour only if that still covers ``agent_timeout_sec``; else it raises.
         """
         identity = cluster_info.agent_cloud_identity
         if not identity:
@@ -167,11 +173,18 @@ class GcpProvider(Provider):
         try:
             token = mint_impersonated_token(identity, lifetime_sec=lifetime)
         except ImpersonationError as exc:
-            # A refusal past an hour is the missing lifetime-extension org policy; retry at an hour.
+            # A refusal past an hour is the missing lifetime-extension org policy.
             if not exc.refused or lifetime <= _DEFAULT_TOKEN_LIFETIME_SEC:
                 raise SandboxError(f"{exc}; {_REFUSAL}") from exc
+            if agent_timeout_sec is not None and agent_timeout_sec > _DEFAULT_TOKEN_LIFETIME_SEC:
+                # The container cannot refresh it, so an hour would expire mid-run; refuse now.
+                raise SandboxError(
+                    f"{exc}; a {_DEFAULT_TOKEN_LIFETIME_SEC}s credential would expire before the "
+                    f"agent's {int(agent_timeout_sec)}s timeout and the container cannot refresh "
+                    f"it — grant {_LIFETIME_EXTENSION_POLICY} or shorten the timeout; {_REFUSAL}"
+                ) from exc
             _log.warning(
-                "%s; retrying at %ds, so it expires before the agent's token budget",
+                "%s; retrying at %ds, which covers the agent's timeout but not the slack after it",
                 exc,
                 _DEFAULT_TOKEN_LIFETIME_SEC,
             )

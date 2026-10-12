@@ -1164,13 +1164,17 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     )
     kubeconfig = tmp_path / "creds" / "kubeconfig"
 
-    cloud_requests: list[tuple[str, int | None]] = []
+    cloud_requests: list[tuple[str, int | None, float | None]] = []
 
     class _StubProvider:
         def sandbox_cloud_credential_env(
-            self, cluster_info: ClusterInfo, *, lifetime_sec: int | None = None
+            self,
+            cluster_info: ClusterInfo,
+            *,
+            lifetime_sec: int | None = None,
+            agent_timeout_sec: float | None = None,
         ) -> dict[str, str]:
-            cloud_requests.append((cluster_info.name, lifetime_sec))
+            cloud_requests.append((cluster_info.name, lifetime_sec, agent_timeout_sec))
             return {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
 
     provider = _StubProvider()
@@ -1222,8 +1226,8 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     # kubeconfig), never the ambient current-context.
     assert plan_requests == [(provider, "c1")]
     # The provider's minted cloud credential lands on the spec, keyed to this
-    # run's cluster and sized to the same budget as the cluster token.
-    assert cloud_requests == [("c1", 1500)]
+    # run's cluster, sized to the cluster token's budget, with the timeout as the floor.
+    assert cloud_requests == [("c1", 1500, 600)]
     assert spec.cloud_credential_env == {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
 
 

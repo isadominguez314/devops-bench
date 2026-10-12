@@ -122,13 +122,18 @@ class Provider(ABC):
         )
 
     def sandbox_cloud_credential_env(
-        self, cluster_info: ClusterInfo, *, lifetime_sec: int | None = None
+        self,
+        cluster_info: ClusterInfo,
+        *,
+        lifetime_sec: int | None = None,
+        agent_timeout_sec: float | None = None,
     ) -> dict[str, str]:
         """Mint a ``lifetime_sec`` credential for the task's ``agent_cloud_identity``.
 
-        The default mints nothing, so a named identity is a :class:`SandboxError`.
+        ``agent_timeout_sec`` is the floor a shorter-than-asked credential must still
+        cover. The default mints nothing, so a named identity is a :class:`SandboxError`.
         """
-        del lifetime_sec
+        del lifetime_sec, agent_timeout_sec
         if cluster_info.agent_cloud_identity:
             raise SandboxError(
                 f"provider {type(self).__name__} cannot mint a credential for the agent's "

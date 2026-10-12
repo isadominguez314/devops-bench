@@ -253,14 +253,32 @@ def test_gcp_cloud_credential_env_falls_back_to_an_hour_when_extension_is_refuse
         ],
     )
     with caplog.at_level("WARNING"):
-        env = GcpProvider().sandbox_cloud_credential_env(_identity_info(), lifetime_sec=5400)
+        # A 50-minute timeout asks for 65 minutes (slack); the hour still covers the run.
+        env = GcpProvider().sandbox_cloud_credential_env(
+            _identity_info(), lifetime_sec=3900, agent_timeout_sec=3000
+        )
     assert env["CLOUDSDK_AUTH_ACCESS_TOKEN"] == "tok"
     assert [_lifetime_arg(c) for c in mock_run.call_args_list] == [
-        "--lifetime=5400s",
+        "--lifetime=3900s",
         "--lifetime=3600s",
     ]
     assert "lifetime exceeds policy" in caplog.text
-    assert "expires before the agent's token budget" in caplog.text
+    assert "covers the agent's timeout but not the slack" in caplog.text
+
+
+def test_gcp_cloud_credential_env_fails_fast_when_an_hour_expires_before_the_timeout(
+    mocker: MockerFixture,
+) -> None:
+    mock_run = mocker.patch(
+        "devops_bench.core.model_providers.run",
+        return_value=SimpleNamespace(returncode=1, stdout="", stderr="lifetime exceeds policy"),
+    )
+    with pytest.raises(SandboxError, match="allowServiceAccountCredentialLifetimeExtension"):
+        GcpProvider().sandbox_cloud_credential_env(
+            _identity_info(), lifetime_sec=6300, agent_timeout_sec=5400
+        )
+    # No point minting an hour that is known to expire mid-run.
+    assert mock_run.call_count == 1
 
 
 def test_gcp_cloud_credential_env_does_not_retry_a_budget_within_an_hour(
