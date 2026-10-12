@@ -288,6 +288,7 @@ class AgyCliAgent(base.AgentHarness):
 
     @classmethod
     def reasoning_effort(cls, config: agents_config.AgentConfig) -> str | None:
+        """The tier the run uses, whether it came from the id, ``--effort``, or the env default."""
         return _effective_effort(config.model) if config.model else None
 
     def _resolve_binary(self) -> str:

@@ -86,14 +86,14 @@ def test_setup_id_matches_catalog_slug_for_dotted_model():
     assert setup_id("gemini-3.1-pro", "gemini-cli", []) == "gemini-3-1-pro-gemini-cli"
 
 
-def test_setup_id_appends_the_reasoning_effort_as_its_own_arm():
+def test_setup_id_appends_the_reasoning_effort_as_its_own_arm() -> None:
     # Runs of one model at different tiers must not share an id, or the
     # aggregate's keep-newest dedupe lets a re-run at one tier replace the other.
     assert setup_id("m", "h", ["mcp"], reasoning_effort="low") == "m-h-mcp-effort-low"
     assert setup_id("m", "h", [], reasoning_effort="high") == "m-h-effort-high"
 
 
-def test_setup_id_without_a_reasoning_effort_is_unchanged():
+def test_setup_id_without_a_reasoning_effort_is_unchanged() -> None:
     assert setup_id("m", "h", ["mcp"], reasoning_effort=None) == setup_id("m", "h", ["mcp"])
 
 
@@ -167,7 +167,7 @@ def test_extract_score_none_score_in_dict_is_none():
 # -- build_rows --------------------------------------------------------------
 
 
-def test_build_rows_carries_the_manifest_reasoning_effort():
+def test_build_rows_carries_the_manifest_reasoning_effort() -> None:
     manifest = _manifest(setup_id="m-h-effort-low", reasoning_effort="low")
     record = {"name": "t", "folder": "t", "status": "success", "latency": 1.0}
 
