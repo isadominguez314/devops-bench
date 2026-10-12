@@ -18,7 +18,6 @@
 # Dimensions: Task x Model x AgentConfig. Run from your workstation; results are
 # copied back locally. (Legacy arm: scripts/bastion/run_matrix_legacy.sh.)
 #
-# Agent-config presets: "<oc|gcli>[+mcp][+skills]" (oc=openclaw, gcli=gemini).
 # The refactored arm wires MCP/skills per-run via env, so every combo is fully
 # independent. CUJs:
 #
@@ -53,8 +52,10 @@ agent_config_env() {
     # "gemini" is the registered agent key; "cli" matches neither a registered
     # agent nor the gemini-cli alias, so it fails at agent resolution.
     gcli) out+=("BENCH_AGENT_TYPE=gemini" "AGENT_TARGET=gemini") ;;
-    agy)  out+=("BENCH_AGENT_TYPE=antigravity" "AGENT_TARGET=\$HOME/.local/bin/agy") ;;
-    cc)   out+=("BENCH_AGENT_TYPE=claude" "AGENT_TARGET=\$HOME/.local/bin/claude") ;;
+    agy)  out+=("BENCH_AGENT_TYPE=antigravity") ;;
+    # claude needs its own provider; the matrix-wide AGENT_PROVIDER is a gemini one.
+    cc)   out+=("BENCH_AGENT_TYPE=claude" "AGENT_TARGET=\$HOME/.local/bin/claude"
+                "AGENT_PROVIDER=anthropic${BENCH_VERTEX:+-vertex}") ;;
     *) echo "ERROR: unknown agent type '${type}' in preset '${preset}'" >&2; return 1 ;;
   esac
   for feat in $(echo "${preset}" | tr '+' ' '); do
