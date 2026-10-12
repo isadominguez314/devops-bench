@@ -798,7 +798,7 @@ class DefaultEvalHarness(Harness):
             # a batch of only exempt tasks never needs the seam.
             _ensure_builtin_agents_registered()
             agent_cls = AGENTS.get(_canonical_agent_type(self.agent_type))
-            if agent_cls is not None and not getattr(agent_cls, "supports_sandbox", False):
+            if not getattr(agent_cls, "supports_sandbox", False):
                 raise SandboxError(
                     f"agent harness {agent_cls.__name__} has not been migrated onto "
                     "the sandbox seam; refusing the whole batch rather than "
@@ -913,7 +913,8 @@ class DefaultEvalHarness(Harness):
         # The tier is part of the arm: without it, runs of one model at two tiers
         # share a setup id and the aggregate's keep-newest dedupe merges them.
         _ensure_builtin_agents_registered()
-        agent_cls = AGENTS.get(harness)
+        # ``get`` raises on a miss; an unregistered harness still gets its rows written.
+        agent_cls = AGENTS.get(harness) if harness in AGENTS else None
         reasoning_effort = (
             agent_cls.reasoning_effort(self._agent_config) if agent_cls is not None else None
         )

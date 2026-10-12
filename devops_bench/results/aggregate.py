@@ -205,6 +205,7 @@ def build_manifests(
             augmentation=list(row.augmentation),
             sandbox_image=image,
             sandbox_image_digest=digest,
+            reasoning_effort=row.reasoning_effort,
         )
     return list(manifests.values())
 

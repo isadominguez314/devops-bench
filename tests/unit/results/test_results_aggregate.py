@@ -103,13 +103,16 @@ def test_build_manifests_one_per_setup():
             _row(setupId="m-h-mcp", taskFolder="task-a", taskName="task-a"),
             _row(setupId="m-h-mcp", taskFolder="task-b", taskName="task-b"),
             _row(setupId="m-h", augmentation=[], taskFolder="task-a", taskName="task-a"),
+            _row(setupId="m-h-effort-low", augmentation=[], reasoningEffort="low"),
         ],
         run_id="run_x",
         t="2026-06-01T12:00:00Z",
     )
     manifests = build_manifests(rows, run_id="run_x", t="2026-06-01T12:00:00Z")
-    assert [m.setup_id for m in manifests] == ["m-h-mcp", "m-h"]
+    assert [m.setup_id for m in manifests] == ["m-h-mcp", "m-h", "m-h-effort-low"]
     assert all(m.run_id == "run_x" and m.t == "2026-06-01T12:00:00Z" for m in manifests)
+    # The tier is part of the arm, so the batch manifest carries it like the per-task one.
+    assert [m.reasoning_effort for m in manifests] == [None, None, "low"]
 
 
 def _write_manifest(path: Path, **overrides: object) -> None:

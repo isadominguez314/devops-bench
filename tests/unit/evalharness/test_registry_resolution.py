@@ -202,8 +202,6 @@ def test_manifest_records_the_reasoning_effort_of_a_tiered_harness(
     the aggregate's keep-newest dedupe lets a re-run at one tier replace rows
     scored at the other.
     """
-    import devops_bench.agents.cli.antigravity.agent  # noqa: F401 - registers the harness
-
     monkeypatch.delenv("AGENT_MODEL_EFFORT", raising=False)
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
     harness.agent_type = "antigravity"
@@ -217,3 +215,19 @@ def test_manifest_records_the_reasoning_effort_of_a_tiered_harness(
     assert manifest["reasoningEffort"] == "low"
     assert manifest["setupId"].startswith("google-gemini-3-1-pro-preview-low-antigravity")
     assert manifest["setupId"].endswith("-effort-low")
+
+
+def test_manifest_is_still_written_for_an_unregistered_harness(
+    tmp_path: Path, mocker: MockerFixture
+) -> None:
+    """A harness the registry does not know gets no tier, not a lost manifest."""
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    harness.agent_type = "no-such-harness"
+    write_manifest = mocker.patch.object(harness.reporter, "write_manifest")
+    mocker.patch.object(harness.reporter, "write_rows")
+
+    harness._write_run_artifacts(tmp_path, [])  # noqa: SLF001 - the unit under test
+
+    manifest = write_manifest.call_args.args[1]
+    assert manifest["harness"] == "no-such-harness"
+    assert manifest["reasoningEffort"] is None

@@ -357,15 +357,21 @@ class TestResolveModelName:
         assert agy_mod._resolve_model_name("google/gemini-3.1-pro-preview") == (
             "gemini-3.1-pro",
             "high",
+            "high",
         )
 
     def test_supplies_default_tier_when_id_names_none(self) -> None:
         # agy has no untiered form; a bare slug is refused outright.
-        assert agy_mod._resolve_model_name("gemini-3.8-flash") == ("gemini-3.8-flash", "high")
+        assert agy_mod._resolve_model_name("gemini-3.8-flash") == (
+            "gemini-3.8-flash",
+            "high",
+            "high",
+        )
 
     def test_splits_a_tier_spelled_into_the_slug(self) -> None:
         assert agy_mod._resolve_model_name("gemini-3.8-flash-medium") == (
             "gemini-3.8-flash",
+            "medium",
             "medium",
         )
 
@@ -375,6 +381,7 @@ class TestResolveModelName:
         assert agy_mod._resolve_model_name("google/gemini-3.1-pro-preview-low") == (
             "gemini-3.1-pro",
             "low",
+            "low",
         )
 
     @pytest.mark.parametrize("tier", agy_mod._AGY_EFFORT_TIERS)
@@ -383,7 +390,7 @@ class TestResolveModelName:
         # name would get a second --effort, which agy rejects.
         display = f"Gemini 3.8 Flash ({tier.title()})"
 
-        assert agy_mod._resolve_model_name(display) == (display, None)
+        assert agy_mod._resolve_model_name(display) == (display, None, tier)
 
     def test_display_name_keeps_its_own_tier_and_takes_no_effort_flag(self) -> None:
         # agy errors when --effort accompanies a parenthesised tier, so the
@@ -391,12 +398,14 @@ class TestResolveModelName:
         assert agy_mod._resolve_model_name("Gemini 3.1 Pro (Low)") == (
             "Gemini 3.1 Pro (Low)",
             None,
+            "low",
         )
 
     def test_display_name_tier_match_is_case_insensitive(self) -> None:
         assert agy_mod._resolve_model_name("GEMINI 3.1 PRO (HIGH)") == (
             "GEMINI 3.1 PRO (HIGH)",
             None,
+            "high",
         )
 
 
