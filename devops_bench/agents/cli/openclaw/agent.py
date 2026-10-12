@@ -469,17 +469,23 @@ class OpenClawAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                     host_run=run,
                 )
-            except SubprocessError:
-                # With check=False the only SubprocessError here is a timeout.
-                return AgentResult.errored(f"oc agent timed out after {self.config.timeout_sec}s")
+            except SubprocessError as exc:
+                # With check=False this is a timeout. The process is dead; the session
+                # store on the bind mount is not, so the host-side export below still runs.
+                completed, timed_out = exc, True
             except OSError as exc:
                 return AgentResult.errored(f"oc binary unavailable: {exc}")
+            else:
+                timed_out = False
 
             stdout_text = _strip_ansi(completed.stdout or "")
             errors: list[str] = []
             metadata: dict = {}
 
-            if completed.returncode != 0:
+            if timed_out:
+                errors.append(f"oc agent timed out after {self.config.timeout_sec}s")
+                metadata["returncode"] = completed.returncode
+            elif completed.returncode != 0:
                 stderr = (completed.stderr or "").strip()
                 errors.append(f"oc agent exited {completed.returncode}: {stderr or '<no stderr>'}")
                 metadata["returncode"] = completed.returncode

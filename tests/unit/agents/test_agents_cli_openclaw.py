@@ -489,15 +489,30 @@ def test_execute_records_export_subprocess_failure(
     assert any("export-trajectory failed" in e for e in result.errors)
 
 
-def test_execute_records_bash_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fake_bash(cmd, **kwargs):
-        # core.subprocess.run wraps TimeoutExpired in SubprocessError.
-        raise SubprocessError(["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="")
+def _timed_out_bash(cmd: str, **kwargs: Any) -> SimpleNamespace:
+    # core.subprocess.run wraps TimeoutExpired in SubprocessError.
+    raise SubprocessError(["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="")
 
-    _install_oc_run(monkeypatch, fake_bash)
+
+def test_execute_recovers_the_trajectory_on_a_bash_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The killed process leaves its session store behind; the host-side export still reads it."""
+    _install_oc_run(monkeypatch, _timed_out_bash, _bundle_writer(SAMPLE_EVENTS))
     result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=5.0)).run("p")
-    assert result.has_errors()
-    assert "timed out" in result.errors[0]
+    assert result.errors == ["oc agent timed out after 5.0s"]
+    assert result.metadata["returncode"] == -1
+    assert [step["name"] for step in result.trajectory] == ["kubectl_get_pods", "kubectl_describe"]
+    assert result.output == "All pods healthy."
+
+
+def test_execute_records_a_bash_timeout_with_nothing_to_export(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_oc_run(monkeypatch, _timed_out_bash)
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=5.0)).run("p")
+    assert result.errors[0] == "oc agent timed out after 5.0s"
+    assert any("no session key" in e for e in result.errors)
     assert result.trajectory == []
 
 
