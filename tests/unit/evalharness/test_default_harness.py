@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from pytest_mock import MockerFixture
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentHarness
 from devops_bench.agents.result import AgentResult, ToolCall
@@ -2100,10 +2101,15 @@ def test_only_readonly_quota_declines_quota_writes() -> None:
     assert declining == ["readonly-quota"]
 
 
-def test_resolve_model_name_prefers_the_judges_own_label() -> None:
-    """The judge's own label wins over its client's; no judge resolves to None."""
-    resolve = harness_default._resolve_model_name  # noqa: SLF001
-    client = SimpleNamespace(model_name="client-m")
-    assert resolve(SimpleNamespace(_model_name="judge-m", client=client)) == "judge-m"
-    assert resolve(SimpleNamespace(client=client)) == "client-m"
-    assert resolve(None) is None
+def test_manifest_names_a_judge_only_when_scoring_ran(mocker: MockerFixture) -> None:
+    """An all-failed batch never builds a judge, so the manifest must not name one."""
+    judge = SimpleNamespace(identity={"provider": "p", "model": "judge-m"})
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c", judge_model=judge)
+    assert harness._judge_model_name is None  # noqa: SLF001
+
+    harness._score([{"status": "failed"}])  # noqa: SLF001
+    assert harness._judge_model_name is None  # noqa: SLF001
+
+    mocker.patch("devops_bench.metrics.evaluate_metrics_batch")
+    harness._score([{"status": "success"}])  # noqa: SLF001
+    assert harness._judge_model_name == "judge-m"  # noqa: SLF001
