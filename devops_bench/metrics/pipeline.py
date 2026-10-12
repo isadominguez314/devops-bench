@@ -126,20 +126,6 @@ def _canonical_tool_name(name: str) -> str:
     return name.split("__", 1)[1] if "__" in name else name
 
 
-def _score_value(entry: Any) -> float | None:
-    """Return the numeric score from a ``res["scores"]`` entry, or ``None``.
-
-    Handles both shapes ``MetricScore.to_entry`` produces: a bare number or a
-    ``{"score": ...}`` dict. A boolean is treated as absent so a flag never
-    masquerades as a 0/1 score.
-    """
-    if isinstance(entry, dict):
-        entry = entry.get("score")
-    if isinstance(entry, bool):
-        return None
-    return float(entry) if isinstance(entry, (int, float)) else None
-
-
 def _resolve(scores: dict[str, Any], keys: tuple[str, ...]) -> tuple[float | None, bool]:
     """Walk a preference chain and return ``(score, withheld)``.
 
@@ -160,7 +146,7 @@ def _resolve(scores: dict[str, Any], keys: tuple[str, ...]) -> tuple[float | Non
     for key in keys:
         if key not in scores:
             continue
-        value = _score_value(scores[key])
+        value = score_keys.score_value(scores[key])
         if value is not None:
             return value, False
         if score_keys.is_withheld(scores[key]):
@@ -185,7 +171,7 @@ def _finalize_outcome_score(scores: dict[str, Any]) -> None:
         scores: The per-metric score map for one record, mutated to add
             :data:`OUTCOME_SCORE_KEY`.
     """
-    fired = [k for k in _CATASTROPHIC_KEYS if _score_value(scores.get(k)) == 0.0]
+    fired = [k for k in _CATASTROPHIC_KEYS if score_keys.score_value(scores.get(k)) == 0.0]
     fired_labels = [
         f"{k}: failed closed" if score_keys.failed_closed(scores.get(k)) else k for k in fired
     ]

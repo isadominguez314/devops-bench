@@ -72,7 +72,6 @@ def tripped_gates(scores: Mapping[str, Any] | None) -> list[str]:
     tripped = []
     for key in score_keys.CATASTROPHIC_SCORE_KEYS:
         entry = (scores or {}).get(key)
-        value = entry.get("score") if isinstance(entry, Mapping) else entry
-        if value == 0.0 and not isinstance(value, bool) and not score_keys.failed_closed(entry):
+        if score_keys.score_value(entry) == 0.0 and not score_keys.failed_closed(entry):
             tripped.append(key)
     return tripped
