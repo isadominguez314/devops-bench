@@ -188,7 +188,7 @@ def test_gcp_ensure_cluster_credentials_reads_the_agent_cloud_identity_output(
 def test_gcp_cloud_credential_env_is_empty_without_an_identity(
     mocker: MockerFixture,
 ) -> None:
-    mock_run = mocker.patch("devops_bench.providers.gcp.run")
+    mock_run = mocker.patch("devops_bench.core.model_providers.run")
     info = ClusterInfo(name="c", location="us-central1-a", project="p")
     assert GcpProvider().sandbox_cloud_credential_env(info) == {}
     mock_run.assert_not_called()
@@ -198,7 +198,7 @@ def test_gcp_cloud_credential_env_mints_an_impersonated_token(
     mocker: MockerFixture,
 ) -> None:
     mock_run = mocker.patch(
-        "devops_bench.providers.gcp.run",
+        "devops_bench.core.model_providers.run",
         return_value=SimpleNamespace(returncode=0, stdout="tok-123\n", stderr=""),
     )
     env = GcpProvider().sandbox_cloud_credential_env(_identity_info())
@@ -234,7 +234,7 @@ def _lifetime_arg(call: Any) -> str:
 
 def test_gcp_cloud_credential_env_requests_the_agent_token_budget(mocker: MockerFixture) -> None:
     mock_run = mocker.patch(
-        "devops_bench.providers.gcp.run",
+        "devops_bench.core.model_providers.run",
         return_value=SimpleNamespace(returncode=0, stdout="tok\n", stderr=""),
     )
     GcpProvider().sandbox_cloud_credential_env(_identity_info(), lifetime_sec=5400)
@@ -246,7 +246,7 @@ def test_gcp_cloud_credential_env_falls_back_to_an_hour_when_extension_is_refuse
     mocker: MockerFixture, caplog: pytest.LogCaptureFixture
 ) -> None:
     mock_run = mocker.patch(
-        "devops_bench.providers.gcp.run",
+        "devops_bench.core.model_providers.run",
         side_effect=[
             SimpleNamespace(returncode=1, stdout="", stderr="lifetime exceeds policy"),
             SimpleNamespace(returncode=0, stdout="tok\n", stderr=""),
@@ -267,7 +267,7 @@ def test_gcp_cloud_credential_env_does_not_retry_a_budget_within_an_hour(
     mocker: MockerFixture,
 ) -> None:
     mock_run = mocker.patch(
-        "devops_bench.providers.gcp.run",
+        "devops_bench.core.model_providers.run",
         return_value=SimpleNamespace(returncode=1, stdout="", stderr="denied"),
     )
     with pytest.raises(SandboxError, match="denied"):
@@ -282,7 +282,7 @@ def test_gcp_cloud_credential_env_does_not_retry_a_budget_within_an_hour(
 def test_gcp_cloud_credential_env_turns_a_hung_or_missing_gcloud_into_a_sandbox_error(
     mocker: MockerFixture, exc: Exception
 ) -> None:
-    mocker.patch("devops_bench.providers.gcp.run", side_effect=exc)
+    mocker.patch("devops_bench.core.model_providers.run", side_effect=exc)
     with pytest.raises(SandboxError, match="bounded at 60s"):
         GcpProvider().sandbox_cloud_credential_env(_identity_info())
 
@@ -291,7 +291,7 @@ def test_gcp_cloud_credential_env_fails_loud_when_the_mint_fails(
     mocker: MockerFixture,
 ) -> None:
     mocker.patch(
-        "devops_bench.providers.gcp.run",
+        "devops_bench.core.model_providers.run",
         return_value=SimpleNamespace(returncode=1, stdout="", stderr="PERMISSION_DENIED"),
     )
     info = ClusterInfo(name="c", agent_cloud_identity="rot-x@p.iam.gserviceaccount.com")

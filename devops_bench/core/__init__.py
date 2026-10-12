@@ -27,6 +27,7 @@ from devops_bench.core.errors import (
     AlreadyRegisteredError,
     ConfigError,
     DevOpsBenchError,
+    ImpersonationError,
     InvalidKeyError,
     MissingDependencyError,
     NotRegisteredError,
@@ -62,6 +63,7 @@ __all__ = [
     "InvalidKeyError",
     "NotRegisteredError",
     "MissingDependencyError",
+    "ImpersonationError",
     "SandboxError",
     "SubprocessError",
 ]

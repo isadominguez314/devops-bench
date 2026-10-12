@@ -16,19 +16,19 @@
 
 from __future__ import annotations
 
-import subprocess
 from typing import Any
 
 from devops_bench.core import (
     ClusterInfo,
     ConfigError,
+    ImpersonationError,
     NetworkPlan,
     SandboxError,
-    SubprocessError,
     get_bool,
     get_env,
     get_logger,
 )
+from devops_bench.core.model_providers import mint_impersonated_token
 from devops_bench.core.subprocess import run
 from devops_bench.providers.base import PROVIDERS, Provider, ResolveContext
 
@@ -36,41 +36,14 @@ __all__ = ["GcpProvider"]
 
 _log = get_logger("providers.gcp")
 
-_TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 # Impersonation's ceiling without constraints/iam.allowServiceAccountCredentialLifetimeExtension.
 _DEFAULT_TOKEN_LIFETIME_SEC = 3600
-_MINT_TIMEOUT_SEC = 60
+_REFUSAL = "refusing to run the agent without the credential its task needs"
 
 
 def _context_name(project: str, location: str, cluster_name: str) -> str:
     """Reconstruct the kubectl context name ``gcloud get-credentials`` writes."""
     return f"gke_{project}_{location}_{cluster_name}"
-
-
-def _stderr_of(result: subprocess.CompletedProcess[str]) -> str:
-    return (result.stderr or "").strip() or "<no stderr>"
-
-
-def _print_access_token(identity: str, lifetime_sec: int) -> subprocess.CompletedProcess[str]:
-    """Run the bounded impersonation mint; a hang or missing gcloud is a :class:`SandboxError`."""
-    try:
-        return run(
-            [
-                "gcloud",
-                "auth",
-                "print-access-token",
-                f"--impersonate-service-account={identity}",
-                f"--scopes={_TOKEN_SCOPE}",
-                f"--lifetime={lifetime_sec}s",
-            ],
-            check=False,
-            timeout=_MINT_TIMEOUT_SEC,
-        )
-    except (OSError, SubprocessError) as exc:
-        raise SandboxError(
-            f"could not mint an access token for the agent's cloud identity {identity!r}: "
-            f"{exc} (the mint is bounded at {_MINT_TIMEOUT_SEC}s)"
-        ) from exc
 
 
 @PROVIDERS.register("gcp")
@@ -191,26 +164,22 @@ class GcpProvider(Provider):
         if not identity:
             return {}
         lifetime = lifetime_sec or _DEFAULT_TOKEN_LIFETIME_SEC
-        result = _print_access_token(identity, lifetime)
-        if result.returncode != 0 and lifetime > _DEFAULT_TOKEN_LIFETIME_SEC:
+        try:
+            token = mint_impersonated_token(identity, lifetime_sec=lifetime)
+        except ImpersonationError as exc:
+            # A refusal past an hour is the missing lifetime-extension org policy; retry at an hour.
+            if not exc.refused or lifetime <= _DEFAULT_TOKEN_LIFETIME_SEC:
+                raise SandboxError(f"{exc}; {_REFUSAL}") from exc
             _log.warning(
-                "could not mint a %ds credential for %s (%s); retrying at %ds, so it expires "
-                "before the agent's token budget",
-                lifetime,
-                identity,
-                _stderr_of(result),
+                "%s; retrying at %ds, so it expires before the agent's token budget",
+                exc,
                 _DEFAULT_TOKEN_LIFETIME_SEC,
             )
             lifetime = _DEFAULT_TOKEN_LIFETIME_SEC
-            result = _print_access_token(identity, lifetime)
-        token = (result.stdout or "").strip()
-        if result.returncode != 0 or not token:
-            raise SandboxError(
-                f"could not mint an access token for the agent's cloud identity "
-                f"{identity!r} (gcloud exit {result.returncode}: {_stderr_of(result)}); the "
-                "provisioning identity needs roles/iam.serviceAccountTokenCreator on it — "
-                "refusing to run the agent without the credential its task needs"
-            )
+            try:
+                token = mint_impersonated_token(identity, lifetime_sec=lifetime)
+            except ImpersonationError as retry_exc:
+                raise SandboxError(f"{retry_exc}; {_REFUSAL}") from retry_exc
         _log.info("minted a %ds cloud credential for the sandboxed agent as %s", lifetime, identity)
         env = {
             "CLOUDSDK_AUTH_ACCESS_TOKEN": token,

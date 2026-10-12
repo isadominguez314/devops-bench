@@ -26,7 +26,7 @@ import pytest
 from pydantic import ValidationError
 
 from devops_bench.core import model_providers
-from devops_bench.core.errors import ConfigError, SubprocessError
+from devops_bench.core.errors import ConfigError, ImpersonationError, SubprocessError
 from devops_bench.core.model_providers import (
     VERTEX_SANDBOX_SA_ENV,
     known_providers,
@@ -347,6 +347,19 @@ def test_expires_in_counts_down_between_requests(
     # remaining life of the one cached token, not a fresh 3600 each time.
     assert first - 1001 <= second <= first - 999
     assert len(minted) == 1
+
+
+def test_mint_impersonated_token_tells_a_refusal_from_a_missing_gcloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_run(cmd: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("gcloud")
+
+    monkeypatch.setattr(model_providers, "run", missing_run)
+    with pytest.raises(ImpersonationError) as exc:
+        model_providers.mint_impersonated_token(_SA, lifetime_sec=1500)
+    assert exc.value.refused is False
+    assert "bounded at" in str(exc.value)
 
 
 def test_the_mint_is_bounded_and_a_hang_is_a_config_error(

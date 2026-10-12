@@ -97,6 +97,16 @@ class SandboxError(DevOpsBenchError):
     """
 
 
+class ImpersonationError(DevOpsBenchError):
+    """A failed ``gcloud`` impersonation mint; ``refused`` is False for a hang or missing gcloud."""
+
+    def __init__(self, service_account: str, detail: str, *, refused: bool) -> None:
+        super().__init__(
+            f"could not mint an access token by impersonating {service_account}: {detail}"
+        )
+        self.refused = refused
+
+
 class SubprocessError(DevOpsBenchError):
     """Raised when a subprocess exits non-zero or times out."""
 
