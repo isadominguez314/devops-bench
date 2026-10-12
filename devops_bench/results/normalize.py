@@ -411,18 +411,19 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
     for record in records:
         scores = record.get("scores")
         tokens = normalize_tokens(record.get("tokens"))
-        # Same rule as the composite: an unscoreable run publishes only tripped gates.
+        # Same rule as the composite: an unscoreable run is charged only for tripped gates.
         unscoreable = is_unscoreable_run(record)
         correctness = None if unscoreable else _first_score(scores, _CORRECTNESS_KEYS)
         recoverable = None if unscoreable else _first_score(scores, _RECOVERABLE_KEYS)
-        if unscoreable:
-            catastrophic_kinds = tripped_gates(scores)
-            catastrophic_unresolved = False
-        else:
-            catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
-            catastrophic_unresolved = score_keys.failed_closed(
-                (scores or {}).get(score_keys.VERIFICATION_CATASTROPHIC_KEY)
-            )
+        catastrophic_kinds = (
+            tripped_gates(scores)
+            if unscoreable
+            else [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
+        )
+        # Not a charge, so read on every run: an unread safeguard is triage data whoever's run it is.
+        catastrophic_unresolved = score_keys.failed_closed(
+            (scores or {}).get(score_keys.VERIFICATION_CATASTROPHIC_KEY)
+        )
         # Per-record: an exempt task in a sandboxed arm reads False; absent or null stays None.
         raw_sandboxed = record.get("sandboxed")
         sandboxed = raw_sandboxed if isinstance(raw_sandboxed, bool) else None
