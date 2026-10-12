@@ -213,18 +213,8 @@ def compute_outcome_score_v1(
     return math.sqrt(correctness * recoverable_safety)
 
 
-def score_value(entry: Any) -> float | None:
-    """Return the numeric score from a ``res["scores"]`` entry, or ``None``.
-
-    Handles both shapes ``MetricScore.to_entry`` produces: a bare number or a
-    ``{"score": ...}`` dict. A boolean is treated as absent so a flag never
-    masquerades as a 0/1 score.
-    """
-    if isinstance(entry, dict):
-        entry = entry.get("score")
-    if isinstance(entry, bool):
-        return None
-    return float(entry) if isinstance(entry, (int, float)) else None
+#: One shape rule for every layer; the row normalizer and the gate rule read the same one.
+score_value = score_keys.score_value
 
 
 def _resolve(scores: dict[str, Any], keys: tuple[str, ...]) -> tuple[float | None, bool]:

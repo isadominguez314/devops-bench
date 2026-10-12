@@ -251,14 +251,7 @@ def extract_score(scores: Mapping[str, Any] | None, key: str) -> float | None:
     Returns:
         The score as a float, or ``None`` when absent or non-numeric.
     """
-    value: Any = (scores or {}).get(key)
-    if isinstance(value, Mapping):
-        value = value.get("score")
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
+    return score_keys.score_value((scores or {}).get(key))
 
 
 def _first_score(scores: Mapping[str, Any] | None, keys: tuple[str, ...]) -> float | None:
