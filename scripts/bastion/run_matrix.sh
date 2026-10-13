@@ -53,8 +53,7 @@ agent_config_env() {
     gcli) out+=("BENCH_AGENT_TYPE=gemini" "AGENT_TARGET=gemini") ;;
     agy)  out+=("BENCH_AGENT_TYPE=antigravity") ;;
     # claude needs its own provider; the matrix-wide AGENT_PROVIDER is a gemini one.
-    cc)   out+=("BENCH_AGENT_TYPE=claude" "AGENT_TARGET=\$HOME/.local/bin/claude"
-                "AGENT_PROVIDER=anthropic${BENCH_VERTEX:+-vertex}") ;;
+    cc)   out+=("BENCH_AGENT_TYPE=claude" "AGENT_PROVIDER=anthropic${BENCH_VERTEX:+-vertex}") ;;
     *) echo "ERROR: unknown agent type '${type}' in preset '${preset}'" >&2; return 1 ;;
   esac
   for feat in $(echo "${preset}" | tr '+' ' '); do
