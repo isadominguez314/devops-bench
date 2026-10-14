@@ -306,6 +306,11 @@ This scans the tree for per-task `rows.json` files, de-duplicates retried tasks
 writes a combined `rows.json` plus per-setup `manifests.json`. Pass
 `--run-id <id>` to reuse the matrix's own id instead of a generated one.
 
+Once several invocations of the same matrix have been aggregated, pass@k / pass^k
+over them come from `python -m devops_bench.metrics.passk <parent-of-the-roots>`,
+which reads each root's aggregated `rows.json` (see
+[pass@k / pass^k](../components/metrics.md#passk--passk)).
+
 ---
 
 ## When something fails

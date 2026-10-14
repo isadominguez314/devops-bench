@@ -39,6 +39,7 @@ __all__ = [
     "build_manifests",
     "dedupe_latest",
     "discover_row_files",
+    "load_rows",
     "rebatch_rows",
 ]
 
@@ -71,7 +72,7 @@ def discover_row_files(root: str | os.PathLike[str], *, exclude: Iterable[Path] 
     return out
 
 
-def _load_rows(files: Iterable[Path]) -> list[dict]:
+def load_rows(files: Iterable[Path]) -> list[dict]:
     """Read and concatenate the ``ResultRow[]`` arrays from ``files``.
 
     Args:
@@ -107,7 +108,7 @@ def _load_provenance(files: Iterable[Path]) -> dict[str, tuple[str | None, str |
             image, digest = parsed.get("sandboxImage"), parsed.get("sandboxImageDigest")
         else:
             # No manifest: this file's setups cannot borrow another file's image.
-            setups = {str(row.get("setupId", "")) for row in _load_rows([file])}
+            setups = {str(row.get("setupId", "")) for row in load_rows([file])}
             image = digest = None
         for setup in setups:
             images, digests = seen.setdefault(setup, (set(), set()))
@@ -225,7 +226,7 @@ def aggregate(files: Iterable[Path], *, run_id: str, t: str) -> tuple[list[dict]
         write as ``rows.json`` / ``manifests.json``.
     """
     files = list(files)
-    deduped = dedupe_latest(_load_rows(files))
+    deduped = dedupe_latest(load_rows(files))
     rows = rebatch_rows(deduped, run_id=run_id, t=t)
     manifests = build_manifests(rows, run_id=run_id, t=t, provenance=_load_provenance(files))
     return [row.to_dict() for row in rows], [m.to_dict() for m in manifests]

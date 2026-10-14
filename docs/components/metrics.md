@@ -101,6 +101,29 @@ A few notes that matter when you read these:
 > [!NOTE]
 > The fixed order in which the built-in keys appear in `results.json` is pinned in [`pipeline.py`](../../devops_bench/metrics/pipeline.py); any third-party plugin metrics follow in registry insertion order.
 
+### pass@k / pass^k
+
+Reliability metrics over **repeated runs** of the same setup × task, computed after
+the fact by [`metrics/passk.py`](../../devops_bench/metrics/passk.py) rather than per
+run. From `n` scored attempts of which `c` passed:
+
+| Metric | Formula | Reads as |
+| --- | --- | --- |
+| `passAt1` | `c / n` | plain pass rate |
+| `passAtK` | `1 − C(n−c, k) / C(n, k)` | at least one of `k` attempts passes |
+| `passPowK` | `C(c, k) / C(n, k)` | all `k` attempts pass |
+
+A pass is `OutcomeScore >= 1.0` (`PASSK_THRESHOLD`); `k` defaults to 5 (`DEFAULT_K`).
+Each metric is `null` below its own `k` attempts, and the per-setup value is the mean
+over tasks — `null` for pass@k / pass^k unless every task has `k` attempts, so the
+three never average different task sets.
+
+An **attempt** is one `(runId, iteration)`. A **repeated run** is a separate matrix
+invocation, i.e. a separate batch `runId` produced by
+[aggregating](../how-to/run-evals.md#aggregating-matrix-results) that invocation. A
+second row for the same task *within* one invocation is a retry, which aggregation
+collapses (latest wins), so it is not a second attempt.
+
 ## How `OutcomeScore` is assembled
 
 The formula is **v1**, defined in [`scoring.py`](../../devops_bench/metrics/scoring.py) and stamped onto every score it produces so results stay attributable to a formula version:
