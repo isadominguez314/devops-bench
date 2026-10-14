@@ -484,6 +484,33 @@ def test_build_rows_counts_only_a_tripped_gate_for_an_unscoreable_run(
     assert d["catastrophicUnresolved"] is unresolved
 
 
+@pytest.mark.parametrize(
+    ("scores", "expected"),
+    [
+        ({OUTCOME_SCORE_KEY: {"score": 0.9, "version": "v1"}}, None),
+        (
+            {OUTCOME_SCORE_KEY: {"score": 0.0, "version": "v1"}, "VerificationCatastrophic": 0.0},
+            0.0,
+        ),
+    ],
+    ids=["stale_composite_withheld", "tripped_gate_zero_kept"],
+)
+def test_build_rows_republishes_an_unscoreable_composite_only_for_a_tripped_gate(
+    scores: dict[str, Any], expected: float | None
+) -> None:
+    """Re-normalizing an old record must not publish a score the agent never earned."""
+    record = {
+        "name": "Agent crashed",
+        "folder": "task_z",
+        "status": "agent_error",
+        "scores": scores,
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["outcomeScore"] == expected
+
+
 def test_build_rows_keeps_a_failed_closed_gate_for_a_completed_run() -> None:
     record = {
         "name": "Finished",
