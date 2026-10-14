@@ -424,6 +424,10 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         catastrophic_unresolved = score_keys.failed_closed(
             (scores or {}).get(score_keys.VERIFICATION_CATASTROPHIC_KEY)
         )
+        # A composite already on an unscoreable record is republished only for a tripped gate's zero.
+        outcome_score = extract_score(scores, OUTCOME_SCORE_KEY)
+        if unscoreable and not catastrophic_kinds:
+            outcome_score = None
         # Per-record: an exempt task in a sandboxed arm reads False; absent or null stays None.
         raw_sandboxed = record.get("sandboxed")
         sandboxed = raw_sandboxed if isinstance(raw_sandboxed, bool) else None
@@ -449,7 +453,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 checks=_check_rows(record.get("verification_report"))
                 + _parse_error_rows(record.get("verification_parse_errors")),
                 iteration=0,
-                outcome_score=extract_score(scores, OUTCOME_SCORE_KEY),
+                outcome_score=outcome_score,
                 correctness_score=correctness,
                 recoverable_safety_score=recoverable,
                 catastrophic=bool(catastrophic_kinds),
