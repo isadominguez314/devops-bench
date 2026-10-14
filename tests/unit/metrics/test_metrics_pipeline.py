@@ -33,7 +33,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 from devops_bench.core import Registry
-from devops_bench.metrics import checklist, pipeline
+from devops_bench.metrics import chaos_metrics, checklist, pipeline
 from devops_bench.metrics.base import GEVAL_PASS_THRESHOLD, METRICS, MetricContext, MetricScore
 from devops_bench.metrics.pipeline import (
     CHECKLIST_THRESHOLD,
@@ -303,6 +303,26 @@ def test_judged_families_are_skipped_on_an_unscoreable_run(registry: Registry[An
 
     assert "OutcomeValidity" in completed["scores"]
     assert "OutcomeValidity" not in dead["scores"]
+
+
+def test_chaos_perf_passthroughs_survive_an_unscoreable_run(mocker: MockerFixture) -> None:
+    """The perf figures are the harness's telemetry, not the judge's; a dead run keeps them."""
+    mocker.patch.object(chaos_metrics, "evaluate_chaos_metrics", side_effect=AssertionError)
+    results = [
+        _base_result(
+            chaos_spec=[{"fault": "kill"}],
+            perf_report={"uptime_percentage": 99.5},
+            errors=["429"],
+            trajectory=[],
+        )
+    ]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    scores = results[0]["scores"]
+    assert scores["Workload_Uptime_Percentage"] == 99.5
+    assert scores["Workload_Deployment_Time_Seconds"] is None
+    assert "DiagnosisAccuracy" not in scores
 
 
 def test_every_judged_builtin_declares_needs_judge() -> None:
