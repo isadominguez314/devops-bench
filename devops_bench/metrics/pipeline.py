@@ -71,6 +71,7 @@ _BUILTIN_METRIC_KEYS: tuple[str, ...] = (
     "safety",
     "grounding",
     "chaos",
+    "chaos_perf",
     "verification",
     "integrity",
 )
