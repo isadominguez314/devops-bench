@@ -252,8 +252,8 @@ def _write(path: Path, rows: list[dict]) -> None:
     path.write_text(json.dumps(rows), encoding="utf-8")
 
 
-def test_cli_skips_aggregate_output_next_to_its_inputs(tmp_path: Path) -> None:
-    # Each run root holds per-task rows plus aggregate's combined rows.json/manifests.json.
+def test_cli_reads_aggregated_batches_not_their_per_task_inputs(tmp_path: Path) -> None:
+    # Each matrix root holds per-task rows plus aggregate's combined rows.json/manifests.json.
     for i, row in enumerate(_five_runs("task-a", [1.0, 1.0, 0.0])):
         run_root = tmp_path / f"run{i}"
         _write(run_root / "task-a" / "rows.json", [row])
@@ -265,23 +265,23 @@ def test_cli_skips_aggregate_output_next_to_its_inputs(tmp_path: Path) -> None:
     assert (setup["tasks"][0]["n"], setup["tasks"][0]["c"]) == (3, 2)
 
 
-def test_cli_keeps_standalone_aggregate_output(tmp_path: Path) -> None:
+def test_cli_retry_within_one_batch_is_not_a_second_attempt(tmp_path: Path) -> None:
+    # One invocation, task retried: aggregate collapsed it, so the per-task copies don't count.
+    rows = _five_runs("task-a", [0.0, 1.0])
+    _write(tmp_path / "run" / "try1" / "rows.json", [rows[0]])
+    _write(tmp_path / "run" / "try2" / "rows.json", [rows[1]])
+    _write(tmp_path / "run" / "rows.json", [dict(rows[1], runId="batch")])
+    _write(tmp_path / "run" / "manifests.json", [])
+
+    assert main([str(tmp_path)]) == 0
+    (setup,) = json.loads((tmp_path / "passk_summary.json").read_text())["setups"]
+    assert (setup["tasks"][0]["n"], setup["tasks"][0]["c"]) == (1, 1)
+
+
+def test_cli_falls_back_to_per_task_rows_when_nothing_is_aggregated(tmp_path: Path) -> None:
     for i, row in enumerate(_five_runs("task-a", [1.0, 0.0])):
-        _write(tmp_path / f"run{i}" / "rows.json", [row])
-        _write(tmp_path / f"run{i}" / "manifests.json", [])
+        _write(tmp_path / f"run{i}" / "task-a" / "rows.json", [row])
 
     assert main([str(tmp_path)]) == 0
     (setup,) = json.loads((tmp_path / "passk_summary.json").read_text())["setups"]
     assert setup["tasks"][0]["n"] == 2
-
-
-def test_cli_skips_aggregate_output_in_a_separate_dir(tmp_path: Path) -> None:
-    rows = _five_runs("task-a", [1.0, 1.0, 0.0])
-    for i, row in enumerate(rows):
-        _write(tmp_path / f"run{i}" / "rows.json", [row])
-    _write(tmp_path / "batch" / "rows.json", [dict(r, runId="batch") for r in rows])
-    _write(tmp_path / "batch" / "manifests.json", [])
-
-    assert main([str(tmp_path)]) == 0
-    (setup,) = json.loads((tmp_path / "passk_summary.json").read_text())["setups"]
-    assert (setup["tasks"][0]["n"], setup["tasks"][0]["c"]) == (3, 2)

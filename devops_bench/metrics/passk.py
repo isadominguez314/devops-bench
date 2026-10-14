@@ -20,6 +20,11 @@ From ``n`` scored attempts with ``c`` passes (unbiased estimators):
     pass^k =     C(c, k)     / C(n, k)   (all k pass)
 
 Both are ``None`` when ``n < k``. A pass is ``outcomeScore >= PASSK_THRESHOLD``.
+
+An attempt is one ``(runId, iteration)``; a repeated run is a separate matrix
+invocation, i.e. a separate batch ``runId``. Within one invocation a second row for
+the same task is a retry, which ``results.aggregate`` collapses, so the CLI reads
+aggregated ``rows.json`` files and falls back to per-task files only when none exist.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ import json
 import math
 from collections.abc import Iterable
 from pathlib import Path
+
+from devops_bench.results.aggregate import discover_row_files, load_rows
 
 __all__ = [
     "DEFAULT_K",
@@ -202,20 +209,18 @@ def summarize_rows(
 _OUT_FILENAME = "passk_summary.json"
 
 
-def _drop_combined(files: list[Path]) -> list[Path]:
-    """Drop aggregate outputs (``manifests.json`` sibling) if any per-task rows are present."""
-    per_task = [f for f in files if not (f.parent / "manifests.json").exists()]
-    return per_task or files
+def _prefer_aggregated(files: list[Path]) -> list[Path]:
+    """Keep only aggregate outputs (``manifests.json`` sibling) when any exist."""
+    aggregated = [f for f in files if (f.parent / "manifests.json").exists()]
+    return aggregated or files
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI: write ``passk_summary.json`` for the ``rows.json`` files under a root."""
-    # Lazy: keeps the estimators importable without pydantic.
-    from devops_bench.results.aggregate import discover_row_files, load_rows
-
     parser = argparse.ArgumentParser(
         prog="python -m devops_bench.metrics.passk",
-        description="Compute pass@k / pass^k from the rows.json files under a root.",
+        description="Compute pass@k / pass^k from the rows.json files under a root "
+        "(aggregated batches when present, else per-task files).",
     )
     parser.add_argument("root", help="Results root scanned recursively for rows.json files.")
     parser.add_argument(
@@ -237,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path = (Path(args.out) if args.out else Path(args.root) / _OUT_FILENAME).resolve()
 
-    files = _drop_combined(discover_row_files(args.root, exclude=(out_path,)))
+    files = _prefer_aggregated(discover_row_files(args.root, exclude=(out_path,)))
     if not files:
         parser.error(f"no rows.json files found under {args.root}")
 
