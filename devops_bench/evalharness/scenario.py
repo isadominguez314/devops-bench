@@ -402,6 +402,8 @@ class ScenarioManager:
         }
         if dumped.get("error") is not None:
             report["error"] = dumped["error"]
+        if dumped.get("driver"):
+            report["driver"] = dumped["driver"]
         return report
 
     @staticmethod
