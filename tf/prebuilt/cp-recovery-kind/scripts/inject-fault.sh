@@ -98,6 +98,8 @@ docker exec "${TARGET_NODE}" sh -c \
 # on a loaded host crictl rm -f can report DeadlineExceeded while the
 # container still dies moments later (observed live), and the health poll
 # below is the authoritative assert either way.
+# Exited etcd containers present before the kill, so a crash can be told apart from history.
+EXITED_BEFORE="$(docker exec "${TARGET_NODE}" crictl ps -a --name etcd --state exited -q || true)"
 set +e
 docker exec "${TARGET_NODE}" sh -c \
   'ids="$(crictl ps -a -q --name etcd)"; [ -n "$ids" ] || exit 42; crictl rm -f $ids'
@@ -110,25 +112,35 @@ elif [ "${kill_rc}" -ne 0 ]; then
   echo "    crictl kill exited ${kill_rc}; the health assert below decides"
 fi
 
-echo "==> Verifying the fault took hold (expect a stable 2 healthy members)..."
-# One 2-healthy reading only proves the kill: during the kubelet restart gap the
-# count reads 2 even when the corruption failed and the member is about to rejoin.
+echo "==> Verifying the fault took hold (a new etcd container crashed; 2 members healthy)..."
+# A 2-healthy count alone is a timing inference: it also reads 2 during the kubelet restart
+# gap when the corruption failed. The gate is a recreated etcd container that exited.
 healthy=0
 stable=0
+crashed=0
 for _ in $(seq 1 36); do
+  if [ "${crashed}" -eq 0 ]; then
+    for id in $(docker exec "${TARGET_NODE}" crictl ps -a --name etcd --state exited -q 2>/dev/null); do
+      printf '%s\n' "${EXITED_BEFORE}" | grep -qxF "${id}" || { crashed=1; break; }
+    done
+  fi
   healthy="$(kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
     etcdctl "${ETCD_CERTS[@]}" endpoint health --cluster 2>&1 \
     | grep -c 'is healthy' || true)"
   if [ "${healthy}" -eq 2 ]; then
     stable=$((stable + 1))
-    [ "${stable}" -ge 3 ] && break
   else
     stable=0
   fi
+  [ "${crashed}" -eq 1 ] && [ "${stable}" -ge 3 ] && break
   sleep 5
 done
+if [ "${crashed}" -eq 0 ]; then
+  echo "ERROR: fault injection did not take hold: no recreated etcd container exited on ${TARGET_NODE}" >&2
+  exit 1
+fi
 if [ "${stable}" -lt 3 ]; then
-  echo "ERROR: fault injection did not take hold: ${healthy} healthy members (expected a stable 2)" >&2
+  echo "ERROR: quorum not stable after the fault: ${healthy} healthy members (expected a stable 2)" >&2
   exit 1
 fi
 
