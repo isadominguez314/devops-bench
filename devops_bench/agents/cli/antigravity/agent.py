@@ -22,7 +22,7 @@ import pathlib
 import re
 import shutil
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from devops_bench import core
 from devops_bench.agents import base
@@ -94,7 +94,7 @@ _VERTEX_PREVIEW_SUFFIX: str = "-preview"
 # the CLI errors if --effort is passed alongside one. Recognize it so it survives
 # untouched: it is the spelling ``agy --help`` steers operators towards.
 _DISPLAY_TIER_RE: re.Pattern[str] = re.compile(
-    rf"\((?:{'|'.join(map(re.escape, _AGY_EFFORT_TIERS))})\)\s*$", re.IGNORECASE
+    rf"\(({'|'.join(map(re.escape, _AGY_EFFORT_TIERS))})\)\s*$", re.IGNORECASE
 )
 
 # The tier is a scoring variable, not a formatting detail -- `low` and `high`
@@ -131,7 +131,15 @@ def _default_effort() -> str:
     return effort.lower()
 
 
-def _resolve_model_name(model: str) -> tuple[str, str | None]:
+class _ModelSelection(NamedTuple):
+    """A configured model id resolved for ``agy``."""
+
+    model: str
+    effort: str | None  # --effort value; None when ``model`` names its own tier
+    tier: str  # the tier in force, whichever spelling named it
+
+
+def _resolve_model_name(model: str) -> _ModelSelection:
     """Resolve a matrix model id to the ``(model, effort)`` pair ``agy`` expects.
 
     ``AGENT_MODEL`` is one value shared by every arm and by the judge, and it is
@@ -141,20 +149,21 @@ def _resolve_model_name(model: str) -> tuple[str, str | None]:
     confines the quirk to the one harness that has it; respelling ``AGENT_MODEL``
     instead would desynchronize this arm's label from every other arm in the matrix.
 
-    e.g. ``"google/gemini-3.1-pro-preview"`` -> ``("gemini-3.1-pro", "high")``,
-    and ``"gemini-3.1-pro-preview-low"`` -> ``("gemini-3.1-pro", "low")``.
+    e.g. ``"google/gemini-3.1-pro-preview"`` -> ``("gemini-3.1-pro", "high", "high")``,
+    and ``"Gemini 3.1 Pro (Low)"`` -> ``("Gemini 3.1 Pro (Low)", None, "low")``.
 
     Args:
         model: The configured model id, optionally provider-qualified.
 
     Returns:
-        The id to pass as ``--model``, and the tier to pass as ``--effort`` --
-        or ``None`` for the tier when the id already names its own, in which
-        case ``--effort`` must be omitted or the CLI rejects the pair.
+        The id to pass as ``--model``, the tier to pass as ``--effort`` -- or
+        ``None`` when the id already names its own, in which case ``--effort``
+        must be omitted or the CLI rejects the pair -- and the tier in force.
     """
     name = model.split("/")[-1].strip()
-    if _DISPLAY_TIER_RE.search(name):
-        return name, None
+    display = _DISPLAY_TIER_RE.search(name)
+    if display:
+        return _ModelSelection(name, None, display.group(1).lower())
     # The tier comes off first: a tier suffix would otherwise hide -preview
     # from the check below, and Antigravity rejects any id that still carries it.
     effort: str | None = None
@@ -164,7 +173,17 @@ def _resolve_model_name(model: str) -> tuple[str, str | None]:
             break
     if name.endswith(_VERTEX_PREVIEW_SUFFIX):
         name = name[: -len(_VERTEX_PREVIEW_SUFFIX)]
-    return name, effort or _default_effort()
+    effort = effort or _default_effort()
+    return _ModelSelection(name, effort, effort)
+
+
+def _effective_effort(model: str) -> str | None:
+    """The tier a run of ``model`` uses, whichever of the three spellings names it."""
+    try:
+        return _resolve_model_name(model).tier
+    except core.ConfigError:
+        # A bad AGENT_MODEL_EFFORT already failed the run itself; the arm just goes unlabelled.
+        return None
 
 
 def _build_settings(
@@ -267,6 +286,11 @@ class AgyCliAgent(base.AgentHarness):
         self.skills = caps.skills
         self.rules = caps.rules
 
+    @classmethod
+    def reasoning_effort(cls, config: agents_config.AgentConfig) -> str | None:
+        """The tier the run uses, whether it came from the id, ``--effort``, or the env default."""
+        return _effective_effort(config.model) if config.model else None
+
     def _resolve_binary(self) -> str:
         """Resolve the absolute path to the ``agy`` binary."""
         if self.config.target:
@@ -289,7 +313,8 @@ class AgyCliAgent(base.AgentHarness):
         model_name: str | None = None
         effort: str | None = None
         if self.config.model:
-            model_name, effort = _resolve_model_name(self.config.model)
+            selection = _resolve_model_name(self.config.model)
+            model_name, effort = selection.model, selection.effort
             if model_name != self.config.model:
                 _log.warning(
                     "agy does not accept the configured model id %r; running --model %s%s",

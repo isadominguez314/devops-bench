@@ -798,14 +798,13 @@ class DefaultEvalHarness(Harness):
             # a batch of only exempt tasks never needs the seam.
             _ensure_builtin_agents_registered()
             agent_cls = AGENTS.get(_canonical_agent_type(self.agent_type))
-            if agent_cls is not None and not getattr(agent_cls, "supports_sandbox", False):
+            if not getattr(agent_cls, "supports_sandbox", False):
                 raise SandboxError(
                     f"agent harness {agent_cls.__name__} has not been migrated onto "
                     "the sandbox seam; refusing the whole batch rather than "
                     "provisioning a cluster per task just to fail each one"
                 )
-            if agent_cls is not None:
-                agent_cls.sandbox_preflight(self._agent_config)
+            agent_cls.sandbox_preflight(self._agent_config)
         if sandboxed:
             # Reap containers a killed harness never got to reap, before this
             # batch's own exist; the sweep itself applies the BENCH_PARALLEL gate.
@@ -910,17 +909,28 @@ class DefaultEvalHarness(Harness):
         # Canonical key, so an alias aggregates with it instead of as a second setup.
         harness = _canonical_agent_type(self.agent_type)
         model = self._agent_config.model or self._agent_config.provider or harness
+        # The tier is part of the arm: without it, runs of one model at two tiers
+        # share a setup id and the aggregate's keep-newest dedupe merges them.
+        _ensure_builtin_agents_registered()
+        # ``get`` raises on a miss; an unregistered harness still gets its rows written.
+        agent_cls = AGENTS.get(harness) if harness in AGENTS else None
+        reasoning_effort = (
+            agent_cls.reasoning_effort(self._agent_config) if agent_cls is not None else None
+        )
         manifest = Manifest(
             schema_version=SCHEMA_VERSION,
             run_id=run_dir.name,
             t=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            setup_id=results_setup_id(model, harness, augmentation),
+            setup_id=results_setup_id(
+                model, harness, augmentation, reasoning_effort=reasoning_effort
+            ),
             model=model,
             harness=harness,
             augmentation=augmentation,
             # Pinned at batch start; a mutable tag alone is not provenance.
             sandbox_image=sandbox.image if sandbox is not None else None,
             sandbox_image_digest=sandbox.image_digest if sandbox is not None else None,
+            reasoning_effort=reasoning_effort,
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])

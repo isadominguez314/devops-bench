@@ -129,7 +129,10 @@ as for a bare `gemini-3.8-flash`.
 The tier is a scoring variable, not a formatting detail: `low` and `high` are
 materially different agents. `high` is the default because the other harnesses
 run their model with no reasoning throttle. Override it with
-`AGENT_MODEL_EFFORT`.
+`AGENT_MODEL_EFFORT`. The tier a run used is recorded on its manifest and every
+row as `reasoningEffort`, and folded into `setupId` (`…-antigravity-effort-low`),
+so runs at different tiers are separate arms and a re-run at one tier cannot
+replace rows scored at another.
 
 Tiers vary by model, and the harness only checks `AGENT_MODEL_EFFORT` against
 the union of tiers across models. The Flash models take `low`, `medium`, and
