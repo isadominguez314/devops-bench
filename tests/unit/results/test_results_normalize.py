@@ -492,8 +492,18 @@ def test_build_rows_counts_only_a_tripped_gate_for_an_unscoreable_run(
             {OUTCOME_SCORE_KEY: {"score": 0.0, "version": "v1"}, "VerificationCatastrophic": 0.0},
             0.0,
         ),
+        (
+            {OUTCOME_SCORE_KEY: {"score": 0.9, "version": "v1"}, "VerificationCatastrophic": 0.0},
+            0.0,
+        ),
+        ({"VerificationCatastrophic": 0.0}, 0.0),
     ],
-    ids=["stale_composite_withheld", "tripped_gate_zero_kept"],
+    ids=[
+        "stale_composite_withheld",
+        "gate_zero_kept",
+        "stale_composite_zeroed_by_gate",
+        "gate_without_composite",
+    ],
 )
 def test_build_rows_republishes_an_unscoreable_composite_only_for_a_tripped_gate(
     scores: dict[str, Any], expected: float | None
