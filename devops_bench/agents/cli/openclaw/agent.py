@@ -266,42 +266,57 @@ def _oc_model_id(config: AgentConfig) -> str:
     model = (config.model or "").strip()
     if not model:
         return ""
-    if "/" in model:  # already a full oc id; normalize the provider segment
-        wire, _, bare = model.partition("/")
-        try:
-            wire = resolve_provider(wire, default=wire).oc_provider
-        except ConfigError:
-            return model  # unknown wire: leave as-is, let oc validate
-        return f"{wire}/{bare}"
-    return f"{resolve_provider(config.provider).oc_provider}/{model}"
+    wire, bare = _split_wire(model)
+    if wire is None and "/" in model:
+        return model  # unknown wire: leave as-is, let oc validate
+    return f"{wire or resolve_provider(config.provider).oc_provider}/{bare}"
+
+
+def _split_wire(model: str | None) -> tuple[str | None, str]:
+    """Split ``provider/model`` into ``(oc provider id, bare model)``; else ``(None, model)``."""
+    model = (model or "").strip()
+    if "/" not in model:
+        return None, model
+    wire, _, bare = model.partition("/")
+    try:
+        return resolve_provider(wire, default=wire).oc_provider, bare
+    except ConfigError:
+        return None, model  # unknown wire: oc validates it
 
 
 def _effective_provider(config: AgentConfig) -> str | None:
     """The provider the run's auth follows: a full ``provider/model`` id wins over ``config.provider``.
 
     oc routes the call by the id's provider segment, so the key vars, the location,
-    the emulator and the auth profile must follow the same one. Both set and
-    disagreeing is a misconfiguration and raises rather than splitting the run.
+    the emulator and the auth profile follow it too; see :func:`_warn_provider_override`.
 
     Raises:
-        ConfigError: ``config.provider`` names a different provider than the model id.
+        ConfigError: ``config.provider`` is set and not a known provider.
     """
-    model = (config.model or "").strip()
-    if "/" not in model:
+    wire, _ = _split_wire(config.model)
+    if wire is None:
         return config.provider
-    wire = model.partition("/")[0]
-    try:
-        wire_provider = resolve_provider(wire, default=wire).oc_provider
-    except ConfigError:
-        return (
-            config.provider
-        )  # unknown wire: oc validates it; auth follows the configured provider
-    if config.provider and resolve_provider(config.provider).oc_provider != wire_provider:
-        raise ConfigError(
-            f"model {model!r} names provider {wire_provider!r} but the configured provider is "
-            f"{config.provider!r}; set one of them or make them agree"
-        )
+    if config.provider:
+        resolve_provider(config.provider)  # an unknown alias still fails loud
     return wire
+
+
+def _warn_provider_override(config: AgentConfig) -> None:
+    """Log once when a full model id overrides a disagreeing ``config.provider``."""
+    wire, _ = _split_wire(config.model)
+    if wire is None or not config.provider:
+        return
+    try:
+        configured = resolve_provider(config.provider).oc_provider
+    except ConfigError:
+        return  # _build_env raises on it
+    if configured != wire:
+        _log.warning(
+            "model %r names provider %r; ignoring the configured provider %r",
+            config.model,
+            wire,
+            config.provider,
+        )
 
 
 def _build_model_override(config: AgentConfig) -> dict:
@@ -377,7 +392,7 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     sandboxed or not. The caller adds the ``OPENCLAW_*`` paths.
 
     Raises:
-        ConfigError: An unknown provider, or one that disagrees with the model id.
+        ConfigError: If the configured provider is not a known provider.
     """
     # Resolve unconditionally so an unknown provider fails loud even keyless.
     spec = resolve_provider(_effective_provider(config))
@@ -514,6 +529,7 @@ class OpenClawAgent(AgentHarness):
     def __init__(self, config: AgentConfig | None = None, *, agent_name: str = "main") -> None:
         AgentHarness.__init__(self, config)
         self.agent_name = agent_name
+        _warn_provider_override(self.config)
         caps = self.config.capabilities
         self.rules = caps.rules
         self.mcp_servers = caps.mcp_servers
