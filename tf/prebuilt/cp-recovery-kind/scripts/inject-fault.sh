@@ -98,8 +98,8 @@ docker exec "${TARGET_NODE}" sh -c \
 # on a loaded host crictl rm -f can report DeadlineExceeded while the
 # container still dies moments later (observed live), and the health poll
 # below is the authoritative assert either way.
-# Exited etcd containers present before the kill, so a crash can be told apart from history.
-EXITED_BEFORE="$(docker exec "${TARGET_NODE}" crictl ps -a --name etcd --state exited -q || true)"
+# Every etcd container id before the kill (any state): only an id absent here counts as a crash.
+ETCD_BEFORE="$(docker exec "${TARGET_NODE}" crictl ps -a --name etcd -q || true)"
 set +e
 docker exec "${TARGET_NODE}" sh -c \
   'ids="$(crictl ps -a -q --name etcd)"; [ -n "$ids" ] || exit 42; crictl rm -f $ids'
@@ -121,7 +121,7 @@ crashed=0
 for _ in $(seq 1 36); do
   if [ "${crashed}" -eq 0 ]; then
     for id in $(docker exec "${TARGET_NODE}" crictl ps -a --name etcd --state exited -q 2>/dev/null); do
-      printf '%s\n' "${EXITED_BEFORE}" | grep -qxF "${id}" || { crashed=1; break; }
+      printf '%s\n' "${ETCD_BEFORE}" | grep -qxF "${id}" || { crashed=1; break; }
     done
   fi
   healthy="$(kubectl -n kube-system exec "etcd-${SNAP_NODE}" -- \
