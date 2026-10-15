@@ -235,14 +235,28 @@ def test_effective_provider_follows_a_full_model_id(monkeypatch: pytest.MonkeyPa
 
 def test_effective_provider_accepts_an_agreeing_alias() -> None:
     cfg = AgentConfig(model="gemini/gemini-2.5-pro", provider="google")
-    assert oc_mod._effective_provider(cfg) == "gemini"
+    assert oc_mod._effective_provider(cfg) == "google"
     assert "GEMINI_API_KEY" not in _build_env(cfg)
 
 
-def test_effective_provider_rejects_a_disagreeing_provider() -> None:
-    """Splitting the run between two providers fails loud instead of half-configuring it."""
-    with pytest.raises(ConfigError, match="google-vertex.*google"):
-        _build_env(AgentConfig(model="google-vertex/gemini-3.8-flash", provider="google"))
+def test_effective_provider_overrides_a_disagreeing_provider_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """oc routes by the id's provider, so the configured one cannot win; say so once."""
+    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
+    warnings: list[str] = []
+    monkeypatch.setattr(oc_mod._log, "warning", lambda msg, *args: warnings.append(msg % args))
+    cfg = AgentConfig(model="google-vertex/gemini-3.8-flash", provider="google")
+    assert oc_mod._effective_provider(cfg) == "google-vertex"
+    assert "GOOGLE_CLOUD_LOCATION" in _build_env(cfg)
+    assert warnings == []
+    OpenClawAgent(cfg)
+    assert warnings == [
+        "model 'google-vertex/gemini-3.8-flash' names provider 'google-vertex'; "
+        "ignoring the configured provider 'google'"
+    ]
+    with pytest.raises(ConfigError, match="unknown agent provider"):
+        _build_env(AgentConfig(model="google-vertex/gemini-3.8-flash", provider="bogus"))
 
 
 def test_effective_provider_leaves_an_unknown_wire_to_the_configured_provider() -> None:
@@ -1366,6 +1380,22 @@ def test_sandbox_google_vertex_overlay_gets_the_same_credential_recipe(
     assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
     assert "ANTHROPIC_VERTEX_USE_GCP_METADATA" not in overlay
     assert calls == [{"backend": "vertex", "project": "p-from-repo-var"}]
+
+
+@pytest.mark.parametrize(
+    "model,anthropic_marker",
+    [("google-vertex/gemini-3.8-flash", False), ("anthropic-vertex/claude-opus-4-7", True)],
+)
+def test_sandbox_overlay_follows_a_full_model_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str, anthropic_marker: bool
+) -> None:
+    """With no provider configured, the emulator and the Vertex markers follow the id."""
+    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
+    calls = _install_fake_emulator(monkeypatch)
+    overlay = oc_mod._sandbox_provider_env(_sandboxed(tmp_path, model=model), tmp_path)
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
+    assert ("ANTHROPIC_VERTEX_USE_GCP_METADATA" in overlay) is anthropic_marker
+    assert [c["backend"] for c in calls] == ["vertex"]
 
 
 @pytest.mark.parametrize(
