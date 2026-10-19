@@ -916,8 +916,8 @@ class DefaultEvalHarness(Harness):
         reasoning_effort = (
             agent_cls.reasoning_effort(self._agent_config) if agent_cls is not None else None
         )
-        # A tier spelled inside the id is lifted out of the model, so one agent has
-        # one setup id however the operator spelled the tier.
+        # A tier spelled inside the matrix id is lifted out of the model, so one agent
+        # has one setup id whether the tier came from the id suffix or the env.
         arm_model = agent_cls.arm_model(self._agent_config) if agent_cls is not None else None
         model = arm_model or self._agent_config.model or self._agent_config.provider or harness
         manifest = Manifest(

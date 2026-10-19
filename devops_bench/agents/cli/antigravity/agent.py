@@ -162,7 +162,7 @@ def _resolve_model_name(model: str) -> _ModelSelection:
         ``None`` when the id already names its own, in which case ``--effort``
         must be omitted or the CLI rejects the pair -- the tier in force, and the
         configured id with that tier lifted out, which is what the arm records as
-        its model so one agent has one setup id however the tier was spelled.
+        its model so one agent has one setup id however the matrix id spelled the tier.
     """
     prefix, _, name = model.strip().rpartition("/")
     name = name.strip()
