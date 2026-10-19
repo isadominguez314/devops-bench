@@ -626,7 +626,11 @@ mints a short-lived credential for that identity host-side and injects it into
 the container; the operator's own credentials never cross. On GCP this is an
 impersonated access token (`CLOUDSDK_AUTH_ACCESS_TOKEN` /
 `GOOGLE_OAUTH_ACCESS_TOKEN`, with `CLOUDSDK_CORE_PROJECT` pinned to the task's
-project), requested with the same budget as the cluster token above. A mint
+project), requested with the same budget as the cluster token above. The mint
+runs as the host's active `gcloud` account, so the stack must grant that
+account `roles/iam.serviceAccountTokenCreator` on the identity (the in-tree
+stacks default it to the provisioning identity and take `token_creator_member`
+when that differs). A mint
 failure, a hung `gcloud`, or a provider that cannot mint for a named identity
 fails the run rather than letting the agent run without the credential its
 task depends on. A task that also declares `requires_unsandboxed` runs ambient
@@ -642,7 +646,7 @@ lost), it takes the hour and warns. If it does not, the run fails before the
 agent starts, naming the policy: grant it, or shorten the timeout. The
 alternative, serving the task identity through the metadata emulator so the
 container refreshes on its own, was deliberately not built: the emulator serves
-one identity and the container's `gcloud` reads the static token. Revisit it if
+one identity and the container's tooling reads the static token. Revisit it if
 a task genuinely needs more than an hour of cloud API access; today none does.
 
 ## Adding your own harness

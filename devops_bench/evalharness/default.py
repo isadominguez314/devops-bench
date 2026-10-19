@@ -1042,7 +1042,7 @@ class DefaultEvalHarness(Harness):
             # A per-run workspace roots the artifact diff where the agent actually writes.
             workspace_path = Path(tempfile.mkdtemp(prefix="devops-bench-workspace-"))
             if self._agent_config.sandbox is not None and task.requires_unsandboxed:
-                # The task can't run behind the boundary (a credential no provider can mint);
+                # The task can't run behind the boundary (a credential its provider cannot mint);
                 # skip the sandbox for it and say so loudly.
                 _log.warning(
                     "task %s declares requires_unsandboxed; running it OUTSIDE the "

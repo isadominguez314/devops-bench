@@ -198,8 +198,9 @@ class Task(BaseModel):
             ``title`` and ``description`` on every verification entry), because
             the leaderboard renders validated tasks and nothing else.
         requires_unsandboxed: Opt this task out of the agent sandbox even when the
-            run asks for one, for a task needing a credential no provider can mint
-            into the sandbox. No in-tree task uses it.
+            run asks for one, for a task needing a credential its provider cannot
+            mint into the sandbox. No in-tree task uses it; it stays for providers
+            with no mint recipe.
     """
 
     model_config = _STRICT
