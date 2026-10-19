@@ -28,11 +28,13 @@ rather than running ambient. Host reachability is the host setup's
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
@@ -55,6 +57,7 @@ __all__ = [
     "discover_fixture_mounts",
     "filter_boundary_env",
     "container_name_for_workspace",
+    "image_digest",
     "kill_container",
     "sweep_stray_containers",
 ]
@@ -137,6 +140,8 @@ class SandboxSpec:
     the rest per task. ``fixture_mounts`` maps host path -> container path (RW);
     ``env_allowlist`` lets named vars cross despite a deny rule; ``owner`` scopes
     container names and the stray sweep to one attempt.
+    ``cloud_credential_env`` is the harness-minted, task-scoped cloud credential
+    (allowlisted by name; empty for kubectl-only tasks).
     """
 
     image: str = ""
@@ -146,6 +151,14 @@ class SandboxSpec:
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
     owner: str = ""
+    cloud_credential_env: Mapping[str, str] = field(default_factory=dict, repr=False)
+    # Pinned by the harness at batch start, before the first container runs.
+    image_digest: str | None = None
+
+    @property
+    def launch_image(self) -> str:
+        """The reference ``docker run`` gets: the pinned digest, else the tag."""
+        return self.image_digest or self.image
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
@@ -419,7 +432,14 @@ class SandboxExecutor:
         for host_path, mount_path in self._remap_mounts():
             argv += ["-v", f"{host_path}:{mount_path}"]
             targets.append(mount_path)
-        argv += [self.spec.image, "chown", "-R", f"--from={from_uid}", f"{uid}:{gid}", *targets]
+        argv += [
+            self.spec.launch_image,
+            "chown",
+            "-R",
+            f"--from={from_uid}",
+            f"{uid}:{gid}",
+            *targets,
+        ]
         return argv
 
     def _chown_before_remap(self) -> None:
@@ -455,6 +475,12 @@ class SandboxExecutor:
                 " ".join(argv),
             )
 
+    @cached_property
+    def _credential_env(self) -> dict[str, str]:
+        """The spec's minted cloud credential, allowlisted by name; filtered once per run."""
+        names = tuple(self.spec.cloud_credential_env)
+        return filter_boundary_env(self.spec.cloud_credential_env, names)
+
     def wrap_argv(
         self,
         cmd: Sequence[str | os.PathLike[str]],
@@ -468,8 +494,9 @@ class SandboxExecutor:
         ``--cap-drop=ALL`` and ``no-new-privileges``; the network plan and
         ``host.docker.internal:host-gateway``; ``--user`` on Linux so workspace
         files stay operator-owned; workspace RW, kubeconfig RO, fixtures RW;
-        overlay env as name-only ``-e`` (values ride the client env, never the
-        argv); ``HOME``/``KUBECONFIG`` last so they win; no ``-i``.
+        overlay env, then the minted cloud credential, as name-only ``-e`` (values
+        ride the client env, never the argv); ``HOME``/``KUBECONFIG`` last so they
+        win; no ``-i``.
         """
         spec = self.spec
         argv: list[str] = [CONTAINER_RUNTIME, "run", "--rm", "--name", self.container_name]
@@ -490,9 +517,12 @@ class SandboxExecutor:
             argv += ["-v", f"{host_path}:{container_path}"]
         for name in filter_boundary_env(extra_env, spec.env_allowlist):
             argv += ["-e", name]
+        for name in self._credential_env:
+            argv += ["-e", name]
         argv += ["-e", f"HOME={CONTAINER_HOME}", "-e", f"KUBECONFIG={CONTAINER_KUBECONFIG}"]
         argv += ["-w", self.map_host_path(cwd) if cwd is not None else CONTAINER_WORKSPACE]
-        argv.append(spec.image)
+        # The digest the manifest records is the image that runs, even if the tag moves mid-batch.
+        argv.append(spec.launch_image)
         argv.extend(str(part) for part in cmd)
         return argv
 
@@ -535,6 +565,12 @@ class SandboxExecutor:
             )
         # Filter once so the client env matches the names wrap_argv emits.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
+        if clash := sorted(set(crossing) & set(self._credential_env)):
+            # Neither side may silently win: the overlay routes the model, the credential the task.
+            raise SandboxError(
+                f"the agent env overlay and the minted cloud credential both set {clash}; "
+                "refusing to let one silently override the other"
+            )
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
         remap = self._needs_id_remap()
         try:
@@ -544,7 +580,7 @@ class SandboxExecutor:
             try:
                 completed = run(
                     wrapped,
-                    extra_env=crossing,
+                    extra_env={**crossing, **self._credential_env},
                     check=check,
                     capture=capture,
                     text=text,
@@ -583,6 +619,40 @@ def container_name_for_workspace(workspace: Path, owner: str = "") -> str:
     ``owner`` (:attr:`SandboxSpec.owner`) adds a segment scoping the name to one attempt.
     """
     return f"{_CONTAINER_NAME_PREFIX}{owner + '-' if owner else ''}{workspace.name}"
+
+
+def image_digest(image: str) -> str | None:
+    """Resolve ``image`` to a content digest for the run manifest; never raises.
+
+    Prefers the registry-anchored ``RepoDigests`` entry, else the local image ID;
+    any failure logs and returns ``None`` so provenance cannot sink a finished run.
+    """
+    try:
+        completed = run(
+            [CONTAINER_RUNTIME, "image", "inspect", image],
+            check=False,
+            timeout=_HOUSEKEEPING_TIMEOUT_SEC,
+        )
+    except (OSError, SubprocessError) as exc:
+        _log.warning("could not resolve a digest for sandbox image %s (%s)", image, exc)
+        return None
+    if completed.returncode != 0:
+        _log.warning(
+            "could not resolve a digest for sandbox image %s; the manifest will "
+            "carry the tag only (%s)",
+            image,
+            (completed.stderr or "").strip() or "docker image inspect failed",
+        )
+        return None
+    try:
+        inspected = json.loads(completed.stdout or "[]")
+        first = inspected[0]
+        repo_digests = first.get("RepoDigests") or []
+        digest = repo_digests[0] if repo_digests else first.get("Id")
+    except (json.JSONDecodeError, IndexError, AttributeError, TypeError):
+        _log.warning("unexpected docker inspect output for sandbox image %s", image)
+        return None
+    return digest or None
 
 
 def kill_container(name: str) -> None:

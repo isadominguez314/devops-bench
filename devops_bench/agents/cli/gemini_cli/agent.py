@@ -236,21 +236,32 @@ class GeminiCliAgent(AgentHarness):
                     host_run=run,
                 )
             except SubprocessError as exc:
-                return AgentResult.errored(f"gemini subprocess error: {exc}")
+                # Under check=False this is a timeout; the partial stream it carries is the run's work.
+                stdout, returncode = exc.stdout or "", exc.returncode
+                stderr = (exc.stderr or "").strip()
+                reason = f"gemini timed out after {self.config.timeout_sec}s"
+                if stderr:
+                    reason += f": {stderr}"
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
                 return AgentResult.errored(f"gemini binary unavailable: {exc}")
+            else:
+                stdout, returncode = completed.stdout or "", completed.returncode
+                stderr = (completed.stderr or "").strip()
+                reason = (
+                    None
+                    if returncode == 0
+                    else f"gemini exited {returncode}: {stderr or '<no stderr>'}"
+                )
 
-        output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
+        output, trajectory, tokens, parse_errors = parse_stream_json(stdout)
         errors: list[str] = list(parse_errors)
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").strip()
-            errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
-            if not output:
-                output = f"Error: gemini exited {completed.returncode}"
         metadata: dict = {}
-        if completed.returncode != 0:
-            metadata["returncode"] = completed.returncode
+        if reason is not None:
+            errors.append(reason)
+            metadata["returncode"] = returncode
+            if not output:
+                output = f"Error: {reason}"
         return AgentResult(
             output=output,
             trajectory=trajectory,

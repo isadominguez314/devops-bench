@@ -18,6 +18,7 @@ For the concepts (harness vs model, capabilities, configuration), read
 | Add the module to `_BUILTIN_AGENT_MODULES` | `devops_bench/evalharness/default.py` |
 | Route agent-owned subprocesses through `run_agent_cmd`, then set `supports_sandbox = True` | your new module |
 | Ship a sandbox image for your CLI | `docker/Dockerfile.<name>` |
+| Override `reasoning_effort(cls, config)` if your CLI exposes a reasoning tier, so each tier gets its own `setupId` | your new module |
 
 ## Steps
 
@@ -121,6 +122,9 @@ A harness that shells out must also work inside the agent sandbox (see
 - Set `supports_sandbox = True` once every agent-owned call goes through the
   seam. Until then, `run()` refuses to start the harness while
   `BENCH_AGENT_SANDBOX` is set.
+- Override the `sandbox_preflight(config)` classmethod for a check that should
+  refuse the whole batch before any cluster exists (a host/image version
+  mismatch, say). Raise `SandboxError`; the default is a no-op.
 - Translate host paths that cross the boundary, in argv or env, with
   `sandbox.container_path(self.config.sandbox.workspace, path)`. Keep the host
   path for reading results back; the workspace is a bind mount. See

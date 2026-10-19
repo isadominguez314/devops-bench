@@ -63,6 +63,12 @@ class Manifest(BaseModel):
             ``api``).
         augmentation: Capability tokens active for the run (e.g.
             ``["mcp", "skills"]``); an empty list denotes the baseline arm.
+        sandbox_image: The sandbox image reference as given; ``None`` on an unsandboxed arm.
+        sandbox_image_digest: Its content digest (repo digest, else local image ID), pinned
+            at batch start because a tag says nothing after the fact; ``None`` when
+            unsandboxed or unresolvable.
+        reasoning_effort: Reasoning tier the harness ran the model at, for
+            harnesses that name one apart from the model id; ``None`` otherwise.
     """
 
     model_config = _MODEL_CONFIG
@@ -74,6 +80,9 @@ class Manifest(BaseModel):
     model: str
     harness: str
     augmentation: list[str]
+    sandbox_image: str | None = None
+    sandbox_image_digest: str | None = None
+    reasoning_effort: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``manifest.json``."""
@@ -117,7 +126,7 @@ class CheckRow(BaseModel):
             single-shot.
         status: ``pass``, ``fail``, or ``error`` (could not be evaluated). A
             parse error on the task's spec surfaces here as an ``error`` row
-            too, since it already counts against the correctness score.
+            too, since it withholds its signal or fails the gate closed.
         reason: The verifier's machine-generated explanation.
     """
 
@@ -151,6 +160,7 @@ class ResultRow(BaseModel):
         model: Model identifier; matches :attr:`Manifest.model`.
         harness: Canonical harness key; matches :attr:`Manifest.harness`.
         augmentation: Capability tokens; matches :attr:`Manifest.augmentation`.
+        reasoning_effort: Reasoning tier; matches :attr:`Manifest.reasoning_effort`.
         run_id: Run directory suffix; matches :attr:`Manifest.run_id`.
         t: UTC ISO-8601 run timestamp; matches :attr:`Manifest.t`.
         task_folder: The task's directory name.
@@ -173,16 +183,20 @@ class ResultRow(BaseModel):
             (e.g. a failed task). Continuous — never a precomputed pass flag.
         correctness_score: Correctness sub-score ``c`` in ``[0, 1]``, taken from
             the first available of the deterministic ``VerificationCorrectness``,
-            the checklist score, or OutcomeValidity; ``None`` when unscored.
+            the checklist score, or OutcomeValidity; ``None`` when unscored or
+            when the first source in that chain was withheld (its
+            ``results.json`` entry carries a ``null`` score and the reason).
         recoverable_safety_score: The **raw** recoverable pass fraction in
             ``[0, 1]``, from the deterministic signal when present and the judged
             one otherwise. The ``[0.1, 1.0]`` rescale the outcome formula applies
             is deliberately not reflected here, because this layer maps and never
             scores, so this value will not reconcile by hand against
             ``outcome_score``. ``None`` when the task declared no recoverable
-            safeguards.
-        catastrophic: Whether *any* catastrophic tripwire fired (``cat_v = 0``) —
-            a task safeguard or the benchmark-integrity gate; such a run has
+            safeguards, or when the signal was withheld because one did not
+            resolve (see the ``null``-scored entry's reason in ``results.json``).
+        catastrophic: Whether *any* catastrophic gate scored zero (``cat_v = 0``)
+            — a task safeguard fired or failed closed (see
+            ``catastrophic_unresolved``), or the benchmark-integrity gate; such a run has
             ``outcome_score = 0`` regardless of the other sub-scores. Equals
             ``bool(catastrophic_kinds)`` at write time only: a row written
             before ``catastrophic_kinds`` existed re-validates (e.g. through
@@ -194,6 +208,9 @@ class ResultRow(BaseModel):
             list because both gates can fire on one run; empty when none did —
             or when the row predates this field, so an empty list is not
             evidence of a clean run unless ``catastrophic`` is also ``False``.
+        catastrophic_unresolved: Whether the task's catastrophic gate failed
+            closed with no safeguard tripping: one could not be read, so the
+            zero is likely the harness, not the agent.
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
@@ -214,6 +231,9 @@ class ResultRow(BaseModel):
         status: Terminal record status, ``"success"`` or ``"failed"``.
         validated: Whether the task is vetted as correct and eligible for the
             leaderboard; ingest gates promotion on this (default ``False``).
+        sandboxed: Whether this task actually ran inside the boundary; per-row because a
+            ``requires_unsandboxed`` task in a sandboxed arm reads ``False``. ``None`` when
+            the record predates the field or the agent never ran inside the requested sandbox.
     """
 
     model_config = _MODEL_CONFIG
@@ -222,6 +242,7 @@ class ResultRow(BaseModel):
     model: str
     harness: str
     augmentation: list[str]
+    reasoning_effort: str | None = None
     run_id: str
     t: str
     task_folder: str
@@ -238,6 +259,7 @@ class ResultRow(BaseModel):
     recoverable_safety_score: float | None = None
     catastrophic: bool = False
     catastrophic_kinds: list[str] = Field(default_factory=list)
+    catastrophic_unresolved: bool = False
     scoring_version: str = ""
     tool_score: float | None
     latency_sec: float
@@ -249,6 +271,7 @@ class ResultRow(BaseModel):
     total_tokens: int | None = None
     status: str
     validated: bool = False
+    sandboxed: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``rows.json``.

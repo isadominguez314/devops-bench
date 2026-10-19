@@ -29,6 +29,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import tempfile
@@ -50,10 +51,10 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
-from devops_bench.agents.shared.vertex_env import vertex_project
+from devops_bench.agents.shared.vertex_env import vertex_location, vertex_project
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError, SandboxError
-from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
+from devops_bench.core.model_providers import ProviderSpec, resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
@@ -89,6 +90,75 @@ def _ensure_node_on_path(env_overlay: dict[str, str]) -> dict[str, str]:
 
 _log = get_logger("agents.cli.openclaw.agent")
 
+# ``oc --version`` prints ``OpenClaw 2026.9.1-beta.1 (1d96e5a)``; anchor on the name so a
+# stray version-shaped token (a Node notice, say) can never be mistaken for oc's.
+_OC_VERSION_RE = re.compile(r"\bOpenClaw\s+(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)")
+# The image probe only prints a version, so it gets no network and no capabilities.
+_IMAGE_PROBE_FLAGS = (
+    "--rm",
+    "--network=none",
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges=true",
+)
+
+
+def _probe_oc_version(
+    argv: list[str], *, timeout: float, extra_env: dict[str, str] | None = None
+) -> str | None:
+    """Run ``argv`` and parse an ``oc`` version from its stdout, or ``None`` when inconclusive."""
+    try:
+        completed = run(argv, check=False, timeout=timeout, extra_env=extra_env)
+    except (OSError, SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _OC_VERSION_RE.search(completed.stdout or "")
+    return match[1] if match else None
+
+
+def _host_oc_version(oc_bin: str) -> str | None:
+    """Version of the host ``oc``, probed with nvm's Node on ``PATH`` like the export calls."""
+    return _probe_oc_version([oc_bin, "--version"], timeout=30, extra_env=_ensure_node_on_path({}))
+
+
+def _image_oc_version(image: str) -> str | None:
+    """Version of the sandbox image's ``oc``; the timeout covers a cold pull."""
+    argv = ["docker", "run", *_IMAGE_PROBE_FLAGS, "--entrypoint", "oc", image, "--version"]
+    return _probe_oc_version(argv, timeout=300)
+
+
+def _oc_version_skew(oc_bin: str, image: str) -> str | None:
+    """Describe a host/image ``oc`` mismatch, or ``None`` on a match or an inconclusive probe."""
+    host = _host_oc_version(oc_bin)
+    image_version = _image_oc_version(image)
+    inconclusive = [
+        name for name, found in (("host", host), ("image", image_version)) if found is None
+    ]
+    if inconclusive:
+        _log.warning(
+            "oc version skew check skipped: the %s probe was inconclusive",
+            " and ".join(inconclusive),
+        )
+        return None
+    # Equality is a proxy: oc's real check is its state-store schema version, which it never prints.
+    if host == image_version:
+        return None
+    return (
+        f"oc version skew: host oc is {host} but sandbox image {image} ships oc "
+        f"{image_version}. The post-run trajectory export would fail against the "
+        "session store the container wrote, leaving an empty trajectory. Align "
+        "the host oc with the image before running."
+    )
+
+
+def _resolve_oc_bin(config: AgentConfig) -> str:
+    """Pick the ``oc`` binary path from ``config.target`` or fall back to ``~/bin/oc`` then ``oc``."""
+    if config.target:
+        return os.path.expanduser(config.target)
+    candidate = os.path.expanduser("~/bin/oc")
+    return candidate if os.path.exists(candidate) else "oc"
+
+
 # The image ships its own oc on PATH; a host binary path means nothing inside.
 _CONTAINER_OC_BIN = "oc"
 # Per-run layout: ``state`` is oc's state root, ``openclaw.json`` the isolated config.
@@ -108,6 +178,9 @@ _CATALOG_OVERRIDES: dict[str, frozenset[str]] = {
     ),
 }
 
+# Satisfies oc's auth-profile gate on keyless Vertex; never sent, ADC carries the real credential.
+_VERTEX_CREDENTIALS_MARKER = "gcp-vertex-credentials"
+
 # A per-run provider entry replaces oc's built-in one, so it must pin ``api`` or
 # oc falls back to the OpenAI transport. oc expands ``{location}`` itself.
 _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
@@ -121,7 +194,7 @@ _PROVIDER_TRANSPORT: dict[str, dict[str, str]] = {
     "anthropic-vertex": {
         "api": "anthropic-messages",
         "baseUrl": "https://aiplatform.googleapis.com",
-        "apiKey": "gcp-vertex-credentials",
+        "apiKey": _VERTEX_CREDENTIALS_MARKER,
     },
 }
 # node-fetch->native-fetch loader shim (see :func:`_write_node_fetch_shim`), under
@@ -258,12 +331,22 @@ def _build_openclaw_config(config: AgentConfig, mcp_servers: tuple[McpBinding, .
     return payload
 
 
+def _vertex_key_present(config: AgentConfig, spec: ProviderSpec) -> bool:
+    """Whether the agent receives a real Vertex key; the ADC marker never counts as one."""
+    env = {**os.environ, **config.extra_env}  # the precedence _build_env applies
+    # A provider with no key var gets config.api_key nowhere, so it cannot count.
+    configured = (config.api_key or "") if spec.api_key_envs else ""
+    candidates = (configured, *(env.get(var, "") for var in spec.api_key_envs))
+    return any(c.strip() and c.strip() != _VERTEX_CREDENTIALS_MARKER for c in candidates)
+
+
 def _build_env(config: AgentConfig) -> dict[str, str]:
     """Build the env overlay that gives ``oc agent --local`` its model API key.
 
     ``config.api_key`` lands on the provider's key var(s) from
     :func:`~devops_bench.core.model_providers.resolve_provider`; keyless (ambient
-    credential) backends get no key. The caller adds the ``OPENCLAW_*`` paths.
+    credential) backends get no key. A Vertex backend also gets its location,
+    sandboxed or not. The caller adds the ``OPENCLAW_*`` paths.
 
     Raises:
         ConfigError: If ``config.provider`` is not a known provider.
@@ -276,6 +359,9 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
+    if spec.backend == "vertex":
+        # oc aborts without a location; the shared chain ends at "global".
+        overlay["GOOGLE_CLOUD_LOCATION"] = vertex_location()
     if config.extra_env:
         overlay.update(config.extra_env)
     return overlay
@@ -306,11 +392,11 @@ def _sandbox_provider_env(config: AgentConfig, state_dir: Path) -> dict[str, str
     register = _write_node_fetch_shim(state_dir) / "register.mjs"
     overlay["NODE_OPTIONS"] = f"--import={sandbox.container_path(sandbox_spec.workspace, register)}"
     spec = resolve_provider(config.provider)
-    if spec.backend == "vertex" and not config.api_key:
+    if spec.backend == "vertex" and not _vertex_key_present(config, spec):
         overlay.update(sandbox_credential_env(spec, project=vertex_project()))
     if spec.oc_provider == "anthropic-vertex":
         overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] = "1"
-        overlay.setdefault("GOOGLE_CLOUD_API_KEY", "gcp-vertex-credentials")
+        overlay.setdefault("GOOGLE_CLOUD_API_KEY", _VERTEX_CREDENTIALS_MARKER)
     return overlay
 
 
@@ -326,25 +412,21 @@ def _oc_model_flag(config: AgentConfig) -> str:
     return f"--model {shlex.quote(model_id)} "
 
 
-def _oc_provider_or_none(config: AgentConfig) -> str | None:
-    """Resolve ``config.provider`` to its ``oc`` provider id, or ``None`` if unknown.
+def _vertex_auth_profile_provider(config: AgentConfig) -> str | None:
+    """The oc provider id a keyless Vertex run must seed a headless auth profile for, else ``None``.
 
-    Tolerant on purpose: its caller runs before :func:`_build_env` fails loud on a typo.
+    In current openclaw releases a per-agent auth-profile store gates the Vertex
+    providers before ADC resolution, so a keyless run fails with ``ProviderAuthError``
+    until ``oc models auth paste-api-key`` registers :data:`_VERTEX_CREDENTIALS_MARKER`.
+    A real key, configured or in the environment, gets no profile: it would be shadowed.
     """
     try:
-        return resolve_provider(config.provider).oc_provider
+        spec = resolve_provider(config.provider)
     except ConfigError:
         return None
-
-
-def _needs_anthropic_vertex_auth_profile(config: AgentConfig) -> bool:
-    """Whether a keyless anthropic-vertex run must register a headless auth profile.
-
-    From openclaw 2026.9.1 a per-agent auth-profile store gates model auth before
-    the plugin's credential hook runs, so the config marker alone fails with
-    ``ProviderAuthError``; ``oc models auth paste-api-key`` registers the entry.
-    """
-    return _oc_provider_or_none(config) == "anthropic-vertex" and not config.api_key
+    if spec.backend != "vertex" or _vertex_key_present(config, spec):
+        return None
+    return spec.oc_provider
 
 
 def _prepend_rules(rules_text: str, prompt: str) -> str:
@@ -362,11 +444,12 @@ def _build_local_command(config: AgentConfig, prompt: str, agent_name: str, oc_b
     """
     quoted_oc = shlex.quote(oc_bin)
     auth_setup = ""
-    if _needs_anthropic_vertex_auth_profile(config):
-        marker = _PROVIDER_TRANSPORT["anthropic-vertex"]["apiKey"]
+    auth_provider = _vertex_auth_profile_provider(config)
+    if auth_provider:
         auth_setup = (
-            f"printf '%s\\n' {shlex.quote(marker)} | {quoted_oc} models auth paste-api-key "
-            f"--provider anthropic-vertex --agent {shlex.quote(agent_name)}; "
+            f"printf '%s\\n' {shlex.quote(_VERTEX_CREDENTIALS_MARKER)} | "
+            f"{quoted_oc} models auth paste-api-key "
+            f"--provider {shlex.quote(auth_provider)} --agent {shlex.quote(agent_name)}; "
         )
     extra_flags_str = (
         " ".join(shlex.quote(f) for f in config.extra_flags) + " " if config.extra_flags else ""
@@ -408,12 +491,14 @@ class OpenClawAgent(AgentHarness):
         self.mcp_servers = caps.mcp_servers
         self.skills = caps.skills
 
-    def _resolve_oc_bin(self) -> str:
-        """Pick the ``oc`` binary path from config or fall back."""
-        if self.config.target:
-            return os.path.expanduser(self.config.target)
-        candidate = os.path.expanduser("~/bin/oc")
-        return candidate if os.path.exists(candidate) else "oc"
+    @classmethod
+    def sandbox_preflight(cls, config: AgentConfig) -> None:
+        """Refuse the batch before any cluster exists when the host and image ``oc`` versions differ."""
+        if config.sandbox is None or not config.sandbox.image:
+            return
+        skew = _oc_version_skew(_resolve_oc_bin(config), config.sandbox.image)
+        if skew:
+            raise SandboxError(skew)
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
         """Run ``oc agent --local`` with the granted capabilities and extract the trajectory.
@@ -422,7 +507,8 @@ class OpenClawAgent(AgentHarness):
         method owns) first: ``state/`` with skills, and ``openclaw.json`` for MCP.
         """
         caps = self.config.capabilities
-        oc_bin = self._resolve_oc_bin()
+        oc_bin = _resolve_oc_bin(self.config)
+
         final_prompt = _prepend_rules(caps.rules.text, prompt)
 
         with agent_workdir(workspace_path, prefix="oc-run-") as workdir:
@@ -469,23 +555,29 @@ class OpenClawAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                     host_run=run,
                 )
-            except SubprocessError:
-                # With check=False the only SubprocessError here is a timeout.
-                return AgentResult.errored(f"oc agent timed out after {self.config.timeout_sec}s")
+            except SubprocessError as exc:
+                # With check=False this is a timeout. The process is dead; the session
+                # store on the bind mount is not, so the host-side export below still runs.
+                completed, timed_out = exc, True
             except OSError as exc:
                 return AgentResult.errored(f"oc binary unavailable: {exc}")
+            else:
+                timed_out = False
 
             stdout_text = _strip_ansi(completed.stdout or "")
             errors: list[str] = []
             metadata: dict = {}
 
-            if completed.returncode != 0:
+            if timed_out:
+                errors.append(f"oc agent timed out after {self.config.timeout_sec}s")
+                metadata["returncode"] = completed.returncode
+            elif completed.returncode != 0:
                 stderr = (completed.stderr or "").strip()
                 errors.append(f"oc agent exited {completed.returncode}: {stderr or '<no stderr>'}")
                 metadata["returncode"] = completed.returncode
 
             trajectory, tokens, bundle_output, export_errors = self._extract_trajectory(
-                oc_bin, env_overlay
+                oc_bin, env_overlay, workdir
             )
             errors.extend(export_errors)
 
@@ -501,9 +593,14 @@ class OpenClawAgent(AgentHarness):
         )
 
     def _extract_trajectory(
-        self, oc_bin: str, env_overlay: dict[str, str]
+        self, oc_bin: str, env_overlay: dict[str, str], export_workspace: Path
     ) -> tuple[list[dict], dict, str, list[str]]:
         """Run ``oc sessions`` + ``export-trajectory`` against the run's state and parse the bundle.
+
+        The bundle lands in a fresh ``oc-export-*`` dir under ``export_workspace``
+        so the workspace diff carries the raw ``events.jsonl`` into
+        ``generated_files/``. The dir is created after the agent turn, so the
+        agent can't plant a bundle there.
 
         Returns:
             ``(trajectory, tokens, output_text, errors)``; ``output_text`` is the
@@ -536,43 +633,42 @@ class OpenClawAgent(AgentHarness):
             errors.append("oc sessions returned no session key")
             return [], {}, "", errors
 
-        with tempfile.TemporaryDirectory(prefix="oc-export-") as tmpdir:
-            workspace = Path(tmpdir)
-            try:
-                export = run(
-                    [
-                        oc_bin,
-                        "sessions",
-                        "export-trajectory",
-                        "--session-key",
-                        key,
-                        "--workspace",
-                        str(workspace),
-                        "--json",
-                    ],
-                    check=False,
-                    timeout=self.config.timeout_sec,
-                    extra_env=env_overlay,
-                )
-            except SubprocessError as exc:
-                errors.append(f"oc export-trajectory failed: {exc}")
-                return [], {}, "", errors
-            except OSError as exc:
-                errors.append(f"oc export-trajectory: binary unavailable: {exc}")
-                return [], {}, "", errors
+        export_dir = Path(tempfile.mkdtemp(dir=export_workspace, prefix="oc-export-"))
+        try:
+            export = run(
+                [
+                    oc_bin,
+                    "sessions",
+                    "export-trajectory",
+                    "--session-key",
+                    key,
+                    "--workspace",
+                    str(export_dir),
+                    "--json",
+                ],
+                check=False,
+                timeout=self.config.timeout_sec,
+                extra_env=env_overlay,
+            )
+        except SubprocessError as exc:
+            errors.append(f"oc export-trajectory failed: {exc}")
+            return [], {}, "", errors
+        except OSError as exc:
+            errors.append(f"oc export-trajectory: binary unavailable: {exc}")
+            return [], {}, "", errors
 
-            if export.returncode != 0:
-                stderr = (export.stderr or "").strip()
-                errors.append(
-                    f"oc export-trajectory exited {export.returncode}: {stderr or '<no stderr>'}"
-                )
-                return [], {}, "", errors
+        if export.returncode != 0:
+            stderr = (export.stderr or "").strip()
+            errors.append(
+                f"oc export-trajectory exited {export.returncode}: {stderr or '<no stderr>'}"
+            )
+            return [], {}, "", errors
 
-            events_text, read_errors = _read_export_bundle(workspace)
-            errors.extend(read_errors)
-            if not events_text:
-                return [], {}, "", errors
+        events_text, read_errors = _read_export_bundle(export_dir)
+        errors.extend(read_errors)
+        if not events_text:
+            return [], {}, "", errors
 
-            trajectory, tokens, output_text, parse_errors = parse_trajectory_export(events_text)
-            errors.extend(parse_errors)
-            return trajectory, tokens, output_text, errors
+        trajectory, tokens, output_text, parse_errors = parse_trajectory_export(events_text)
+        errors.extend(parse_errors)
+        return trajectory, tokens, output_text, errors

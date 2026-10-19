@@ -50,7 +50,12 @@ configuration surface — including the MCP and skills bindings
 The judge is selected the same way, with `JUDGE_PROVIDER` / `JUDGE_MODEL` (or the
 `--judge-provider` / `--judge-model` flags). With both unset, the judge inherits
 `AGENT_PROVIDER` (defaulting to `google`) and the Gemini adapter falls back to
-`AGENT_MODEL`, then to `gemini-3.1-pro-preview` (`devops_bench/models/gemini.py`). See
+`AGENT_MODEL`, then to `gemini-3.1-pro-preview` (`devops_bench/models/gemini.py`). That
+fallback usually means the agent grades itself, so the harness warns at launch with the
+configured judge and again at scoring time with the judge it actually built. Each scored
+record stores that judge under `judge` (empty on failed records and when no judge could
+be built), and under `chaos_driver` the model that actually drove the run's chaos fault
+(empty when no chaos driver was built), resolved from `CHAOS_PROVIDER` / `CHAOS_MODEL` the same way. See
 [model providers](../components/model_providers.md) for how provider keys and
 API-key routing work, including the keyless Vertex/Bedrock backends that
 authenticate via ambient credentials instead of an `AGENT_API_KEY`.
@@ -209,7 +214,7 @@ secrets are sourced from `~/secrets.env`; never print or commit key values.
 # Local (default): every combo runs on this host.
 PROJECT_ID=<project> \
 MATRIX_TASKS="tasks/common/opa-remediation/task.yaml" \
-MATRIX_MODELS="gemini-3.1-pro gemini-3.5-flash" \
+MATRIX_MODELS="gemini-3.1-pro-preview gemini-3.5-flash" \
 MATRIX_AGENT_CONFIGS="gcli+mcp+skills oc+mcp+skills" \
 MAX_PARALLEL=3 \
   scripts/bastion/run_matrix.sh
@@ -234,7 +239,7 @@ Defaults live in `scripts/bastion/_matrix_lib.sh` and `run_matrix.sh`.
 | Variable | Meaning |
 |---|---|
 | `MATRIX_TASKS` | Space-separated `task.yaml` paths, or `ALL` to enumerate every task under `tasks/` (default `tasks/common/opa-remediation/task.yaml`). |
-| `MATRIX_MODELS` | Space-separated model ids (default `gemini-3.1-pro`). |
+| `MATRIX_MODELS` | Space-separated model ids (default `gemini-3.1-pro-preview`). |
 | `MATRIX_AGENT_CONFIGS` | Agent-config presets, each `<oc\|gcli>[+mcp][+skills]` — `oc` = openclaw, `gcli` = gemini (default `oc`, the baseline arm). |
 | `PROJECT_ID` | Cloud project id; required unless `DRY_RUN`. |
 | `MAX_PARALLEL` | Max combos running at once (default 3). |
@@ -269,7 +274,7 @@ results land.
 results/run_<YYYYMMDD_HHMMSS>_<suffix>/   # suffix = sanitized run id, or sub-second precision
 ├── results.json        # full per-task records: prompt, output, trajectory, reports, scores
 ├── rows.json           # flattened per-task summary rows (best-effort)
-└── manifest.json       # run-level identity: setupId, model, harness, augmentation (best-effort)
+└── manifest.json       # run-level identity: setupId, model, harness, augmentation, reasoningEffort (best-effort)
 ```
 
 **A matrix run** writes one directory per combo under its output root
@@ -305,6 +310,11 @@ This scans the tree for per-task `rows.json` files, de-duplicates retried tasks
 (latest wins), stamps one shared batch run id and timestamp across every row, and
 writes a combined `rows.json` plus per-setup `manifests.json`. Pass
 `--run-id <id>` to reuse the matrix's own id instead of a generated one.
+
+Once several invocations of the same matrix have been aggregated, pass@k / pass^k
+over them come from `python -m devops_bench.metrics.passk <parent-of-the-roots>`,
+which reads each root's aggregated `rows.json` (see
+[pass@k / pass^k](../components/metrics.md#passk--passk)).
 
 ---
 

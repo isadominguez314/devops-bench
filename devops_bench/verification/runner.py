@@ -223,16 +223,29 @@ class VerifierAgent:
         deadline = time.monotonic() + (0.0 if single_shot else timeout_sec)
         return self._run(entry.check, deadline, single_shot=single_shot)
 
-    def _run(self, node: Any, deadline: float, *, single_shot: bool = False) -> VerificationResult:
-        """Dispatch a node against the shared deadline."""
+    def _run(
+        self,
+        node: Any,
+        deadline: float,
+        *,
+        single_shot: bool = False,
+        bounded_round: bool = False,
+    ) -> VerificationResult:
+        """Dispatch a node against the shared deadline.
+
+        ``bounded_round`` marks a single_shot evaluation that is one round of a
+        converge poll, so ``deadline`` is real and must not be outlived; see
+        :meth:`_run_parallel`.
+        """
+        kw = {"single_shot": single_shot, "bounded_round": bounded_round}
         if isinstance(node, SequenceSpec):
-            return self._run_sequence(node, deadline, single_shot=single_shot)
+            return self._run_sequence(node, deadline, **kw)
         if isinstance(node, ParallelSpec):
-            return self._run_parallel(node, deadline, single_shot=single_shot)
+            return self._run_parallel(node, deadline, **kw)
         if isinstance(node, AnySpec):
-            return self._run_any(node, deadline, single_shot=single_shot)
+            return self._run_any(node, deadline, **kw)
         if isinstance(node, NoneSpec):
-            return self._run_none(node, deadline, single_shot=single_shot)
+            return self._run_none(node, deadline, **kw)
         return self._run_leaf(node, deadline, single_shot=single_shot)
 
     def _run_leaf(
@@ -274,7 +287,12 @@ class VerifierAgent:
             reasons.append(f"[{j}] skipped")
 
     def _run_sequence(
-        self, node: SequenceSpec, deadline: float, *, single_shot: bool = False
+        self,
+        node: SequenceSpec,
+        deadline: float,
+        *,
+        single_shot: bool = False,
+        bounded_round: bool = False,
     ) -> VerificationResult:
         """Run children in order; stop and skip the rest on the first failure or error.
 
@@ -298,7 +316,7 @@ class VerifierAgent:
                 status = "fail"
                 self._skip_rest(node.checks, i, "deadline exhausted", children, reasons)
                 break
-            res = self._run(child, deadline, single_shot=single_shot)
+            res = self._run(child, deadline, single_shot=single_shot, bounded_round=bounded_round)
             children.append(res)
             if res.status == "error":
                 status = "error"
@@ -323,7 +341,12 @@ class VerifierAgent:
         )
 
     def _run_any(
-        self, node: AnySpec, deadline: float, *, single_shot: bool = False
+        self,
+        node: AnySpec,
+        deadline: float,
+        *,
+        single_shot: bool = False,
+        bounded_round: bool = False,
     ) -> VerificationResult:
         """Evaluate members, succeeding once some child passes.
 
@@ -337,13 +360,20 @@ class VerifierAgent:
         evaluated.
         """
         if single_shot:
-            return self._eval_any_round(node, deadline, bound_by_deadline=False)
+            return self._eval_any_round(
+                node, deadline, bound_by_deadline=False, bounded_round=bounded_round
+            )
         return self._poll_rounds(
             lambda: self._eval_any_round(node, deadline, bound_by_deadline=True), deadline
         )
 
     def _eval_any_round(
-        self, node: AnySpec, deadline: float, *, bound_by_deadline: bool = False
+        self,
+        node: AnySpec,
+        deadline: float,
+        *,
+        bound_by_deadline: bool = False,
+        bounded_round: bool = False,
     ) -> VerificationResult:
         """Run one bounded pass over ``node``'s children, stopping at the first success.
 
@@ -382,7 +412,9 @@ class VerifierAgent:
                     status="error",
                 )
                 break
-            res = self._run(child, deadline, single_shot=True)
+            res = self._run(
+                child, deadline, single_shot=True, bounded_round=bounded_round or bound_by_deadline
+            )
             children.append(res)
             if res.success:
                 reasons.append(f"[{i}] succeeded")
@@ -400,7 +432,12 @@ class VerifierAgent:
         )
 
     def _run_none(
-        self, node: NoneSpec, deadline: float, *, single_shot: bool = False
+        self,
+        node: NoneSpec,
+        deadline: float,
+        *,
+        single_shot: bool = False,
+        bounded_round: bool = False,
     ) -> VerificationResult:
         """Evaluate members, succeeding once a round finds nothing holds.
 
@@ -413,13 +450,20 @@ class VerifierAgent:
         evaluated.
         """
         if single_shot:
-            return self._eval_none_round(node, deadline, bound_by_deadline=False)
+            return self._eval_none_round(
+                node, deadline, bound_by_deadline=False, bounded_round=bounded_round
+            )
         return self._poll_rounds(
             lambda: self._eval_none_round(node, deadline, bound_by_deadline=True), deadline
         )
 
     def _eval_none_round(
-        self, node: NoneSpec, deadline: float, *, bound_by_deadline: bool = False
+        self,
+        node: NoneSpec,
+        deadline: float,
+        *,
+        bound_by_deadline: bool = False,
+        bounded_round: bool = False,
     ) -> VerificationResult:
         """Run one bounded pass over ``node``'s children, stopping at the first pass.
 
@@ -451,7 +495,9 @@ class VerifierAgent:
                     status="error",
                 )
                 break
-            res = self._run(child, deadline, single_shot=True)
+            res = self._run(
+                child, deadline, single_shot=True, bounded_round=bounded_round or bound_by_deadline
+            )
             children.append(res)
             if res.success:
                 reasons.append(f"[{i}] unexpectedly succeeded: {res.reason}")
@@ -496,7 +542,12 @@ class VerifierAgent:
         return last.model_copy(update={"elapsed_time": time.monotonic() - start})
 
     def _run_parallel(
-        self, node: ParallelSpec, deadline: float, *, single_shot: bool = False
+        self,
+        node: ParallelSpec,
+        deadline: float,
+        *,
+        single_shot: bool = False,
+        bounded_round: bool = False,
     ) -> VerificationResult:
         """Run children concurrently; each sees the full remaining deadline.
 
@@ -518,12 +569,13 @@ class VerifierAgent:
         that a single hung child would stall the whole run forever. In pure
         assert mode ``deadline`` is effectively "now" (``run_entry`` sets it
         to zero budget), so remaining time is not meaningful there and the
-        wait uses the ceiling outright. Nested inside a converge round,
-        though, ``deadline`` is the real shared deadline, and the wait must
-        not outlive it or a single round can overshoot the converge deadline
-        by up to the ceiling, defeating the total-budget bound; the wait is
-        clamped to whichever of the ceiling and the remaining deadline is
-        smaller.
+        wait uses the ceiling outright. Nested inside a converge round
+        (``bounded_round``), ``deadline`` is the real shared deadline and the
+        wait must not outlive it: it is clamped to the remaining time, and a
+        round that enters after the deadline has already passed waits only
+        :data:`_CHILD_HANDOFF_GRACE_SEC` for children that are already running,
+        never the ceiling, or one round could overshoot the converge deadline by
+        up to the ceiling.
         """
         start = time.monotonic()
         results: list[VerificationResult] = [
@@ -537,16 +589,21 @@ class VerifierAgent:
         ex = ThreadPoolExecutor(max_workers=workers)
         try:
             futs = {
-                ex.submit(self._run, child, deadline, single_shot=single_shot): i
+                ex.submit(
+                    self._run, child, deadline, single_shot=single_shot, bounded_round=bounded_round
+                ): i
                 for i, child in enumerate(node.checks)
             }
             if single_shot:
                 remaining = deadline - time.monotonic()
-                wait_timeout = (
-                    min(_SINGLE_SHOT_WAIT_CEILING_SEC, remaining)
-                    if remaining > 0
-                    else _SINGLE_SHOT_WAIT_CEILING_SEC
-                )
+                if remaining > 0:
+                    wait_timeout = min(_SINGLE_SHOT_WAIT_CEILING_SEC, remaining)
+                elif bounded_round:
+                    # The converge deadline passed mid-round: brief handoff, never the ceiling.
+                    wait_timeout = _CHILD_HANDOFF_GRACE_SEC
+                else:
+                    # Assert mode has no budget by design; the ceiling is its only backstop.
+                    wait_timeout = _SINGLE_SHOT_WAIT_CEILING_SEC
             else:
                 # Measured from the absolute handoff deadline, not from now:
                 # a nested group entered after ``deadline`` would otherwise wait a

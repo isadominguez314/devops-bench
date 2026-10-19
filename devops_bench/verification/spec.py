@@ -339,8 +339,8 @@ class VerificationEntry(BaseModel):
         hold_window_sec: Length, in seconds, of the post-run soak window for
             an ``objective`` entry in ``hold`` mode. Required in that case:
             there is no default, since a silent default would quietly
-            consume the shared post-run verification budget
-            (``VERIFICATION_TOTAL_BUDGET_SEC``) on every task in a suite. Not
+            lengthen the post-run verification of every task in a suite
+            (see ``verification_budget_sec``). Not
             allowed for a ``safeguard`` entry in ``hold`` mode, whose window
             is always the agent's turn; setting it there would be
             meaningless and silently ignored, which would mislead. Setting

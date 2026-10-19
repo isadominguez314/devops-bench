@@ -23,9 +23,8 @@ import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Mapping
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentResult
@@ -43,7 +42,6 @@ from devops_bench.cheat_detection import (
     annotate_records,
     baseline_from_granted_paths,
     build_inventory_rules,
-    build_mount_rules,
     filter_rules_for_prompt,
     load_ruleset,
 )
@@ -58,6 +56,7 @@ from devops_bench.core import (
     get_env,
     get_logger,
 )
+from devops_bench.core.model_identity import judge_identity
 from devops_bench.deployers.factory import get_deployer
 from devops_bench.evalharness.artifacts import collect_generated_files, snapshot_dir
 from devops_bench.evalharness.base import Harness
@@ -70,9 +69,9 @@ from devops_bench.evalharness.hold import (
 from devops_bench.evalharness.reporter import ResultReporter
 from devops_bench.evalharness.scenario import (
     VERIFICATION_TIMEOUT_SEC,
-    VERIFICATION_TOTAL_BUDGET_SEC,
     ScenarioManager,
     pick_free_port,
+    verification_budget_sec,
 )
 from devops_bench.k8s import agent_credentials
 from devops_bench.tasks import Task
@@ -161,6 +160,27 @@ def _entry_display_fields(entry: VerificationEntry) -> dict[str, Any]:
     }
 
 
+def _budget_exhausted_row(entry: VerificationEntry) -> dict[str, Any]:
+    """Report item for an entry the shared verification budget never reached.
+
+    Never evaluated, not a condition observed false, so it stays unresolved
+    rather than counting against the agent.
+    """
+    return {
+        "name": entry.name,
+        **_entry_display_fields(entry),
+        "role": entry.role,
+        "severity": entry.severity,
+        "weight": entry.weight,
+        "mode": entry.resolved_mode,
+        "success": False,
+        "status": "error",
+        "reason": "verification total budget exhausted before evaluation",
+        "elapsed_time": 0.0,
+        "children": [],
+    }
+
+
 def _task_metadata(task: Task) -> dict[str, Any]:
     """The task-level display metadata snapshotted onto every record."""
     return {
@@ -213,6 +233,20 @@ class DefaultEvalHarness(Harness):
         self.project_id = project_id
         self.cluster_name = cluster_name
         self._judge_model = judge_model
+        if judge_model is None and get_env("JUDGE_MODEL") is None:
+            # Configured, not built: the resolved judge is logged again at scoring time.
+            configured = judge_identity()
+            if configured["model"]:
+                _log.warning(
+                    "JUDGE_MODEL unset; the judge is configured as %s/%s (AGENT_MODEL fallback)",
+                    configured["provider"],
+                    configured["model"],
+                )
+            else:
+                _log.warning(
+                    "JUDGE_MODEL and AGENT_MODEL unset; the judge uses the %s adapter's default model",
+                    configured["provider"],
+                )
         self.results_root = results_root
         resolved_agent_type = (
             agent_type
@@ -481,23 +515,28 @@ class DefaultEvalHarness(Harness):
         timeout_sec: float = VERIFICATION_TIMEOUT_SEC,
         *,
         hold_observations: dict[str, HoldObservation] | None = None,
+        total_budget_sec: float | None = None,
     ) -> list[dict[str, Any]]:
         """Evaluate every entry against the live cluster after the agent finishes.
 
         Every entry runs; one that raises is recorded as a failure and the rest
-        continue. Converging entries share one wall-clock deadline from
-        :data:`VERIFICATION_TOTAL_BUDGET_SEC` and get ``min(timeout_sec,
-        remaining)`` each; one with under :data:`MIN_LEAF_BUDGET_SECONDS` left is
-        recorded as budget-exhausted. Assert entries ignore the total budget.
-        Safeguard hold entries take their outcome from ``hold_observations``
-        (sampled during the agent's turn); objective hold entries are soaked here
-        against the same deadline. A hold with zero samples is an error, never a pass.
+        continue. Converging entries and objective soaks draw on one budget
+        sized by :func:`~devops_bench.evalharness.scenario.verification_budget_sec`:
+        each is granted ``min(its cap, budget left)`` and charged only the time
+        it actually spent, up to that grant, so overruns past a cap and harness
+        work between entries never starve a later entry. One granted under
+        :data:`MIN_LEAF_BUDGET_SECONDS` is recorded as budget-exhausted, as is an
+        objective hold granted no time at all. Assert entries cost nothing. Safeguard hold entries take their outcome from
+        ``hold_observations`` (sampled during the agent's turn); objective hold
+        entries are soaked here, last. A hold with zero samples is an error,
+        never a pass.
 
         Args:
             entries: The task's parsed verification entries.
             timeout_sec: Per-entry budget for converging entries.
             hold_observations: Name-keyed safeguard-hold observations; ``None``
                 or a missing name counts as zero samples.
+            total_budget_sec: Overrides the spec-sized total budget.
 
         Returns:
             One mapping per entry, in declaration order, in the shape
@@ -505,7 +544,11 @@ class DefaultEvalHarness(Harness):
         """
         agent = VerifierAgent()
         report: list[dict[str, Any]] = []
-        total_deadline = time.monotonic() + VERIFICATION_TOTAL_BUDGET_SEC
+        budget_left = (
+            verification_budget_sec(entries, timeout_sec)
+            if total_budget_sec is None
+            else total_budget_sec
+        )
         hold_observations = hold_observations or {}
 
         # Objective holds soak last so converging entries claim the budget first.
@@ -519,7 +562,13 @@ class DefaultEvalHarness(Harness):
             if entry.resolved_mode == "hold" and entry.role == "objective":
                 objective_holds.append(index)
                 continue
-            rows[index] = self._evaluate_entry(agent, entry, timeout_sec, total_deadline)
+            if entry.resolved_mode == "assert":
+                rows[index] = self._evaluate_entry(agent, entry, timeout_sec)
+                continue
+            granted = min(timeout_sec, budget_left)
+            started = time.monotonic()
+            rows[index] = self._evaluate_entry(agent, entry, granted)
+            budget_left -= min(granted, time.monotonic() - started)
 
         for index in objective_holds:
             entry = entries[index]
@@ -530,13 +579,19 @@ class DefaultEvalHarness(Harness):
                     "hold_window_sec set; this should have been rejected at "
                     "spec-validation time"
                 )
+            if budget_left <= 0:
+                rows[index] = _budget_exhausted_row(entry)
+                continue
+            granted = min(entry.hold_window_sec, budget_left)
+            started = time.monotonic()
             obs = run_hold_window(
                 entry,
                 entry.hold_window_sec,
                 interval_sec=effective_poll_interval(entry.hold_poll_interval_sec),
-                deadline=total_deadline,
+                deadline=started + granted,
             )
             rows[index] = self._hold_report_entry(entry, obs)
+            budget_left -= min(granted, time.monotonic() - started)
 
         report.extend(row for row in rows if row is not None)
         return report
@@ -546,28 +601,13 @@ class DefaultEvalHarness(Harness):
         agent: VerifierAgent,
         entry: VerificationEntry,
         timeout_sec: float,
-        total_deadline: float,
     ) -> dict[str, Any]:
-        """Evaluate one converge or assert entry against the shared deadline."""
-        remaining = total_deadline - time.monotonic()
-        if entry.resolved_mode != "assert" and remaining < MIN_LEAF_BUDGET_SECONDS:
-            # Never evaluated, not a condition observed false.
-            return {
-                "name": entry.name,
-                **_entry_display_fields(entry),
-                "role": entry.role,
-                "severity": entry.severity,
-                "weight": entry.weight,
-                "mode": entry.resolved_mode,
-                "success": False,
-                "status": "error",
-                "reason": "verification total budget exhausted before evaluation",
-                "elapsed_time": 0.0,
-                "children": [],
-            }
+        """Evaluate one converge or assert entry within its granted ``timeout_sec``."""
+        if entry.resolved_mode != "assert" and timeout_sec < MIN_LEAF_BUDGET_SECONDS:
+            return _budget_exhausted_row(entry)
 
         try:
-            result = agent.run_entry(entry, timeout_sec=min(timeout_sec, remaining))
+            result = agent.run_entry(entry, timeout_sec=timeout_sec)
             success = result.success
             status = result.status
             reason = result.reason
@@ -762,12 +802,13 @@ class DefaultEvalHarness(Harness):
             # a batch of only exempt tasks never needs the seam.
             _ensure_builtin_agents_registered()
             agent_cls = AGENTS.get(_canonical_agent_type(self.agent_type))
-            if agent_cls is not None and not getattr(agent_cls, "supports_sandbox", False):
+            if not getattr(agent_cls, "supports_sandbox", False):
                 raise SandboxError(
                     f"agent harness {agent_cls.__name__} has not been migrated onto "
                     "the sandbox seam; refusing the whole batch rather than "
                     "provisioning a cluster per task just to fail each one"
                 )
+            agent_cls.sandbox_preflight(self._agent_config)
         if sandboxed:
             # Reap containers a killed harness never got to reap, before this
             # batch's own exist; the sweep itself applies the BENCH_PARALLEL gate.
@@ -777,6 +818,7 @@ class DefaultEvalHarness(Harness):
                 )
             except Exception:  # noqa: BLE001 - a sweep failure must not block the run
                 _log.exception("stray sandbox container sweep failed; continuing")
+            self._pin_sandbox_image()
 
         run_dir = self.reporter.new_run_dir()
 
@@ -859,24 +901,60 @@ class DefaultEvalHarness(Harness):
         )
         from devops_bench.results import setup_id as results_setup_id
 
+        # Arm-level: the token lands in the setup id so A/B is a group-by; rows hold per-task truth.
+        sandbox = self._agent_config.sandbox
         augmentation = derive_augmentation(
-            {"use_mcp": self.use_mcp, "skills": list(self._granted_skill_paths)}
+            {
+                "use_mcp": self.use_mcp,
+                "skills": list(self._granted_skill_paths),
+                "sandboxed": sandbox is not None,
+            }
         )
         # Canonical key, so an alias aggregates with it instead of as a second setup.
         harness = _canonical_agent_type(self.agent_type)
         model = self._agent_config.model or self._agent_config.provider or harness
+        # The tier is part of the arm: without it, runs of one model at two tiers
+        # share a setup id and the aggregate's keep-newest dedupe merges them.
+        _ensure_builtin_agents_registered()
+        # ``get`` raises on a miss; an unregistered harness still gets its rows written.
+        agent_cls = AGENTS.get(harness) if harness in AGENTS else None
+        reasoning_effort = (
+            agent_cls.reasoning_effort(self._agent_config) if agent_cls is not None else None
+        )
         manifest = Manifest(
             schema_version=SCHEMA_VERSION,
             run_id=run_dir.name,
             t=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            setup_id=results_setup_id(model, harness, augmentation),
+            setup_id=results_setup_id(
+                model, harness, augmentation, reasoning_effort=reasoning_effort
+            ),
             model=model,
             harness=harness,
             augmentation=augmentation,
+            # Pinned at batch start; a mutable tag alone is not provenance.
+            sandbox_image=sandbox.image if sandbox is not None else None,
+            sandbox_image_digest=sandbox.image_digest if sandbox is not None else None,
+            reasoning_effort=reasoning_effort,
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
         self.reporter.write_manifest(run_dir, manifest.to_dict())
+
+    def _pin_sandbox_image(self) -> None:
+        """Resolve the image digest once, before the first container; a tag can move mid-batch."""
+        spec = self._agent_config.sandbox
+        if spec is None or spec.image_digest is not None:
+            return
+        pinned = replace(spec, image_digest=agent_sandbox.image_digest(spec.image))
+        self._agent_config = replace(self._agent_config, sandbox=pinned)
+
+    def _sandboxed_outcome(
+        self, task: Task, completed_spec: agent_sandbox.SandboxSpec | None, agent_started: bool
+    ) -> bool | None:
+        """Per-record ``sandboxed`` for a failed run; ``None`` unless the agent ran in the boundary."""
+        if self._agent_config.sandbox is None or task.requires_unsandboxed:
+            return False
+        return True if completed_spec is not None and agent_started else None
 
     def _ambient_inventory_rules(
         self,
@@ -940,6 +1018,7 @@ class DefaultEvalHarness(Harness):
         completed_spec: agent_sandbox.SandboxSpec | None = None
         sandbox_rules: tuple[SensitiveAccessRule, ...] = ()
         sandbox_exempt = False
+        agent_started = False
         verification_parse_errors: list[dict[str, str]] = []
         entries: list[VerificationEntry] = []
         # Tracked as computed so a failed record carries the same resolved strings.
@@ -967,6 +1046,13 @@ class DefaultEvalHarness(Harness):
                     "agent sandbox even though a sandbox was requested",
                     task.name,
                 )
+                if cluster_info.agent_cloud_identity:
+                    _log.warning(
+                        "task %s also names agent_cloud_identity %s; no credential is minted "
+                        "for it and the agent uses the ambient one instead",
+                        task.name,
+                        cluster_info.agent_cloud_identity,
+                    )
                 sandbox_exempt = True
             elif self._agent_config.sandbox is not None:
                 # The kubeconfig gets its own dir so the credential enters only via its
@@ -979,10 +1065,9 @@ class DefaultEvalHarness(Harness):
                     deployer.provider,
                     task.agent_pod_security,
                     with_cluster=infra_config.get("deployer") != "noop",
+                    quota_writes=task.agent_quota_writes,
                 )
-                sandbox_rules = self._inventory_sandbox_home(
-                    task.name, workspace_path / "home", completed_spec.fixture_mounts
-                )
+                sandbox_rules = self._inventory_sandbox_home(task.name, workspace_path / "home")
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
@@ -1004,8 +1089,8 @@ class DefaultEvalHarness(Harness):
             )
             if verification_parse_errors:
                 _log.warning(
-                    "%d verification entry/entries failed to parse and will not be "
-                    "scored, which lowers the objective denominator: %s",
+                    "%d verification entry/entries failed to parse; each withholds its "
+                    "signal or fails the catastrophic gate closed: %s",
                     len(verification_parse_errors),
                     verification_parse_errors,
                 )
@@ -1054,6 +1139,7 @@ class DefaultEvalHarness(Harness):
             # inside it; diff it separately (ambient runs collect home/ whole).
             home_dir = workspace_path / "home"
             before_home = snapshot_dir(home_dir) if completed_spec is not None else set()
+            agent_started = True
             agent_res = self.execute_agent(
                 prompt, context, sandbox_spec=completed_spec, sandbox_exempt=sandbox_exempt
             )
@@ -1090,6 +1176,7 @@ class DefaultEvalHarness(Harness):
 
             result = self._build_success_record(
                 task=task,
+                sandboxed=completed_spec is not None,
                 prompt=prompt,
                 expected_output=expected_output,
                 agent_res=agent_res,
@@ -1130,6 +1217,7 @@ class DefaultEvalHarness(Harness):
             result = self._build_failed_record(
                 task,
                 exc,
+                sandboxed=self._sandboxed_outcome(task, completed_spec, agent_started),
                 prompt=prompt,
                 expected_output=expected_output,
                 recoverable_safety=recoverable_safety,
@@ -1177,12 +1265,14 @@ class DefaultEvalHarness(Harness):
         pod_security: str,
         *,
         with_cluster: bool = True,
+        quota_writes: bool = True,
     ) -> agent_sandbox.SandboxSpec:
         """Complete the skeletal sandbox spec for one provisioned task.
 
         Builds the context-pinned network plan, provisions the scoped cluster
         credential, and discovers fixture mounts; ``with_cluster=False`` mounts a
-        credential-free stub kubeconfig instead. Raises :class:`SandboxError`
+        credential-free stub kubeconfig instead. ``quota_writes`` is the task's
+        ``agent_quota_writes``. Raises :class:`SandboxError`
         rather than degrading to an ambient run.
         """
         if self._agent_config.sandbox is None:
@@ -1191,7 +1281,9 @@ class DefaultEvalHarness(Harness):
                 "must gate on config.sandbox"
             )
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
+        token_ttl_sec: int | None = None
         if with_cluster:
+            token_ttl_sec = agent_credentials.token_ttl_for(self._agent_config.timeout_sec)
             # Pinned here too, so the spec and the run-end teardown target the same cluster.
             plan = agent_credentials.pin_plan_context(
                 agent_sandbox.build_network_plan(provider, cluster_info)
@@ -1199,8 +1291,9 @@ class DefaultEvalHarness(Harness):
             kubeconfig = agent_credentials.provision_agent_credentials(
                 plan,
                 creds_dir,
-                token_ttl_sec=agent_credentials.token_ttl_for(self._agent_config.timeout_sec),
+                token_ttl_sec=token_ttl_sec,
                 pod_security=pod_security,
+                quota_writes=quota_writes,
             )
         else:
             plan = agent_sandbox.NetworkPlan()
@@ -1208,12 +1301,23 @@ class DefaultEvalHarness(Harness):
             kubeconfig.write_text("apiVersion: v1\nkind: Config\n")
             kubeconfig.chmod(0o600)
         try:
+            # A mint failure raises: a failed record, never a run missing its credential.
+            cloud_credential_env = (
+                provider.sandbox_cloud_credential_env(
+                    cluster_info,
+                    lifetime_sec=token_ttl_sec,
+                    agent_timeout_sec=self._agent_config.timeout_sec,
+                )
+                if with_cluster and provider is not None
+                else {}
+            )
             return replace(
                 self._agent_config.sandbox,
                 network=plan,
                 workspace=workspace_path,
                 kubeconfig=kubeconfig,
                 fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
+                cloud_credential_env=cloud_credential_env,
             )
         except Exception:
             # Provisioned, but no completed spec will carry the objects to the run-end teardown.
@@ -1228,12 +1332,11 @@ class DefaultEvalHarness(Harness):
         self,
         task_name: str,
         home: Path,
-        fixture_mounts: Mapping[str, str] | None = None,
     ) -> tuple[SensitiveAccessRule, ...]:
         """Detection inventory rooted at the sandbox home; best-effort.
 
-        Fixture mounts only exist inside the container, so each mounted name
-        also gets a container-path rule; the prompt filter authorizes named ones.
+        Fixture mounts are this run's own input (keyed on the run-unique cluster
+        token), so they are not covered; only real sandbox-home leftovers are.
         """
         if not (self.cheat_detect and self.cheat_inventory):
             return ()
@@ -1243,12 +1346,6 @@ class DefaultEvalHarness(Harness):
                 baseline=DEFAULT_BASELINE
                 | baseline_from_granted_paths(home, self._granted_skill_paths),
             )
-            mounted_names = [
-                PurePosixPath(container_path).name
-                for container_path in (fixture_mounts or {}).values()
-            ]
-            if mounted_names:
-                rules += build_mount_rules(agent_sandbox.CONTAINER_HOME, mounted_names)
         except Exception:  # noqa: BLE001 - detection must never block execution
             _log.exception(
                 "sandbox-home inventory failed for %s; static cheat rules only", task_name
@@ -1259,6 +1356,7 @@ class DefaultEvalHarness(Harness):
     def _build_success_record(
         self,
         *,
+        sandboxed: bool = False,
         task: Task,
         prompt: str,
         expected_output: str,
@@ -1277,7 +1375,7 @@ class DefaultEvalHarness(Harness):
         """
         dumped = agent_res.to_dict()
         agent_errors = list(dumped.get("errors") or [])
-        record = self._empty_record(task)
+        record = self._empty_record(task, sandboxed=sandboxed)
         record.update(
             {
                 "input": prompt,
@@ -1306,6 +1404,7 @@ class DefaultEvalHarness(Harness):
                     else list(task.recoverable_safety)
                 ),
                 "chaos_report": chaos_report,
+                "chaos_driver": dict(chaos_report.get("driver") or {}),
                 "perf_report": perf_report,
                 "verification_parse_errors": list(verification_parse_errors or []),
                 "verification_report": list(verification_report or []),
@@ -1319,6 +1418,7 @@ class DefaultEvalHarness(Harness):
         task: Task,
         exc: Exception,
         *,
+        sandboxed: bool | None = False,
         prompt: str | None = None,
         expected_output: str | None = None,
         recoverable_safety: list[str] | None = None,
@@ -1331,6 +1431,7 @@ class DefaultEvalHarness(Harness):
         Args:
             task: The task that failed.
             exc: The exception that aborted the run.
+            sandboxed: Per-record boundary truth; ``None`` when the agent never ran in the sandbox.
             prompt: The substituted prompt if computed, else the raw ``task.prompt``.
             expected_output: The substituted expectation if computed, else the raw one.
             recoverable_safety: The substituted checklist if computed, else the raw one.
@@ -1339,7 +1440,7 @@ class DefaultEvalHarness(Harness):
             verification_status: "evaluated", "not_evaluated", or "skipped_no_infra".
         """
         error_text = str(exc)
-        record = self._empty_record(task)
+        record = self._empty_record(task, sandboxed=sandboxed)
         record.update(
             {
                 "input": prompt if prompt is not None else task.prompt,
@@ -1363,7 +1464,7 @@ class DefaultEvalHarness(Harness):
         )
         return record
 
-    def _empty_record(self, task: Task) -> dict[str, Any]:
+    def _empty_record(self, task: Task, *, sandboxed: bool | None = False) -> dict[str, Any]:
         """Seed every record with the symmetric key set; the caller sets ``status``."""
         return {
             "input": task.prompt,
@@ -1395,6 +1496,12 @@ class DefaultEvalHarness(Harness):
                 "use_mcp": self.use_mcp,
                 "skills": list(self._granted_skill_paths),
             },
+            # Per-task, not per-arm: a requires_unsandboxed task in a sandboxed run reads False.
+            "sandboxed": sandboxed,
+            # Which models scored and disrupted the run: ``judge`` is filled by ``_score``,
+            # ``chaos_driver`` by the success builder from ``chaos_report["driver"]``.
+            "judge": {},
+            "chaos_driver": {},
             "verification_parse_errors": [],
             "verification_report": [],
             "verification_status": "",
@@ -1476,7 +1583,7 @@ class DefaultEvalHarness(Harness):
         if not scorable:
             return
         # Lazy import keeps ``deepeval`` / provider SDKs out of harness import.
-        from devops_bench.metrics import evaluate_metrics_batch, get_judge_model
+        from devops_bench.metrics import describe_judge, evaluate_metrics_batch, get_judge_model
 
         try:
             judge_model = self._judge_model or get_judge_model()
@@ -1485,4 +1592,7 @@ class DefaultEvalHarness(Harness):
             # judge, so a judge outage must not leave a cheating run ungated.
             _log.exception("judge unavailable; scoring deterministic metrics only")
             judge_model = None
+        judge = describe_judge(judge_model) if judge_model is not None else {}
+        for record in scorable:
+            record["judge"] = dict(judge)
         evaluate_metrics_batch(scorable, judge_model, use_mcp=self.use_mcp)

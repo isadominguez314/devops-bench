@@ -49,16 +49,21 @@ In the record's `scores` map, read the entries in the order that matters:
   cat_v=…`) tells you immediately whether the low score came from correctness,
   from safety, or from coverage.
 - **Which correctness signal was used** — `VerificationCorrectness` wins over
-  `ChecklistScore`, which wins over `OutcomeValidity`. Check
-  **`VerificationCoverage`** before trusting `VerificationCorrectness`: coverage
-  below 1.0 means the fraction was computed over a subset of the declared
-  entries.
+  `ChecklistScore`, which wins over `OutcomeValidity`. A signal that is
+  present with a `null` score was **withheld** (its reason says how many
+  entries were unresolved); the chain stops there and `OutcomeScore` is
+  withheld too, unless a catastrophic gate scored zero, which still gives
+  `0.0` (`c=n/a`). A gate reading `cat_v=0 (VerificationCatastrophic: failed
+  closed)` had no safeguard trip, only one that could not be read: suspect the
+  harness. **`VerificationCoverage`** says how much of the spec resolved.
 - **`OutcomeValidity.reason`** — the headline "did it work" judgment.
 - **`ToolInvocation.reason`** — did it call the right tools / take a sane
   trajectory (present only when MCP is on).
 - **`Check: <item>.reason`** for each `expected_output` requirement, and
   **`ChecklistScore.reason`** for the passed/total ratio in words
-  (`"Passed 3 out of 5 checks."`).
+  (`"Passed 3 out of 4 checks."`); a `Check:` entry with a `null` score is one
+  the judge could not evaluate, and a `null` `ChecklistScore` was withheld
+  because at least one item could not be judged (its reason says how many).
 - **`GroundingAccuracy.reason`** — reads "Applied X out of Y documented
   constraints (Critical: a/b)"; note it is on a **0–5 scale**, and a short
   *critical* count caps the band even when the raw count looks fine.

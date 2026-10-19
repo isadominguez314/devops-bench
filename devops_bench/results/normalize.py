@@ -112,17 +112,25 @@ def slugify(text: str) -> str:
     return _DISALLOWED_ID_CHARS.sub("-", text.lower()).strip("-")
 
 
-def setup_id(model: str, harness: str, augmentation: Iterable[str]) -> str:
+def setup_id(
+    model: str,
+    harness: str,
+    augmentation: Iterable[str],
+    *,
+    reasoning_effort: str | None = None,
+) -> str:
     """Build the deterministic setup id for a ``(model, harness, augmentation)`` arm.
 
     The augmentation tokens are sorted so the id is independent of token order;
     the baseline arm (no tokens) yields ``"<model>-<harness>"`` with no trailing
-    dash.
+    dash. A reasoning tier, when the harness names one, is appended as
+    ``effort-<tier>`` so runs at different tiers are distinct arms.
 
     Args:
         model: Model identifier.
         harness: Canonical harness key.
         augmentation: Capability tokens for the arm.
+        reasoning_effort: Reasoning tier the model ran at, if the harness names one.
 
     Returns:
         The sanitized setup id.
@@ -131,6 +139,8 @@ def setup_id(model: str, harness: str, augmentation: Iterable[str]) -> str:
     tokens = sorted(augmentation)
     if tokens:
         parts.append("-".join(tokens))
+    if reasoning_effort:
+        parts.append(f"effort-{reasoning_effort}")
     return slugify("-".join(parts))
 
 
@@ -138,11 +148,14 @@ def derive_augmentation(capabilities_granted: Mapping[str, Any] | None) -> list[
     """Map a record's ``capabilities_granted`` to sorted augmentation tokens.
 
     ``use_mcp`` contributes ``"mcp"``; a non-empty ``skills`` list contributes
-    ``"skills"``. An arm with neither yields ``[]`` (baseline).
+    ``"skills"``; a truthy ``sandboxed`` contributes ``"sandboxed"``. An arm
+    with none of them yields ``[]`` (baseline).
+
+    ``sandboxed`` is a token so a sandboxed arm gets its own setup id and A/B is a group-by.
 
     Args:
-        capabilities_granted: The record's ``capabilities_granted`` mapping
-            (``{"use_mcp": bool, "skills": list}``), or ``None``.
+        capabilities_granted: ``{"use_mcp": bool, "skills": list, "sandboxed": bool}`` or
+            ``None``; ``sandboxed`` is the arm flag the harness passes, not a record field.
 
     Returns:
         Sorted, de-duplicated capability tokens.
@@ -153,6 +166,8 @@ def derive_augmentation(capabilities_granted: Mapping[str, Any] | None) -> list[
         tokens.add("mcp")
     if caps.get("skills"):
         tokens.add("skills")
+    if caps.get("sandboxed"):
+        tokens.add("sandboxed")
     return sorted(tokens)
 
 
@@ -248,17 +263,30 @@ def extract_score(scores: Mapping[str, Any] | None, key: str) -> float | None:
 def _first_score(scores: Mapping[str, Any] | None, keys: tuple[str, ...]) -> float | None:
     """Return the score under the first key in ``keys`` that carries one.
 
+    A key that is present but carries a ``null`` score was withheld, and it
+    ends the walk instead of being skipped, so a signal a metric declined to
+    publish is not answered by a judged key further down the chain. It shares
+    :func:`~devops_bench.core.score_keys.is_withheld` with
+    ``metrics.pipeline._resolve`` so the row's components name the same
+    signals the composite was built from.
+
     Args:
         scores: The record's ``scores`` mapping, or ``None``.
         keys: Candidate score keys in preference order.
 
     Returns:
-        The first numeric score found, or ``None`` when no key carries one.
+        The first numeric score found, or ``None`` when no key carries one or
+        when a key earlier in the chain was withheld.
     """
+    present = scores or {}
     for key in keys:
-        value = extract_score(scores, key)
+        if key not in present:
+            continue
+        value = extract_score(present, key)
         if value is not None:
             return value
+        if score_keys.is_withheld(present[key]):
+            return None
     return None
 
 
@@ -321,17 +349,26 @@ def _parse_error_rows(errors: Any) -> list[CheckRow]:
     """Surface each ``verification_parse_errors`` item as an ``error`` check.
 
     An entry that fails to parse, or is dropped as a duplicate name, never
-    evaluates, yet it already fails closed into the correctness score. Without
-    a row for it a viewer would see a low score next to an all-green check
-    list. The row carries the role and severity the entry declared, so a
-    safeguard that went unrun reads as one; ``objective`` is the fallback for
-    an entry that declared nothing usable, and is also what the rollup charges
-    every such entry as, at weight 1.0.
+    evaluates, yet it still resolves in the rollup: it withholds the signal
+    its declared role and severity feed, or fails the catastrophic gate
+    closed. Without a row for it a viewer would see a withheld score next to
+    an all-green check list. Role and severity are the ones
+    :func:`~devops_bench.core.score_keys.parse_error_class` routed it to, so
+    the row agrees with the rollup; a non-mapping item becomes a bare objective.
     """
     rows: list[CheckRow] = []
     for item in errors or []:
         if not isinstance(item, Mapping):
+            rows.append(
+                CheckRow(
+                    name=_text(item),
+                    role="objective",
+                    status="error",
+                    reason=f"not evaluated: {_text(item)}",
+                )
+            )
             continue
+        kind = score_keys.parse_error_class(item)
         rows.append(
             CheckRow(
                 name=_text(item.get("name")),
@@ -339,8 +376,8 @@ def _parse_error_rows(errors: Any) -> list[CheckRow]:
                 description=_text(item.get("description")),
                 group=_text(item.get("group")),
                 failure_hint=_text(item.get("failure_hint")),
-                role=_text(item.get("role")) or "objective",
-                severity=_text(item.get("severity")),
+                role="objective" if kind == "objective" else "safeguard",
+                severity="" if kind == "objective" else kind,
                 status="error",
                 reason=f"not evaluated: {_text(item.get('reason'))}",
             )
@@ -382,6 +419,9 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         tokens = normalize_tokens(record.get("tokens"))
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
+        # Per-record: an exempt task in a sandboxed arm reads False; absent or null stays None.
+        raw_sandboxed = record.get("sandboxed")
+        sandboxed = raw_sandboxed if isinstance(raw_sandboxed, bool) else None
         task_meta = record.get("task_metadata")
         if not isinstance(task_meta, Mapping):
             task_meta = {}
@@ -391,6 +431,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 model=manifest.model,
                 harness=manifest.harness,
                 augmentation=list(manifest.augmentation),
+                reasoning_effort=manifest.reasoning_effort,
                 run_id=manifest.run_id,
                 t=manifest.t,
                 task_folder=record.get("folder", "") or "",
@@ -408,6 +449,9 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 recoverable_safety_score=_first_score(scores, _RECOVERABLE_KEYS),
                 catastrophic=bool(catastrophic_kinds),
                 catastrophic_kinds=catastrophic_kinds,
+                catastrophic_unresolved=score_keys.failed_closed(
+                    (scores or {}).get(score_keys.VERIFICATION_CATASTROPHIC_KEY)
+                ),
                 scoring_version=_scoring_version(scores),
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
                 latency_sec=float(record.get("latency") or 0.0),
@@ -419,6 +463,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 total_tokens=tokens.total,
                 status=record.get("status", "") or "",
                 validated=bool(record.get("validated", False)),
+                sandboxed=sandboxed,
             )
         )
     return rows

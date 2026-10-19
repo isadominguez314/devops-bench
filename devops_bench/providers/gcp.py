@@ -21,18 +21,25 @@ from typing import Any
 from devops_bench.core import (
     ClusterInfo,
     ConfigError,
+    ImpersonationError,
     NetworkPlan,
     SandboxError,
     get_bool,
     get_env,
     get_logger,
 )
+from devops_bench.core.model_providers import mint_impersonated_token
 from devops_bench.core.subprocess import run
 from devops_bench.providers.base import PROVIDERS, Provider, ResolveContext
 
 __all__ = ["GcpProvider"]
 
 _log = get_logger("providers.gcp")
+
+_LIFETIME_EXTENSION_POLICY = "constraints/iam.allowServiceAccountCredentialLifetimeExtension"
+# Impersonation's ceiling without that org policy.
+_DEFAULT_TOKEN_LIFETIME_SEC = 3600
+_REFUSAL = "refusing to run the agent without the credential its task needs"
 
 
 def _context_name(project: str, location: str, cluster_name: str) -> str:
@@ -117,7 +124,13 @@ class GcpProvider(Provider):
             )
 
         return ClusterInfo.from_dict(
-            {"name": cluster_name, "location": location, "project": project}
+            {
+                "name": cluster_name,
+                "location": location,
+                "project": project,
+                # Only stacks whose task makes its own cloud API calls set this.
+                "agent_cloud_identity": (outputs or {}).get("agent_cloud_identity"),
+            }
         )
 
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
@@ -140,6 +153,55 @@ class GcpProvider(Provider):
                 cluster_info.project, cluster_info.location, cluster_info.name
             )
         )
+
+    def sandbox_cloud_credential_env(
+        self,
+        cluster_info: ClusterInfo,
+        *,
+        lifetime_sec: int | None = None,
+        agent_timeout_sec: float | None = None,
+    ) -> dict[str, str]:
+        """Mint a token by impersonating the task's identity host-side; raises when it cannot.
+
+        Lifetimes past an hour need the lifetime-extension org policy. Refused, the mint
+        falls back to an hour only if that still covers ``agent_timeout_sec``; else it raises.
+        """
+        identity = cluster_info.agent_cloud_identity
+        if not identity:
+            return {}
+        lifetime = lifetime_sec or _DEFAULT_TOKEN_LIFETIME_SEC
+        try:
+            token = mint_impersonated_token(identity, lifetime_sec=lifetime)
+        except ImpersonationError as exc:
+            # A refusal past an hour is the missing lifetime-extension org policy.
+            if not exc.refused or lifetime <= _DEFAULT_TOKEN_LIFETIME_SEC:
+                raise SandboxError(f"{exc}; {_REFUSAL}") from exc
+            if agent_timeout_sec is not None and agent_timeout_sec > _DEFAULT_TOKEN_LIFETIME_SEC:
+                # The container cannot refresh it, so an hour would expire mid-run; refuse now.
+                raise SandboxError(
+                    f"{exc}; a {_DEFAULT_TOKEN_LIFETIME_SEC}s credential would expire before the "
+                    f"agent's {int(agent_timeout_sec)}s timeout and the container cannot refresh "
+                    f"it — grant {_LIFETIME_EXTENSION_POLICY} or shorten the timeout; {_REFUSAL}"
+                ) from exc
+            _log.warning(
+                "%s; retrying at %ds, which covers the agent's timeout but not the slack after it",
+                exc,
+                _DEFAULT_TOKEN_LIFETIME_SEC,
+            )
+            lifetime = _DEFAULT_TOKEN_LIFETIME_SEC
+            try:
+                token = mint_impersonated_token(identity, lifetime_sec=lifetime)
+            except ImpersonationError as retry_exc:
+                raise SandboxError(f"{retry_exc}; {_REFUSAL}") from retry_exc
+        _log.info("minted a %ds cloud credential for the sandboxed agent as %s", lifetime, identity)
+        env = {
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": token,
+            "GOOGLE_OAUTH_ACCESS_TOKEN": token,
+        }
+        if cluster_info.project:
+            # Not GOOGLE_CLOUD_PROJECT: the agent overlay uses it to route model calls.
+            env["CLOUDSDK_CORE_PROJECT"] = cluster_info.project
+        return env
 
     def cleanup(
         self,

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,7 +40,7 @@ class _DummyAgent(AgentHarness):
         raise NotImplementedError
 
 
-def _complete_spec(tmp_path: Path, **overrides) -> sandbox.SandboxSpec:
+def _complete_spec(tmp_path: Path, **overrides: object) -> sandbox.SandboxSpec:
     """A fully-populated spec rooted in ``tmp_path``."""
     workspace = tmp_path / "workspace-abc123"
     workspace.mkdir(exist_ok=True)
@@ -101,6 +103,65 @@ def test_container_name_for_workspace_differs_per_workspace() -> None:
     a = sandbox.container_name_for_workspace(Path("/tmp/workspace-a"))
     b = sandbox.container_name_for_workspace(Path("/tmp/workspace-b"))
     assert a != b
+
+
+def test_image_digest_prefers_the_repo_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """RepoDigests is the cross-host identity; the local Id is only the never-pushed fallback."""
+    inspected = [
+        {
+            "Id": "sha256:aaaa",
+            "RepoDigests": ["registry.example/agent-sandbox@sha256:bbbb"],
+        }
+    ]
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        assert argv == ["docker", "image", "inspect", "agent-sandbox:v1"]
+        return SimpleNamespace(returncode=0, stdout=json.dumps(inspected), stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    assert sandbox.image_digest("agent-sandbox:v1") == (
+        "registry.example/agent-sandbox@sha256:bbbb"
+    )
+
+
+def test_image_digest_falls_back_to_the_local_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps([{"Id": "sha256:aaaa", "RepoDigests": []}]), stderr=""
+        )
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    assert sandbox.image_digest("agent-sandbox:dev") == "sha256:aaaa"
+
+
+def _unknown_image(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(returncode=1, stdout="", stderr="No such image")
+
+
+def _malformed(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    return SimpleNamespace(returncode=0, stdout="not-json", stderr="")
+
+
+def _missing_runtime(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    raise FileNotFoundError("docker")
+
+
+def _wedged_daemon(argv: list[str], **kwargs: object) -> SimpleNamespace:
+    assert kwargs.get("timeout"), "inspect must be bounded"
+    raise sandbox.SubprocessError(argv, returncode=-1, stdout="", stderr="")
+
+
+@pytest.mark.parametrize(
+    "fake_run",
+    [_unknown_image, _malformed, _missing_runtime, _wedged_daemon],
+    ids=["unknown-image", "malformed-output", "missing-runtime", "timeout"],
+)
+def test_image_digest_never_raises(
+    monkeypatch: pytest.MonkeyPatch, fake_run: Callable[..., SimpleNamespace]
+) -> None:
+    """Every failure mode yields None rather than raising."""
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    assert sandbox.image_digest("nope:latest") is None
 
 
 def test_kill_container_invokes_docker_kill_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -543,6 +604,16 @@ def test_wrap_argv_core_shape(tmp_path: Path) -> None:
     assert argv[-4:] == ["agent-image", "gemini", "-p", "hi"]
 
 
+def test_wrap_argv_launches_the_pinned_digest_over_the_tag(tmp_path: Path) -> None:
+    """The reference docker runs is the one the manifest records; the tag alone can move."""
+    spec = _complete_spec(tmp_path, image_digest="agent-image@sha256:feed")
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["gemini", "-p", "hi"])
+    assert argv[-4] == "agent-image@sha256:feed"
+    assert "agent-image" not in argv[:-4]
+    unpinned = sandbox.SandboxExecutor(_complete_spec(tmp_path)).wrap_argv(["gemini"])
+    assert unpinned[-2] == "agent-image"
+
+
 def test_wrap_argv_container_owned_env_flags_come_last(tmp_path: Path) -> None:
     """Defense in depth: the executor's own ``-e HOME``/``-e KUBECONFIG`` trail every
     overlay flag, so last-one-wins keeps them authoritative."""
@@ -561,6 +632,88 @@ def test_wrap_argv_never_forwards_denied_env(tmp_path: Path) -> None:
     joined = " ".join(argv)
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in joined
     assert "BENCH_AGENT_SANDBOX" not in joined
+
+
+def test_wrap_argv_names_the_spec_cloud_credential_env_without_its_value(tmp_path: Path) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={
+            "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok",
+            "GOOGLE_OAUTH_ACCESS_TOKEN": "tok",
+        },
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy", "-p", "hi"])
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN" in argv
+    assert "GOOGLE_OAUTH_ACCESS_TOKEN" in argv
+    assert "tok" not in " ".join(argv)
+    # Container-owned env still trails it, so it can never repoint HOME.
+    assert argv.index("HOME=/workspace/home") > argv.index("CLOUDSDK_AUTH_ACCESS_TOKEN")
+
+
+def test_wrap_argv_drops_container_owned_names_from_the_cloud_credential_env(
+    tmp_path: Path,
+) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        cloud_credential_env={"HOME": "/elsewhere", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"},
+    )
+    argv = sandbox.SandboxExecutor(spec).wrap_argv(["agy"])
+    assert argv.count("-e") == 3  # the token name, then HOME and KUBECONFIG
+    assert "HOME=/workspace/home" in argv
+    assert "CLOUDSDK_AUTH_ACCESS_TOKEN" in argv
+
+
+def test_executor_run_hands_the_cloud_credential_value_to_the_docker_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _complete_spec(tmp_path, cloud_credential_env={"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"})
+    seen: dict = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        if argv[:2] == ["docker", "run"]:
+            seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(sandbox, "run", fake_run)
+    sandbox.SandboxExecutor(spec).run(["agy"], extra_env={"FOO": "bar"}, check=False)
+
+    assert seen["extra_env"] == {"FOO": "bar", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
+
+
+def test_executor_run_refuses_an_overlay_that_collides_with_the_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _complete_spec(
+        tmp_path,
+        env_allowlist=("CLOUDSDK_CORE_PROJECT",),
+        cloud_credential_env={"CLOUDSDK_CORE_PROJECT": "bench-proj"},
+    )
+    monkeypatch.setattr(sandbox, "run", lambda *a, **k: pytest.fail("must not launch"))
+    with pytest.raises(SandboxError, match=r"both set \['CLOUDSDK_CORE_PROJECT'\]"):
+        sandbox.SandboxExecutor(spec).run(
+            ["agy"], extra_env={"CLOUDSDK_CORE_PROJECT": "vertex-proj"}, check=False
+        )
+
+
+def test_executor_filters_the_cloud_credential_once_per_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    spec = _complete_spec(
+        tmp_path, cloud_credential_env={"HOME": "/elsewhere", "CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
+    )
+    monkeypatch.setattr(
+        sandbox, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr="")
+    )
+    with caplog.at_level("WARNING"):
+        sandbox.SandboxExecutor(spec).run(["agy"], check=False)
+    # wrap_argv and the client env share one filtered copy, so one warning, not two.
+    assert sum("HOME" in r.message and "container-owned" in r.message for r in caplog.records) == 1
+
+
+def test_sandbox_spec_repr_hides_the_cloud_credential(tmp_path: Path) -> None:
+    spec = _complete_spec(tmp_path, cloud_credential_env={"CLOUDSDK_AUTH_ACCESS_TOKEN": "ya29.x"})
+    assert "ya29.x" not in repr(spec)
+    assert "cloud_credential_env" not in repr(spec)
 
 
 def test_wrap_argv_mounts_fixtures_read_write(tmp_path: Path) -> None:

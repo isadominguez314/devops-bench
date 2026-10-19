@@ -505,3 +505,68 @@ def test_none_truth_table(checks: list[dict[str, Any]], expected: str) -> None:
     entry = _assert_entry({"type": "none", "checks": checks})
     result = VerifierAgent().run_entry(entry, timeout_sec=30)
     assert result.status == expected
+
+
+# --- a converge round that outlives its deadline never waits out the ceiling (#288) --
+
+
+def _parallel_slow(sleep_for: float) -> Any:
+    """A parallel node whose only child blocks for ``sleep_for`` seconds."""
+    return _assert_entry(
+        {"type": "parallel", "checks": [{"type": "slow", "sleep_for": sleep_for, "name": "s"}]}
+    ).check
+
+
+def test_bounded_round_entered_after_the_deadline_waits_the_grace_not_the_ceiling() -> None:
+    """Regression for #288: ``remaining <= 0`` inside a converge round must not read as assert mode."""
+    agent = VerifierAgent()
+    start = time.monotonic()
+    result = agent._run_parallel(  # noqa: SLF001
+        _parallel_slow(3.0), time.monotonic() - 0.001, single_shot=True, bounded_round=True
+    )
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, "waited for the blocking leaf instead of the handoff grace"
+    assert result.children[0].status == "error"
+    assert "did not complete before the deadline" in (result.children[0].reason or "")
+
+
+def test_assert_mode_parallel_still_waits_for_its_children() -> None:
+    """Without a real deadline (assert mode) the ceiling remains the only backstop."""
+    agent = VerifierAgent()
+    start = time.monotonic()
+    result = agent._run_parallel(  # noqa: SLF001
+        _parallel_slow(0.5), time.monotonic() - 0.001, single_shot=True
+    )
+
+    assert time.monotonic() - start >= 0.5
+    assert result.children[0].reason == "stub", "the leaf's own verdict must come back"
+
+
+def test_bounded_round_flag_reaches_a_parallel_nested_in_a_sequence() -> None:
+    agent = VerifierAgent()
+    seq = _assert_entry(
+        {
+            "type": "sequence",
+            "checks": [{"type": "parallel", "checks": [{"type": "slow", "sleep_for": 3.0}]}],
+        }
+    ).check
+    start = time.monotonic()
+    agent._run_sequence(  # noqa: SLF001
+        seq, time.monotonic() - 0.001, single_shot=True, bounded_round=True
+    )
+    assert time.monotonic() - start < 2.0
+
+
+def test_converge_round_entered_after_the_deadline_is_bounded() -> None:
+    """The exact CI shape: a converge ``any`` round that starts a hair after its deadline."""
+    agent = VerifierAgent()
+    any_node = _assert_entry(
+        {
+            "type": "any",
+            "checks": [{"type": "parallel", "checks": [{"type": "slow", "sleep_for": 3.0}]}],
+        }
+    ).check
+    start = time.monotonic()
+    agent._eval_any_round(any_node, time.monotonic() - 0.001, bound_by_deadline=True)  # noqa: SLF001
+    assert time.monotonic() - start < 2.0

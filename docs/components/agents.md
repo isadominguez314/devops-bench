@@ -61,9 +61,10 @@ it unset to run the agent on whatever model its author configured.
 
 `antigravity` is the exception: it does not go through the shared contract. It
 writes `AGENT_API_KEY` straight onto `GEMINI_API_KEY` and `GOOGLE_API_KEY` and
-maps the model onto `GEMINI_MODEL` (`agents/cli/antigravity/agent.py`), so it is
-Gemini-only in practice — pointing `AGENT_PROVIDER` at another provider will not
-route it.
+passes the model on `agy`'s own `--model` and `--effort` flags, after rewriting
+it into a spelling `agy` accepts (`agents/cli/antigravity/agent.py`; see
+[agy model ids](#agy-model-ids)). It is Gemini-only in practice — pointing
+`AGENT_PROVIDER` at another provider will not route it.
 
 > [!WARNING]
 > **`antigravity` runs with the operator's real `HOME`.** That is deliberate, so
@@ -92,7 +93,8 @@ each harness maps them onto its target.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `AGENT_MODEL` | unset | Model id; flows to the harness's target. |
+| `AGENT_MODEL` | unset | Model id; flows to the harness's target. See [agy model ids](#agy-model-ids) for the one harness that rewrites it. |
+| `AGENT_MODEL_EFFORT` | `high` | Reasoning tier for `antigravity`; ignored by every other harness. One of `low`, `medium`, `high` — an unknown value is rejected rather than passed through. Tiers vary by model; see [agy model ids](#agy-model-ids). |
 | `AGENT_PROVIDER` | unset | Provider key (e.g. `gemini`, `anthropic`, `google-vertex`). |
 | `AGENT_API_KEY` | unset | Routed onto the provider's key env var(s) via the shared contract; omitted for keyless backends (Vertex/Bedrock ADC). |
 | `AGENT_TARGET` | unset | Path to the CLI binary (`gemini` / `oc`). For `adk`, the **import target** of the agent to run (see below); required there. Ignored by `api`. |
@@ -108,6 +110,42 @@ each harness maps them onto its target.
 | `AGENT_ALLOWED_TOOLS` | unset | CSV of pre-approved tool names. |
 | `AGENT_SKILLS_PATHS` | unset | CSV of directories to discover `SKILL.md` files under. |
 | `AGENT_RULES_TEXT` | unset | Operator-brief text handed to the agent. |
+
+### agy model ids
+
+`AGENT_MODEL` is a single value shared by every arm and by the judge, and it is
+normally spelled for Vertex — `gemini-3.1-pro-preview`. The `antigravity`
+harness is the one exception: `agy` does not recognise the `-preview` suffix,
+and it refuses any selection that does not name a reasoning tier exactly once.
+Left alone it exits with `invalid model selection` before the run starts.
+
+So the harness rewrites the id rather than requiring the matrix to respell it —
+respelling `AGENT_MODEL` for that one arm would desynchronise its label from
+every other arm in the same run. `google/gemini-3.1-pro-preview` becomes
+`--model gemini-3.1-pro --effort high`. The flags it runs with are logged
+whenever they differ from `AGENT_MODEL` — including when only a tier was added,
+as for a bare `gemini-3.8-flash`.
+
+The tier is a scoring variable, not a formatting detail: `low` and `high` are
+materially different agents. `high` is the default because the other harnesses
+run their model with no reasoning throttle. Override it with
+`AGENT_MODEL_EFFORT`. The tier a run used is recorded on its manifest and every
+row as `reasoningEffort`, and folded into `setupId` (`…-antigravity-effort-low`),
+so runs at different tiers are separate arms and a re-run at one tier cannot
+replace rows scored at another.
+
+Tiers vary by model, and the harness only checks `AGENT_MODEL_EFFORT` against
+the union of tiers across models. The Flash models take `low`, `medium`, and
+`high`; Gemini 3.1 Pro takes only `low` and `high`, so `medium` on Pro is
+rejected by `agy` itself at startup, before the agent takes any action. The
+default, `high`, is valid for every model.
+
+A tier already spelled into `AGENT_MODEL` is honoured, and `AGENT_MODEL_EFFORT`
+is ignored. A slug suffix is split onto the flag — `gemini-3.1-pro-low`, or the
+Vertex spelling `gemini-3.1-pro-preview-low`, both become
+`--model gemini-3.1-pro --effort low`. The display-name form
+`Gemini 3.1 Pro (Low)` is passed through as `--model` with no `--effort`,
+because `agy` rejects a parenthesised tier and the flag together.
 
 ### Example: gemini CLI with MCP + skills
 
@@ -273,14 +311,15 @@ metadata endpoint when its model credential is missing.
 The agent does **not** get your kubeconfig. Before it starts, the harness
 creates a `bench-agent` ServiceAccount in the `bench-system` namespace, binds it
 to the built-in `edit` role cluster-wide plus a small cluster-scoped supplement
-(namespaces CRUD; nodes, PVs, storage classes, CRDs read-only), mints a
-short-lived token for it, and renders a single-cluster kubeconfig containing
-that token and nothing else. The RBAC deliberately grants no write on
-`rbac.authorization.k8s.io` or `admissionregistration.k8s.io`, so the agent
-cannot grant itself permissions through RBAC objects or remove the admission
-policy below. That closes the direct route, not every route: `edit` itself
-carries permissions that can reach a stronger identity — see [Known gaps in
-the RBAC scope](#known-gaps-in-the-rbac-scope).
+(namespaces CRUD; nodes, PVs, storage classes, CRDs read-only) and, unless the
+task sets `agent_quota_writes: false`, a `ResourceQuota`/`LimitRange` write
+role, mints a short-lived token for it, and renders a single-cluster
+kubeconfig containing that token and nothing else. The RBAC deliberately grants
+no write on `rbac.authorization.k8s.io` or `admissionregistration.k8s.io`, so
+the agent cannot grant itself permissions through RBAC objects or remove the
+admission policy below. That closes the direct route, not every route: `edit`
+itself carries permissions that can reach a stronger identity — see [Known gaps
+in the RBAC scope](#known-gaps-in-the-rbac-scope).
 
 Two consequences worth knowing:
 
@@ -359,8 +398,10 @@ Overlapping controls, applied at the same point:
    `pods/proxy` and `services/proxy` too, because `edit` grants all five and
    these are precisely the namespaces whose pods are legitimately privileged;
    the proxy subresources are an HTTP path into the same pods, arriving as the
-   same `CONNECT`. It does not touch config: a ConfigMap in `kube-system` is a
-   blast-radius question rather than an escape.
+   same `CONNECT`. It matches `ResourceQuota` and `LimitRange` writes as well:
+   the quota role is bound cluster-wide, and a `LimitRange` in `kube-system`
+   would starve the cluster's own pods. It does not touch config: a ConfigMap
+   in `kube-system` is a blast-radius question rather than an escape.
 5. **A fourth policy denying the agent a shell into pods that predate all of
    the above.** Admission only sees requests, so nothing here retracts a pod
    that already exists — and the deployer runs *before* credentials are
@@ -582,6 +623,34 @@ host processes with the operator's own ADC.
 > host-side `GEMINI_API_KEY` is simply absent and the CLI exits reporting that no
 > auth method is set — naming the very variable you exported. Export
 > `AGENT_API_KEY` and the sandboxed run routes it onward for you.
+
+### Task cloud credentials
+
+A task whose work includes cloud API calls beyond `kubectl` can have its stack
+provision a run-unique cloud identity holding only the roles it needs, and
+name it in an `agent_cloud_identity` output. On a sandboxed run the provider
+mints a short-lived credential for that identity host-side and injects it into
+the container; the operator's own credentials never cross. On GCP this is an
+impersonated access token (`CLOUDSDK_AUTH_ACCESS_TOKEN` /
+`GOOGLE_OAUTH_ACCESS_TOKEN`, with `CLOUDSDK_CORE_PROJECT` pinned to the task's
+project), requested with the same budget as the cluster token above. A mint
+failure, a hung `gcloud`, or a provider that cannot mint for a named identity
+fails the run rather than letting the agent run without the credential its
+task depends on. A task that also declares `requires_unsandboxed` runs ambient
+and the identity goes unused, with a warning. Tasks with no such output are
+unaffected.
+
+**Lifetime tradeoff.** The container holds the token as a static variable and
+cannot refresh it, and impersonated tokens are capped at one hour unless the
+project grants `constraints/iam.allowServiceAccountCredentialLifetimeExtension`.
+When a longer request is refused, the harness asks whether an hour still covers
+the agent's `timeout_sec`. If it does (only the slack after the timeout is
+lost), it takes the hour and warns. If it does not, the run fails before the
+agent starts, naming the policy: grant it, or shorten the timeout. The
+alternative, serving the task identity through the metadata emulator so the
+container refreshes on its own, was deliberately not built: the emulator serves
+one identity and the container's `gcloud` reads the static token. Revisit it if
+a task genuinely needs more than an hour of cloud API access; today none does.
 
 ## Adding your own harness
 

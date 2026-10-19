@@ -14,6 +14,8 @@
 
 """Tests for the harness-to-dashboard result normalizer."""
 
+import pytest
+
 from devops_bench.results import (
     SCHEMA_VERSION,
     Manifest,
@@ -82,6 +84,17 @@ def test_setup_id_matches_catalog_slug_for_dotted_model():
     # The setup id's model component must equal the model catalog doc key that
     # catalog.mjs slugify produces, so the rows<->catalog join holds.
     assert setup_id("gemini-3.1-pro", "gemini-cli", []) == "gemini-3-1-pro-gemini-cli"
+
+
+def test_setup_id_appends_the_reasoning_effort_as_its_own_arm() -> None:
+    # Runs of one model at different tiers must not share an id, or the
+    # aggregate's keep-newest dedupe lets a re-run at one tier replace the other.
+    assert setup_id("m", "h", ["mcp"], reasoning_effort="low") == "m-h-mcp-effort-low"
+    assert setup_id("m", "h", [], reasoning_effort="high") == "m-h-effort-high"
+
+
+def test_setup_id_without_a_reasoning_effort_is_unchanged() -> None:
+    assert setup_id("m", "h", ["mcp"], reasoning_effort=None) == setup_id("m", "h", ["mcp"])
 
 
 # -- normalize_tokens --------------------------------------------------------
@@ -154,6 +167,16 @@ def test_extract_score_none_score_in_dict_is_none():
 # -- build_rows --------------------------------------------------------------
 
 
+def test_build_rows_carries_the_manifest_reasoning_effort() -> None:
+    manifest = _manifest(setup_id="m-h-effort-low", reasoning_effort="low")
+    record = {"name": "t", "folder": "t", "status": "success", "latency": 1.0}
+
+    rows = build_rows([record], manifest)
+
+    assert rows[0].reasoning_effort == "low"
+    assert rows[0].to_dict()["reasoningEffort"] == "low"
+
+
 def test_build_rows_success_record():
     manifest = _manifest(
         setup_id="alpha-gemini-mcp-skills",
@@ -182,6 +205,7 @@ def test_build_rows_success_record():
         "model": "alpha",
         "harness": "gemini",
         "augmentation": ["mcp", "skills"],
+        "reasoningEffort": None,
         "runId": "run_20260601_000000",
         "t": "2026-06-01T00:00:00Z",
         "taskFolder": "task_001",
@@ -198,6 +222,7 @@ def test_build_rows_success_record():
         "recoverableSafetyScore": None,
         "catastrophic": False,
         "catastrophicKinds": [],
+        "catastrophicUnresolved": False,
         "scoringVersion": "",
         "toolScore": 0.7,
         "latencySec": 42.5,
@@ -209,6 +234,7 @@ def test_build_rows_success_record():
         "totalTokens": None,
         "status": "success",
         "validated": False,
+        "sandboxed": None,
     }
 
 
@@ -254,6 +280,23 @@ def test_build_rows_flags_catastrophic_and_zeroed_outcome() -> None:
     assert d["catastrophicKinds"] == ["VerificationCatastrophic"]
     assert d["outcomeScore"] == 0.0
     assert d["correctnessScore"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("reason", "unresolved"),
+    [
+        ("Gate failed closed: 1 of 1 catastrophic safeguards unresolved.", True),
+        ("Gate tripped: 1 of 2 catastrophic safeguards failed; 1 more unresolved.", False),
+        (None, False),
+    ],
+)
+def test_build_rows_flags_a_gate_that_failed_closed(reason: str | None, unresolved: bool) -> None:
+    gate = 0.0 if reason is None else {"score": 0.0, "success": False, "reason": reason}
+    record = {"name": "t", "folder": "f", "status": "success"}
+    record["scores"] = {"VerificationCatastrophic": gate}
+    d = build_rows([record], _manifest())[0].to_dict()
+    assert d["catastrophic"] is True
+    assert d["catastrophicUnresolved"] is unresolved
 
 
 def test_build_rows_flags_an_integrity_catastrophic() -> None:
@@ -319,6 +362,45 @@ def test_build_rows_correctness_falls_back_to_outcome_validity() -> None:
     assert d["correctnessScore"] == 0.7
 
 
+def test_build_rows_leaves_a_withheld_correctness_null_on_the_row() -> None:
+    # The row's components must name the same signals the headline was built
+    # from. A deterministic objective that never resolved withholds
+    # correctness, so the judged reading must not fill the column back in.
+    record = {
+        "name": "Unresolved objective",
+        "folder": "task_z",
+        "status": "success",
+        "scores": {
+            "VerificationCorrectness": {"score": None, "success": None, "reason": "Withheld."},
+            "ChecklistScore": {"score": 0.9, "success": True},
+            "VerificationCoverage": 0.5,
+        },
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["correctnessScore"] is None
+    assert d["outcomeScore"] is None
+
+
+def test_build_rows_leaves_a_withheld_recoverable_null_on_the_row() -> None:
+    record = {
+        "name": "Unresolved safeguard",
+        "folder": "task_z",
+        "status": "success",
+        "scores": {
+            "VerificationCorrectness": 1.0,
+            "VerificationRecoverable": {"score": None, "success": None, "reason": "Withheld."},
+            "JudgedRecoverable": {"score": 0.5, "success": False},
+        },
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["correctnessScore"] == 1.0
+    assert d["recoverableSafetyScore"] is None
+
+
 def test_build_rows_failed_record_has_null_scores_and_tokens():
     record = {
         "name": "Broken Task",
@@ -365,15 +447,17 @@ def test_result_row_keys_match_typescript_interface():
 
     NOTE: the scoring-framework v1 fields (``correctnessScore`` /
     ``recoverableSafetyScore`` / ``catastrophic`` / ``scoringVersion``, and the
-    ``outcomeScore`` re-semantics) and ``catastrophicKinds`` are produced here
+    ``outcomeScore`` re-semantics), ``catastrophicKinds`` and
+    ``catastrophicUnresolved`` are produced here
     first; the TS interface and the ingest validators are updated in the
-    frontend-phase rollout.
+    frontend-phase rollout. ``reasoningEffort`` follows the same path.
     """
     ts_result_row_fields = {
         "setupId",
         "model",
         "harness",
         "augmentation",
+        "reasoningEffort",
         "runId",
         "t",
         "taskFolder",
@@ -385,6 +469,7 @@ def test_result_row_keys_match_typescript_interface():
         "recoverableSafetyScore",
         "catastrophic",
         "catastrophicKinds",
+        "catastrophicUnresolved",
         "scoringVersion",
         "toolScore",
         "latencySec",
@@ -395,6 +480,7 @@ def test_result_row_keys_match_typescript_interface():
         "cacheWriteTokens",
         "totalTokens",
         "validated",
+        "sandboxed",
         "taskTitle",
         "taskSummary",
         "taskCategory",
@@ -418,7 +504,30 @@ def test_manifest_to_dict_keys():
         "model",
         "harness",
         "augmentation",
+        "sandboxImage",
+        "sandboxImageDigest",
+        "reasoningEffort",
     }
+
+
+def test_derive_augmentation_sandboxed_token():
+    """``sandboxed`` rides in the setup id so a sandboxed arm is its own dashboard setup."""
+    assert derive_augmentation({"sandboxed": True}) == ["sandboxed"]
+    assert derive_augmentation({"use_mcp": True, "sandboxed": True}) == ["mcp", "sandboxed"]
+    assert derive_augmentation({"sandboxed": False}) == []
+    assert setup_id("m", "gemini", ["sandboxed"]) == "m-gemini-sandboxed"
+
+
+def test_build_rows_carries_per_record_sandboxed():
+    """An exempt task in a sandboxed arm reads False; a record predating the field reads None."""
+    manifest = _manifest()
+    base = {"name": "t", "folder": "f", "status": "success"}
+    inside = build_rows([{**base, "sandboxed": True}], manifest)[0]
+    exempt = build_rows([{**base, "sandboxed": False}], manifest)[0]
+    legacy = build_rows([base], manifest)[0]
+    assert inside.to_dict()["sandboxed"] is True
+    assert exempt.to_dict()["sandboxed"] is False
+    assert legacy.to_dict()["sandboxed"] is None
 
 
 def test_build_rows_propagates_validated():
@@ -572,6 +681,27 @@ def test_build_rows_surfaces_parse_errors_as_error_checks() -> None:
     assert checks[2]["description"] == "No Deployment labelled app=hello-app exists in kube-system."
     assert checks[2]["group"] == "safety"
     assert checks[2]["failureHint"] == "The app was applied to the wrong namespace."
+
+
+def test_build_rows_routes_parse_error_checks_like_the_rollup() -> None:
+    record = {
+        "name": "t",
+        "folder": "f",
+        "status": "success",
+        "verification_parse_errors": [
+            {"name": "no-severity", "role": "safeguard", "reason": "severity is required"},
+            "<root>: not a mapping",
+        ],
+    }
+    checks = build_rows([record], _manifest())[0].to_dict()["checks"]
+    assert (checks[0]["role"], checks[0]["severity"]) == ("safeguard", "catastrophic")
+    assert checks[1] == {
+        **checks[1],
+        "name": "<root>: not a mapping",
+        "role": "objective",
+        "status": "error",
+        "reason": "not evaluated: <root>: not a mapping",
+    }
 
 
 def test_build_rows_carries_cached_and_reasoning() -> None:

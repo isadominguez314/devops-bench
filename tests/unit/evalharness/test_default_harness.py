@@ -20,12 +20,13 @@ import importlib
 import logging
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from devops_bench.agents import AGENTS, AgentHarness
+from devops_bench.agents import AGENTS, AgentConfig, AgentHarness
 from devops_bench.agents.result import AgentResult, ToolCall
 from devops_bench.core import ConfigError, MissingDependencyError
 from devops_bench.core.score_keys import INTEGRITY_CATASTROPHIC_KEY, OUTCOME_SCORE_KEY
@@ -726,11 +727,14 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "cheating_report",
         "documentation",
         "capabilities_granted",
+        "judge",
+        "chaos_driver",
         "verification_parse_errors",
         "verification_report",
         "verification_status",
         "generation_only",
         "validated",
+        "sandboxed",
         "task_metadata",
     }
 )
@@ -772,6 +776,97 @@ def _stub_agent_result() -> AgentResult:
         tokens={"input": 10, "output": 5},
         latency=1.5,
     )
+
+
+def test_records_carry_judge_and_chaos_driver_identity(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``chaos_driver`` comes from the chaos report; ``_score`` stamps the judge it used."""
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    record = harness._build_success_record(  # noqa: SLF001
+        task=_stub_task(),
+        prompt="p",
+        expected_output="e",
+        agent_res=_stub_agent_result(),
+        chaos_report={"status": "success", "driver": {"provider": "google", "model": "chaos-x"}},
+        perf_report={},
+    )
+    assert record["chaos_driver"] == {"provider": "google", "model": "chaos-x"}
+    assert record["judge"] == {}
+    # A fault that never built its driver leaves the field empty, chaos_spec or not.
+    undriven = harness._build_success_record(  # noqa: SLF001
+        task=_stub_task(),
+        prompt="p",
+        expected_output="e",
+        agent_res=_stub_agent_result(),
+        chaos_report={"status": "failed", "error": "port-forward failed"},
+        perf_report={},
+    )
+    assert undriven["chaos_driver"] == {}
+
+    judge = SimpleNamespace(provider="anthropic", client=SimpleNamespace(model_name="judge-x"))
+    failed = {"status": "failed"}
+    with (
+        patch("devops_bench.metrics.get_judge_model", return_value=judge),
+        patch("devops_bench.metrics.evaluate_metrics_batch") as batch,
+    ):
+        harness._score([record, failed])  # noqa: SLF001
+    assert record["judge"] == {"provider": "anthropic", "model": "judge-x"}
+    assert "judge" not in failed
+    batch.assert_called_once()
+
+
+def test_harness_warns_at_init_with_the_configured_judge(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("AGENT_PROVIDER", "gemini")
+    monkeypatch.setenv("AGENT_MODEL", "arm-model")
+    monkeypatch.delenv("JUDGE_MODEL", raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    assert "JUDGE_MODEL unset; the judge is configured as google/arm-model" in caplog.text
+
+
+def test_harness_init_names_the_adapter_default_when_no_model_is_set(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.delenv("JUDGE_MODEL", raising=False)
+    monkeypatch.delenv("AGENT_MODEL", raising=False)
+    monkeypatch.setenv("AGENT_PROVIDER", "gemini")
+
+    with caplog.at_level(logging.WARNING):
+        DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    assert (
+        "JUDGE_MODEL and AGENT_MODEL unset; the judge uses the google adapter's default model"
+        in caplog.text
+    )
+    assert "None" not in caplog.text
+    assert "AGENT_MODEL fallback" not in caplog.text
+
+
+def test_harness_is_quiet_at_init_when_the_judge_is_pinned_or_injected(
+    isolated_env: None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        DefaultEvalHarness(project_id="p", cluster_name="c", judge_model=object())
+        monkeypatch.setenv("JUDGE_MODEL", "judge-x")
+        DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    assert "JUDGE_MODEL unset" not in caplog.text
+
+
+def test_judge_identity_is_empty_when_the_judge_cannot_be_built(isolated_env: None) -> None:
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    record = {"status": "success", "judge": {"stale": "x"}}
+    with (
+        patch("devops_bench.metrics.get_judge_model", side_effect=ConfigError("no judge")),
+        patch("devops_bench.metrics.evaluate_metrics_batch"),
+    ):
+        harness._score([record])  # noqa: SLF001
+    assert record["judge"] == {}
 
 
 def test_success_record_keys_match_golden(isolated_env: None) -> None:
@@ -1114,6 +1209,42 @@ def test_run_fails_fast_on_an_unmigrated_agent_when_sandboxed(
         AGENTS._items.pop("fake-unmigrated", None)  # noqa: SLF001
 
 
+def test_run_calls_the_agent_preflight_before_any_cluster_exists(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An agent's ``sandbox_preflight`` refusal aborts the batch before provisioning."""
+    from devops_bench.core import SandboxError
+
+    seen: list[AgentConfig] = []
+
+    class _PreflightAgent(AgentHarness):
+        supports_sandbox = True
+
+        @classmethod
+        def sandbox_preflight(cls, config: AgentConfig) -> None:
+            seen.append(config)
+            raise SandboxError("host/image mismatch")
+
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            raise NotImplementedError
+
+    def never_provision(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a refused batch must not provision a cluster")
+
+    monkeypatch.setattr(harness_default, "get_deployer", never_provision)
+    AGENTS.register("fake-preflight")(_PreflightAgent)
+    try:
+        harness = _sandboxed_harness(monkeypatch, tmp_path, agent_type="fake-preflight")
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+        with pytest.raises(SandboxError, match="host/image mismatch"):
+            harness.run([task])
+    finally:
+        AGENTS._items.pop("fake-preflight", None)  # noqa: SLF001
+    assert len(seen) == 1
+    assert seen[0].sandbox is not None
+    assert seen[0].sandbox.image == "agent-sandbox:test"
+
+
 def test_exempt_only_batch_skips_the_sandbox_preflight(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1176,8 +1307,9 @@ def test_prepare_sandbox_spec_refuses_without_a_sandbox_opt_in(
         )
 
 
+@pytest.mark.parametrize("quota_writes", [True, False], ids=["granted", "declined"])
 def test_prepare_sandbox_spec_completes_the_skeletal_spec(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, quota_writes: bool
 ) -> None:
     from devops_bench.core import ClusterInfo, NetworkPlan
 
@@ -1189,17 +1321,39 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
         kubectl_context="kind-c1",
     )
     kubeconfig = tmp_path / "creds" / "kubeconfig"
-    provider = object()
+
+    cloud_requests: list[tuple[str, int | None, float | None]] = []
+
+    class _StubProvider:
+        def sandbox_cloud_credential_env(
+            self,
+            cluster_info: ClusterInfo,
+            *,
+            lifetime_sec: int | None = None,
+            agent_timeout_sec: float | None = None,
+        ) -> dict[str, str]:
+            cloud_requests.append((cluster_info.name, lifetime_sec, agent_timeout_sec))
+            return {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
+
+    provider = _StubProvider()
 
     def fake_provision(
-        got_plan: Any, dest_dir: Path, *, token_ttl_sec: int, pod_security: str
+        got_plan: Any,
+        dest_dir: Path,
+        *,
+        token_ttl_sec: int,
+        pod_security: str,
+        quota_writes: bool,
     ) -> Path:
         assert got_plan is plan
         assert dest_dir == tmp_path / "creds"
         # Default 600s agent timeout plus slack: the token must outlast the run.
         assert token_ttl_sec == 1500
         assert pod_security == "baseline"
+        seen_quota_writes.append(quota_writes)
         return kubeconfig
+
+    seen_quota_writes: list[bool] = []
 
     plan_requests: list[tuple[Any, str]] = []
 
@@ -1223,9 +1377,16 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     workspace.mkdir()
     (tmp_path / "creds").mkdir()
     spec = harness._prepare_sandbox_spec(  # noqa: SLF001
-        workspace, tmp_path / "creds", ClusterInfo(name="c1"), provider, "baseline"
+        workspace,
+        tmp_path / "creds",
+        ClusterInfo(name="c1"),
+        provider,
+        "baseline",
+        quota_writes=quota_writes,
     )
 
+    # The task's quota decision reaches provisioning as given, not as the default.
+    assert seen_quota_writes == [quota_writes]
     # The sandbox home exists on the host before the agent runs (it is both
     # the container HOME mountpoint and the detection inventory root).
     assert (workspace / "home").is_dir()
@@ -1237,6 +1398,10 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     # The run's own provider and cluster build the plan (and through it the
     # kubeconfig), never the ambient current-context.
     assert plan_requests == [(provider, "c1")]
+    # The provider's minted cloud credential lands on the spec, keyed to this
+    # run's cluster, sized to the cluster token's budget, with the timeout as the floor.
+    assert cloud_requests == [("c1", 1500, 600)]
+    assert spec.cloud_credential_env == {"CLOUDSDK_AUTH_ACCESS_TOKEN": "tok"}
 
 
 def test_prepare_sandbox_spec_tears_down_when_completion_fails(
@@ -1343,6 +1508,7 @@ def test_run_one_tears_down_sandbox_credentials_in_its_finally(
             pod_security: str,
             *,
             with_cluster: bool = True,
+            quota_writes: bool = True,
         ) -> Any:
             (workspace_path / "home").mkdir(parents=True, exist_ok=True)
             return replace(
@@ -1374,6 +1540,169 @@ def test_run_one_tears_down_sandbox_credentials_in_its_finally(
             assert record["sandbox_teardown_clean"] is False
     finally:
         AGENTS._items.pop("fake-sandbox-teardown", None)  # noqa: SLF001
+
+
+def test_run_one_hands_the_tasks_sandbox_decisions_to_the_spec(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declining task reaches ``_prepare_sandbox_spec`` as it declared itself, so
+    dropping either keyword from ``_run_one`` fails here rather than silently
+    re-granting readonly-quota's agent the quota."""
+    from dataclasses import replace
+
+    from devops_bench.core import NetworkPlan
+
+    class _SandboxReadyAgent(_WorkspaceWritingAgent):
+        supports_sandbox = True
+
+    AGENTS.register("fake-sandbox-decisions")(_SandboxReadyAgent)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-sandbox-decisions", no_infra=True
+        )
+        seen: list[tuple[str, bool]] = []
+
+        def fake_prepare(
+            workspace_path: Path,
+            creds_dir: Path,
+            cluster_info: Any,
+            provider: Any,
+            pod_security: str,
+            *,
+            with_cluster: bool = True,
+            quota_writes: bool = True,
+        ) -> Any:
+            seen.append((pod_security, quota_writes))
+            (workspace_path / "home").mkdir(parents=True, exist_ok=True)
+            return replace(
+                harness.build_agent_config().sandbox,
+                network=NetworkPlan(kubectl_context="kind-c1"),
+                workspace=workspace_path,
+                kubeconfig=creds_dir / "kubeconfig",
+            )
+
+        monkeypatch.setattr(harness, "_prepare_sandbox_spec", fake_prepare)
+        monkeypatch.setattr(
+            harness_default.agent_credentials,
+            "teardown_agent_credentials",
+            lambda context=None: True,
+        )
+        task = Task.from_dict(
+            {
+                "task_id": "t",
+                "name": "demo",
+                "prompt": "p",
+                "agent_pod_security": "privileged",
+                "agent_quota_writes": False,
+            }
+        )
+        run_dir = tmp_path / "run_1"
+        run_dir.mkdir()
+
+        record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
+
+        assert record["status"] == "success"
+        assert seen == [("privileged", False)]
+    finally:
+        AGENTS._items.pop("fake-sandbox-decisions", None)  # noqa: SLF001
+
+
+def test_write_run_artifacts_records_sandbox_provenance(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The arm's sandboxing lands in the setup id and the image is pinned by digest."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    resolved: list[str] = []
+    monkeypatch.setattr(
+        harness_default.agent_sandbox,
+        "image_digest",
+        lambda image: resolved.append(image) or f"{image}@sha256:feed",
+    )
+    written: dict[str, Any] = {}
+    monkeypatch.setattr(
+        harness.reporter, "write_rows", lambda run_dir, rows: written.update(rows=rows)
+    )
+    monkeypatch.setattr(
+        harness.reporter, "write_manifest", lambda run_dir, m: written.update(manifest=m)
+    )
+
+    # Pinned once at batch start, not re-read from the mutable tag at report time.
+    harness._pin_sandbox_image()  # noqa: SLF001
+    harness._pin_sandbox_image()  # noqa: SLF001
+    assert resolved == ["agent-sandbox:test"]
+    record = {"name": "t", "folder": "f", "status": "success", "sandboxed": True}
+    harness._write_run_artifacts(tmp_path, [record])  # noqa: SLF001
+    assert resolved == ["agent-sandbox:test"]
+
+    manifest = written["manifest"]
+    assert "sandboxed" in manifest["augmentation"]
+    assert "sandboxed" in manifest["setupId"]
+    assert manifest["sandboxImage"] == "agent-sandbox:test"
+    assert manifest["sandboxImageDigest"] == "agent-sandbox:test@sha256:feed"
+    assert written["rows"][0]["sandboxed"] is True
+
+
+def test_run_pins_the_sandbox_image_before_the_first_task(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The digest the manifest records is the image the batch started on."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "image_digest", lambda image: f"{image}@sha256:feed"
+    )
+    harness.run([])
+    assert harness.build_agent_config().sandbox.image_digest == "agent-sandbox:test@sha256:feed"
+
+
+def test_write_run_artifacts_stays_baseline_when_unsandboxed(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("BENCH_AGENT_SANDBOX", raising=False)
+    harness = DefaultEvalHarness(
+        project_id="p", cluster_name="c", results_root=str(tmp_path / "results")
+    )
+    written: dict[str, Any] = {}
+    monkeypatch.setattr(harness.reporter, "write_rows", lambda run_dir, rows: None)
+    monkeypatch.setattr(
+        harness.reporter, "write_manifest", lambda run_dir, m: written.update(manifest=m)
+    )
+
+    harness._write_run_artifacts(tmp_path, [{"name": "t", "folder": "f", "status": "success"}])  # noqa: SLF001
+
+    manifest = written["manifest"]
+    assert "sandboxed" not in manifest["augmentation"]
+    assert manifest["sandboxImage"] is None
+    assert manifest["sandboxImageDigest"] is None
+
+
+def test_empty_record_carries_the_task_scoped_sandboxed_flag(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exempt task inside a sandboxed arm records False while its siblings record True."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+
+    assert harness._empty_record(task)["sandboxed"] is False  # noqa: SLF001
+    assert harness._empty_record(task, sandboxed=True)["sandboxed"] is True  # noqa: SLF001
+
+
+def test_failed_record_leaves_sandboxed_unknown_when_never_provisioned(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provisioning failure is not an exemption: ``None``, never ``False``."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+    exempt = Task.from_dict(
+        {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+    )
+    spec = harness_default.agent_sandbox.SandboxSpec(image="agent-sandbox:test")
+    assert harness._sandboxed_outcome(task, None, False) is None  # noqa: SLF001
+    assert harness._sandboxed_outcome(task, spec, False) is None  # noqa: SLF001
+    assert harness._sandboxed_outcome(task, spec, True) is True  # noqa: SLF001
+    assert harness._sandboxed_outcome(exempt, None, True) is False  # noqa: SLF001
+    record = harness._build_failed_record(task, RuntimeError("no plan"), sandboxed=None)  # noqa: SLF001
+    assert record["sandboxed"] is None
 
 
 def test_sandbox_credential_teardown_only_runs_when_the_cluster_survives(
@@ -1461,38 +1790,24 @@ def test_inventory_sandbox_home_records_rules_per_task(
     assert harness._inventory_sandbox_home("fresh-task", fresh_home) == ()  # noqa: SLF001
 
 
-def test_inventory_covers_fixture_mounts_at_their_container_paths(
+def test_fixture_mounts_are_not_inventoried(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fixture mounts only exist inside the container, so each mounted name gets a
-    container-path rule and the prompt filter drops exactly the named ones."""
-    import re
-
-    from devops_bench.cheat_detection import filter_rules_for_prompt
-
+    """A mount is this run's own input; only real sandbox-home leftovers are covered."""
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
     harness = _sandboxed_harness(monkeypatch, tmp_path)
 
+    # Mounts never land in the host-side home, so a mount-only run has no rules.
     home = tmp_path / "ws" / "home"
     home.mkdir(parents=True)
-    rules = harness._inventory_sandbox_home(  # noqa: SLF001
-        "t",
-        home,
-        {
-            "/home/op/opa-repo-c1.git": "/workspace/home/opa-repo-c1.git",
-            "/home/op/stale-notes-c1.md": "/workspace/home/stale-notes-c1.md",
-        },
-    )
-    assert {r.source for r in rules} == {"opa-repo-c1.git", "stale-notes-c1.md"}
-    # The rules match the container-side spellings the trajectory records.
-    repo_rule = next(r for r in rules if r.source == "opa-repo-c1.git")
-    assert re.search(repo_rule.patterns[0], "cat /workspace/home/opa-repo-c1.git/config")
-    assert re.search(repo_rule.patterns[0], "git clone ~/opa-repo-c1.git")
+    assert harness._inventory_sandbox_home("t", home) == ()  # noqa: SLF001
 
-    # A prompt naming the repo authorizes it for that record; the mount the
-    # prompt never asked for (a leftover swept in by the token glob) stays.
-    surviving = filter_rules_for_prompt(rules, "Fix the policy and push to '~/opa-repo-c1.git'.")
-    assert {r.source for r in surviving} == {"stale-notes-c1.md"}
+    # A leftover the run did not mount is still covered.
+    dirty = tmp_path / "ws2" / "home"
+    dirty.mkdir(parents=True)
+    (dirty / "stale-notes.md").write_text("a prior run's distinctive leftover line\n" * 3)
+    rules = harness._inventory_sandbox_home("t2", dirty)  # noqa: SLF001
+    assert "stale-notes.md" in {r.source for r in rules}
 
 
 @pytest.mark.parametrize("parallel", [True, False])
@@ -1714,6 +2029,49 @@ def test_sandbox_exempt_task_gets_the_ambient_inventory(
     assert "prior-run-artifact" in report["categories"]
 
 
+def test_sandbox_exempt_task_warns_when_its_stack_also_names_a_cloud_identity(
+    isolated_env: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The identity goes unused on an exempt task; say so instead of minting nothing silently."""
+    from devops_bench.core import ClusterInfo
+
+    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
+    real_get_deployer = harness_default.get_deployer
+
+    def _with_identity(*args: Any, **kwargs: Any) -> Any:
+        deployer = real_get_deployer(*args, **kwargs)
+        monkeypatch.setattr(
+            deployer,
+            "get_cluster_info",
+            lambda: ClusterInfo(name="c", agent_cloud_identity="rot-x@p.iam.gserviceaccount.com"),
+        )
+        return deployer
+
+    monkeypatch.setattr(harness_default, "get_deployer", _with_identity)
+
+    class _SandboxAwareWriter(_WorkspaceWritingAgent):
+        supports_sandbox = True
+
+    AGENTS.register("fake-exempt-writer")(_SandboxAwareWriter)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-exempt-writer", no_infra=True
+        )
+        task = Task.from_dict(
+            {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+        )
+        with caplog.at_level(logging.WARNING):
+            harness.run([task])
+    finally:
+        AGENTS._items.pop("fake-exempt-writer", None)  # noqa: SLF001
+
+    assert "also names agent_cloud_identity rot-x@p.iam.gserviceaccount.com" in caplog.text
+
+
 def test_build_agent_config_rejects_a_spec_together_with_exempt(isolated_env: None) -> None:
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
     with pytest.raises(ValueError, match="mutually exclusive"):
@@ -1753,3 +2111,17 @@ def test_no_other_task_opts_out_of_the_sandbox() -> None:
         if (_yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("requires_unsandboxed")
     ]
     assert exempt == ["secret-rotation"]
+
+
+def test_only_readonly_quota_declines_quota_writes() -> None:
+    """Loaded through the real loader so a dropped key cannot pass as the default."""
+    import pathlib
+
+    from devops_bench.tasks.loader import FileSystemTaskLoader
+
+    declining = [
+        p.parent.name
+        for p in sorted(pathlib.Path("tasks").glob("*/*/task.yaml"))
+        if not all(t.agent_quota_writes for t in FileSystemTaskLoader().load_tasks(str(p)))
+    ]
+    assert declining == ["readonly-quota"]

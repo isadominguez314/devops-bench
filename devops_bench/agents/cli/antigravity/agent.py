@@ -19,9 +19,10 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from devops_bench import core
 from devops_bench.agents import base
@@ -80,12 +81,109 @@ def _read_db_tokens(db_path: pathlib.Path) -> dict | None:
     return None
 
 
-def _resolve_model_name(model: str) -> str:
-    """Resolve a provider-qualified model id to the bare name ``agy`` expects.
+# Antigravity names the reasoning tier separately from the model and has no
+# untiered form. This is the union across models, not a per-model list: a tier
+# the chosen model lacks is left for the CLI to reject at startup.
+_AGY_EFFORT_TIERS: tuple[str, ...] = ("low", "medium", "high")
 
-    e.g. ``"google/gemini-3.5-flash"`` -> ``"gemini-3.5-flash"``.
+# Vertex publishes preview model ids with this suffix. Antigravity's catalogue
+# does not carry it and rejects the suffixed id outright, with or without --effort.
+_VERTEX_PREVIEW_SUFFIX: str = "-preview"
+
+# A display-name selection ("Gemini 3.1 Pro (Low)") already names its tier, and
+# the CLI errors if --effort is passed alongside one. Recognize it so it survives
+# untouched: it is the spelling ``agy --help`` steers operators towards.
+_DISPLAY_TIER_RE: re.Pattern[str] = re.compile(
+    rf"\(({'|'.join(map(re.escape, _AGY_EFFORT_TIERS))})\)\s*$", re.IGNORECASE
+)
+
+# The tier is a scoring variable, not a formatting detail -- `low` and `high`
+# are materially different agents. `high` is the least surprising default
+# because the other harnesses run their model with no reasoning throttle, so
+# anything lower would hand the Antigravity arm a handicap that reads as a capability
+# gap in the results rather than as the configuration choice it is.
+_DEFAULT_AGY_EFFORT: str = "high"
+_EFFORT_ENV: str = "AGENT_MODEL_EFFORT"
+
+
+def _default_effort() -> str:
+    """Resolve the reasoning tier to request when the model id names none.
+
+    Returns:
+        The tier from ``AGENT_MODEL_EFFORT``, or ``high``.
+
+    Raises:
+        core.ConfigError: If ``AGENT_MODEL_EFFORT`` names a tier no Antigravity
+            model offers. Rejected here rather than passed through, so a typo
+            fails on the misconfiguration itself instead of surfacing as the
+            CLI's own startup error. A real tier the chosen model lacks
+            (``medium`` on Gemini 3.1 Pro) is not caught here; Antigravity
+            rejects it at startup, before the agent takes any action.
     """
-    return model.split("/")[-1]
+    effort = os.environ.get(_EFFORT_ENV, "").strip()
+    if not effort:
+        return _DEFAULT_AGY_EFFORT
+    if effort.lower() not in _AGY_EFFORT_TIERS:
+        raise core.ConfigError(
+            f"{_EFFORT_ENV}={effort!r} is not a reasoning tier Antigravity accepts "
+            f"(known: {', '.join(_AGY_EFFORT_TIERS)})"
+        )
+    return effort.lower()
+
+
+class _ModelSelection(NamedTuple):
+    """A configured model id resolved for ``agy``."""
+
+    model: str
+    effort: str | None  # --effort value; None when ``model`` names its own tier
+    tier: str  # the tier in force, whichever spelling named it
+
+
+def _resolve_model_name(model: str) -> _ModelSelection:
+    """Resolve a matrix model id to the ``(model, effort)`` pair ``agy`` expects.
+
+    ``AGENT_MODEL`` is one value shared by every arm and by the judge, and it is
+    spelled for Vertex -- ``google/gemini-3.1-pro-preview``. Antigravity accepts
+    neither the provider prefix nor the ``-preview`` suffix, and refuses any
+    selection that does not name a reasoning tier exactly once. Normalizing here
+    confines the quirk to the one harness that has it; respelling ``AGENT_MODEL``
+    instead would desynchronize this arm's label from every other arm in the matrix.
+
+    e.g. ``"google/gemini-3.1-pro-preview"`` -> ``("gemini-3.1-pro", "high", "high")``,
+    and ``"Gemini 3.1 Pro (Low)"`` -> ``("Gemini 3.1 Pro (Low)", None, "low")``.
+
+    Args:
+        model: The configured model id, optionally provider-qualified.
+
+    Returns:
+        The id to pass as ``--model``, the tier to pass as ``--effort`` -- or
+        ``None`` when the id already names its own, in which case ``--effort``
+        must be omitted or the CLI rejects the pair -- and the tier in force.
+    """
+    name = model.split("/")[-1].strip()
+    display = _DISPLAY_TIER_RE.search(name)
+    if display:
+        return _ModelSelection(name, None, display.group(1).lower())
+    # The tier comes off first: a tier suffix would otherwise hide -preview
+    # from the check below, and Antigravity rejects any id that still carries it.
+    effort: str | None = None
+    for tier in _AGY_EFFORT_TIERS:
+        if name.lower().endswith(f"-{tier}"):
+            name, effort = name[: -len(tier) - 1], tier
+            break
+    if name.endswith(_VERTEX_PREVIEW_SUFFIX):
+        name = name[: -len(_VERTEX_PREVIEW_SUFFIX)]
+    effort = effort or _default_effort()
+    return _ModelSelection(name, effort, effort)
+
+
+def _effective_effort(model: str) -> str | None:
+    """The tier a run of ``model`` uses, whichever of the three spellings names it."""
+    try:
+        return _resolve_model_name(model).tier
+    except core.ConfigError:
+        # A bad AGENT_MODEL_EFFORT already failed the run itself; the arm just goes unlabelled.
+        return None
 
 
 def _build_settings(
@@ -96,7 +194,16 @@ def _build_settings(
     *,
     skills_enabled: bool = False,
 ) -> dict:
-    """Assemble the Antigravity ``settings.json`` payload for a run."""
+    """Assemble the Antigravity ``settings.json`` payload for a run.
+
+    ``model`` must already be the resolved spelling from
+    ``_resolve_model_name``, identical to the one passed as ``--model``. agy
+    does not validate ``defaultModel`` -- an unknown value there is ignored in
+    silence and the run falls back to a default model -- so the flag's loud
+    validation is the only guard, and it only guards a value settings agrees
+    with. The tier is deliberately not written here: it rides on ``--effort``,
+    and agy exposes no verified settings key for it.
+    """
     settings: dict = {}
     servers = cli_capabilities.build_mcp_servers(mcp_servers)
     if servers:
@@ -104,7 +211,7 @@ def _build_settings(
     if skills_enabled:
         settings["experimental"] = {"skills": True}
     if model:
-        settings["modelConfigs"] = {"defaultModel": _resolve_model_name(model)}
+        settings["modelConfigs"] = {"defaultModel": model}
 
     # The gcp block is what the cloud tools read.
     if project or location:
@@ -132,8 +239,10 @@ def _build_env(config: agents_config.AgentConfig) -> dict[str, str]:
     if config.api_key:
         overlay["GEMINI_API_KEY"] = config.api_key
         overlay["GOOGLE_API_KEY"] = config.api_key
-    if config.model:
-        overlay["GEMINI_MODEL"] = _resolve_model_name(config.model)
+
+    # No GEMINI_MODEL here. It is a Gemini CLI variable; Antigravity ignores it
+    # (a garbage value raises no error, a valid one does not change the model the
+    # run reports). The model travels on --model, the only spelling it validates.
 
     if config.extra_env:
         overlay.update(config.extra_env)
@@ -177,6 +286,11 @@ class AgyCliAgent(base.AgentHarness):
         self.skills = caps.skills
         self.rules = caps.rules
 
+    @classmethod
+    def reasoning_effort(cls, config: agents_config.AgentConfig) -> str | None:
+        """The tier the run uses, whether it came from the id, ``--effort``, or the env default."""
+        return _effective_effort(config.model) if config.model else None
+
     def _resolve_binary(self) -> str:
         """Resolve the absolute path to the ``agy`` binary."""
         if self.config.target:
@@ -192,6 +306,30 @@ class AgyCliAgent(base.AgentHarness):
     ) -> agents_result.AgentResult:
         caps = self.config.capabilities
         binary = self._resolve_binary()
+
+        # Resolved once so the --model flag and settings.json cannot disagree,
+        # and before any workspace is built so a bad AGENT_MODEL_EFFORT fails
+        # here rather than after the run has started costing something.
+        model_name: str | None = None
+        effort: str | None = None
+        if self.config.model:
+            selection = _resolve_model_name(self.config.model)
+            model_name, effort = selection.model, selection.effort
+            if model_name != self.config.model:
+                _log.warning(
+                    "agy does not accept the configured model id %r; running --model %s%s",
+                    self.config.model,
+                    model_name,
+                    f" --effort {effort}" if effort else "",
+                )
+            elif effort:
+                # The tier changes the score, so it is surfaced even when the
+                # id itself needed no rewrite.
+                _log.info(
+                    "agy model %s names no reasoning tier; running --effort %s",
+                    model_name,
+                    effort,
+                )
 
         env_overlay = _build_env(self.config)
 
@@ -227,8 +365,12 @@ class AgyCliAgent(base.AgentHarness):
             ]
             if project:
                 argv.append(f"--project={project}")
-            if self.config.model:
-                argv.append(f"--model={_resolve_model_name(self.config.model)}")
+            if model_name:
+                argv.append(f"--model={model_name}")
+                # Omitted when the id already names its tier: agy rejects the
+                # two spellings together.
+                if effort:
+                    argv.append(f"--effort={effort}")
             if self.config.extra_flags:
                 argv.extend(self.config.extra_flags)
             argv.append(f"--prompt={prompt}")
@@ -248,7 +390,7 @@ class AgyCliAgent(base.AgentHarness):
 
             settings = _build_settings(
                 caps.mcp_servers,
-                self.config.model,
+                model_name,
                 project,
                 location,
                 skills_enabled=bool(skill_names),

@@ -21,7 +21,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -44,8 +44,13 @@ from devops_bench.agents.cli.openclaw.agent import (
     _build_openclaw_config,
     _oc_model_id,
 )
-from devops_bench.agents.cli.openclaw.parsing import _pick_session_key, _strip_ansi
-from devops_bench.core.errors import ConfigError, SubprocessError
+from devops_bench.agents.cli.openclaw.parsing import (
+    _pick_session_key,
+    _read_export_bundle,
+    _strip_ansi,
+)
+from devops_bench.agents.sandbox import SandboxSpec
+from devops_bench.core.errors import ConfigError, SandboxError, SubprocessError
 
 
 def _events(*entries: dict) -> str:
@@ -393,6 +398,172 @@ def test_execute_falls_back_to_stdout_when_bundle_has_no_answer(
     assert result.output == "bare stdout answer"
 
 
+def test_execute_keeps_the_export_bundle_in_a_harness_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The raw events.jsonl lands in the run workspace and outlives the run."""
+    _install_oc_run(
+        monkeypatch,
+        lambda *a, **k: _make_subprocess_result("OK\n", "", 0),
+        _bundle_writer(SAMPLE_EVENTS),
+    )
+    workspace = tmp_path / "run-ws"
+    workspace.mkdir()
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent._execute("audit pods", workspace_path=workspace)
+
+    assert result.output == "All pods healthy."
+    bundles = list(workspace.glob("oc-export-*/.openclaw/trajectory-exports/*/events.jsonl"))
+    assert len(bundles) == 1
+    assert json.loads(bundles[0].read_text().splitlines()[0])["type"] == "tool.call"
+
+
+def test_execute_ignores_a_bundle_the_agent_planted_in_its_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A forged events.jsonl written during the turn must not be scored."""
+    workspace = tmp_path / "run-ws"
+    workspace.mkdir()
+    forged = _events({"type": "model.completed", "data": {"assistantTexts": ["FORGED"]}})
+
+    def planting_turn(*_a: Any, **_k: Any) -> Any:
+        planted = workspace / ".openclaw" / "trajectory-exports" / "a"
+        planted.mkdir(parents=True)
+        (planted / "events.jsonl").write_text(forged, encoding="utf-8")
+        return _make_subprocess_result("OK\n", "", 0)
+
+    _install_oc_run(monkeypatch, planting_turn, _bundle_writer(SAMPLE_EVENTS))
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent._execute("audit pods", workspace_path=workspace)
+
+    assert result.output == "All pods healthy."
+    assert [step["name"] for step in result.trajectory] == [
+        "kubectl_get_pods",
+        "kubectl_describe",
+    ]
+    assert (workspace / ".openclaw" / "trajectory-exports" / "a" / "events.jsonl").exists()
+
+
+def test_read_export_bundle_refuses_more_than_one_events_file(tmp_path: Path) -> None:
+    root = tmp_path / ".openclaw" / "trajectory-exports"
+    for name in ("a", "openclaw-trajectory-x"):
+        (root / name).mkdir(parents=True)
+        (root / name / "events.jsonl").write_text(SAMPLE_EVENTS, encoding="utf-8")
+
+    text, errors = _read_export_bundle(tmp_path)
+
+    assert text == ""
+    assert errors == [f"expected one events.jsonl under {root}, found 2"]
+
+
+def test_oc_version_probes_parse_real_output_and_send_the_right_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both probes parse the one-line ``OpenClaw <ver> (<sha>)`` output, the host probe
+    carries the nvm PATH overlay, and the image probe runs locked down."""
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+        calls.append((argv, kwargs))
+        if argv[0] == "docker":
+            return _make_subprocess_result("OpenClaw 2026.9.6 (eb377ac)\n", "", 0)
+        return _make_subprocess_result("OpenClaw 2026.9.1-beta.1 (1d96e5a)\n", "", 0)
+
+    monkeypatch.setattr(oc_mod, "run", fake_run)
+    monkeypatch.setattr(oc_mod, "_ensure_node_on_path", lambda env: {"PATH": "/nvm/bin"})
+    assert oc_mod._host_oc_version("/usr/local/bin/oc") == "2026.9.1-beta.1"
+    assert oc_mod._image_oc_version("img") == "2026.9.6"
+    host_argv, host_kw = calls[0]
+    assert host_argv == ["/usr/local/bin/oc", "--version"]
+    assert host_kw["extra_env"] == {"PATH": "/nvm/bin"}
+    image_argv, _ = calls[1]
+    assert image_argv[:2] == ["docker", "run"]
+    assert {"--network=none", "--cap-drop=ALL"} <= set(image_argv)
+    assert image_argv[-4:] == ["--entrypoint", "oc", "img", "--version"]
+
+
+def _raise_oserror(argv: list[str], **kwargs: Any) -> SimpleNamespace:
+    raise OSError("docker not installed")
+
+
+def test_oc_version_probe_is_inconclusive_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wrapper without ``--version``, or a docker failure, yields None rather than raising."""
+    monkeypatch.setattr(
+        oc_mod, "run", lambda argv, **kw: _make_subprocess_result("no version here", "", 1)
+    )
+    assert oc_mod._host_oc_version("oc-a") is None
+    monkeypatch.setattr(oc_mod, "run", _raise_oserror)
+    assert oc_mod._image_oc_version("img-a") is None
+
+
+def test_oc_version_skew_names_both_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: "2026.8.2")
+    monkeypatch.setattr(oc_mod, "_image_oc_version", lambda i: "2026.9.1-beta.1")
+    skew = oc_mod._oc_version_skew("oc", "img")
+    assert skew is not None
+    assert "2026.8.2" in skew
+    assert "2026.9.1-beta.1" in skew
+
+
+def test_oc_version_skew_silent_on_match_and_warns_on_an_inconclusive_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(oc_mod._log, "warning", lambda msg, *args: warnings.append(msg % args))
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: "2026.9.1-beta.1")
+    monkeypatch.setattr(oc_mod, "_image_oc_version", lambda i: "2026.9.1-beta.1")
+    assert oc_mod._oc_version_skew("oc", "img") is None
+    assert warnings == []
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: None)
+    assert oc_mod._oc_version_skew("oc", "img") is None
+    assert warnings == ["oc version skew check skipped: the host probe was inconclusive"]
+
+
+def test_oc_version_probe_anchors_on_the_product_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A version-shaped token printed before oc's own line must not be taken for it."""
+    monkeypatch.setattr(
+        oc_mod,
+        "run",
+        lambda argv, **kw: _make_subprocess_result(
+            "Node v24.21.0 is available\nOpenClaw 2026.9.6 (eb377ac)\n", "", 0
+        ),
+    )
+    assert oc_mod._host_oc_version("oc") == "2026.9.6"
+    monkeypatch.setattr(
+        oc_mod, "run", lambda argv, **kw: _make_subprocess_result("wrapper 1.2.3\n", "", 0)
+    )
+    assert oc_mod._host_oc_version("oc") is None
+
+
+def test_sandbox_preflight_refuses_a_skewed_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A skewed host/image pair raises ``SandboxError`` at batch start, so the harness refuses
+    the batch unscored instead of provisioning a cluster per task to produce an empty trajectory."""
+    seen: list[tuple[str, str]] = []
+
+    def fake_skew(oc_bin: str, image: str) -> str:
+        seen.append((oc_bin, image))
+        return "oc version skew: boom"
+
+    monkeypatch.setattr(oc_mod, "_oc_version_skew", fake_skew)
+    config = AgentConfig(target="~/tools/oc", sandbox=SandboxSpec(image="img"))
+    with pytest.raises(SandboxError, match="version skew"):
+        OpenClawAgent.sandbox_preflight(config)
+    assert seen == [(os.path.expanduser("~/tools/oc"), "img")]
+
+
+def test_sandbox_preflight_skips_the_probe_when_unsandboxed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def never_probe(oc_bin: str, image: str) -> str | None:
+        raise AssertionError("no sandbox image, so nothing to compare against")
+
+    monkeypatch.setattr(oc_mod, "_oc_version_skew", never_probe)
+    OpenClawAgent.sandbox_preflight(AgentConfig(target="oc"))
+    OpenClawAgent.sandbox_preflight(AgentConfig(target="oc", sandbox=SandboxSpec(image="")))
+
+
 def test_execute_records_when_sessions_returns_no_rows(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -425,15 +596,30 @@ def test_execute_records_export_subprocess_failure(
     assert any("export-trajectory failed" in e for e in result.errors)
 
 
-def test_execute_records_bash_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fake_bash(cmd, **kwargs):
-        # core.subprocess.run wraps TimeoutExpired in SubprocessError.
-        raise SubprocessError(["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="")
+def _timed_out_bash(cmd: str, **kwargs: Any) -> SimpleNamespace:
+    # core.subprocess.run wraps TimeoutExpired in SubprocessError.
+    raise SubprocessError(["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="")
 
-    _install_oc_run(monkeypatch, fake_bash)
+
+def test_execute_recovers_the_trajectory_on_a_bash_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The killed process leaves its session store behind; the host-side export still reads it."""
+    _install_oc_run(monkeypatch, _timed_out_bash, _bundle_writer(SAMPLE_EVENTS))
     result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=5.0)).run("p")
-    assert result.has_errors()
-    assert "timed out" in result.errors[0]
+    assert result.errors == ["oc agent timed out after 5.0s"]
+    assert result.metadata["returncode"] == -1
+    assert [step["name"] for step in result.trajectory] == ["kubectl_get_pods", "kubectl_describe"]
+    assert result.output == "All pods healthy."
+
+
+def test_execute_records_a_bash_timeout_with_nothing_to_export(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _install_oc_run(monkeypatch, _timed_out_bash)
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=5.0)).run("p")
+    assert result.errors[0] == "oc agent timed out after 5.0s"
+    assert any("no session key" in e for e in result.errors)
     assert result.trajectory == []
 
 
@@ -663,7 +849,8 @@ def test_model_override_vertex_needs_no_api_key() -> None:
         AgentConfig(model="gemini-3.5-flash", provider="google-vertex", api_key=None)
     )
     assert override["agents"]["defaults"]["models"] == {"google-vertex/gemini-3.5-flash": {}}
-    assert _build_env(AgentConfig(model="gemini-3.5-flash", provider="google-vertex")) == {}
+    env = _build_env(AgentConfig(model="gemini-3.5-flash", provider="google-vertex"))
+    assert "GOOGLE_CLOUD_API_KEY" not in env
 
 
 def test_build_env_threads_api_key_by_provider() -> None:
@@ -679,7 +866,8 @@ def test_build_env_routes_vertex_key_to_cloud_api_key() -> None:
     """A ``google-vertex`` key reaches ``GOOGLE_CLOUD_API_KEY`` (the vertex
     transport's var), not ``GEMINI_API_KEY`` (the google-genai one)."""
     vertex = _build_env(AgentConfig(api_key="marker", provider="google-vertex"))
-    assert vertex == {"GOOGLE_CLOUD_API_KEY": "marker"}
+    assert vertex["GOOGLE_CLOUD_API_KEY"] == "marker"
+    assert "GEMINI_API_KEY" not in vertex
 
 
 def test_build_env_unknown_provider_raises() -> None:
@@ -900,6 +1088,96 @@ def test_execute_cleans_up_temp_working_dir_after_run(
     assert not os.path.exists(captured["cwd"])
 
 
+def _runtime_call(call_id: str, args: dict) -> dict:
+    """A ``source: runtime`` tool.call in the oc 2026.9.x shape."""
+    return {
+        "type": "tool.call",
+        "source": "runtime",
+        "data": {"toolCallId": call_id, "name": "exec", "args": args},
+    }
+
+
+def _runtime_result(call_id: str, text: str, *, success: bool = True) -> dict:
+    """A ``source: runtime`` tool.result in the oc 2026.9.x shape."""
+    return {
+        "type": "tool.result",
+        "source": "runtime",
+        "data": {
+            "toolCallId": call_id,
+            "name": "exec",
+            "success": success,
+            "result": {"content": [{"type": "text", "text": text}]},
+        },
+    }
+
+
+def test_parse_trajectory_export_dedupes_dual_source_events() -> None:
+    """oc 2026.9.x logs each tool event twice; nested runtime-only calls are kept."""
+    nested = "tool_search_code:call_1:exec:1"
+    blob = _events(
+        {**_tool_call("call_1", "exec", {"code": "run()"}), "source": "transcript"},
+        _runtime_call("call_1", {"code": "***"}),
+        _runtime_call(nested, {"command": "kubectl get pods"}),
+        _runtime_result(nested, "pod-a Running"),
+        _runtime_result("call_1", "done"),
+        {**_tool_result("call_1", "stale duplicate"), "source": "transcript"},
+        _runtime_call("call_2", {"code": "fail()"}),
+        _runtime_result("call_2", "boom", success=False),
+    )
+    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
+    assert errors == []
+    assert trajectory == [
+        {"name": "exec", "args": {"code": "run()"}, "result": "done", "status": "completed"},
+        {
+            "name": "exec",
+            "args": {"command": "kubectl get pods"},
+            "result": "pod-a Running",
+            "status": "completed",
+        },
+        {"name": "exec", "args": {"code": "fail()"}, "result": "boom", "status": "error"},
+    ]
+
+
+def test_parse_trajectory_export_prefers_transcript_args_whichever_copy_comes_first() -> None:
+    """The runtime copy is always redacted to ***; transcript args win regardless of order."""
+    blob = _events(
+        _runtime_call("call_1", {"code": "***"}),
+        {**_tool_call("call_1", "exec", {"code": "run()"}), "source": "transcript"},
+        _runtime_result("call_1", "done"),
+        {**_tool_result("call_1", "done"), "source": "transcript"},
+    )
+    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
+    assert errors == []
+    assert trajectory == [
+        {"name": "exec", "args": {"code": "run()"}, "result": "done", "status": "completed"},
+    ]
+
+
+def test_parse_trajectory_export_keeps_a_reused_call_id_from_the_same_source() -> None:
+    """A repeat from the same source is a new call, not a duplicate, so nothing is dropped."""
+    blob = _events(
+        {**_tool_call("call_0", "exec", {"command": "ls"}), "source": "transcript"},
+        _runtime_call("call_0", {"command": "***"}),
+        _runtime_result("call_0", "a.txt"),
+        {**_tool_result("call_0", "a.txt"), "source": "transcript"},
+        {**_tool_call("call_0", "exec", {"command": "pwd"}), "source": "transcript"},
+        _runtime_call("call_0", {"command": "***"}),
+        _runtime_result("call_0", "/workspace"),
+        {**_tool_result("call_0", "/workspace"), "source": "transcript"},
+    )
+    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
+    assert errors == []
+    assert trajectory == [
+        {"name": "exec", "args": {"command": "ls"}, "result": "a.txt", "status": "completed"},
+        {
+            "name": "exec",
+            "args": {"command": "pwd"},
+            "result": "/workspace",
+            "status": "completed",
+        },
+    ]
+
+
 def test_native_openai_key_crosses_explicit_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     assert _build_env(AgentConfig(provider="openai"))["OPENAI_API_KEY"] == "test-key"
@@ -922,7 +1200,76 @@ def test_vertex_auth_profile_seeded_for_headless_run() -> None:
     command = oc_mod._build_local_command(
         AgentConfig(provider="anthropic-vertex"), "hi", "operator", "oc"
     )
-    assert "models auth paste-api-key" in command
+    assert "models auth paste-api-key --provider anthropic-vertex --agent operator" in command
+    assert oc_mod._VERTEX_CREDENTIALS_MARKER in command
+
+
+def test_vertex_auth_profile_seeded_for_keyless_google_vertex() -> None:
+    """oc's auth store gates every keyless Vertex provider, not just the plugin one."""
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex"), "hi", "operator", "oc"
+    )
+    assert "models auth paste-api-key --provider google-vertex --agent operator" in command
+
+
+def test_vertex_auth_profile_skipped_for_a_keyed_run() -> None:
+    """A real key is already in the config; the marker would shadow it."""
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex", api_key="k"), "hi", "operator", "oc"
+    )
+    assert "paste-api-key" not in command
+
+
+@pytest.mark.parametrize(
+    "env_key,api_key,seeded",
+    [
+        ("real-express-key", "", False),
+        (oc_mod._VERTEX_CREDENTIALS_MARKER, "", True),
+        ("", oc_mod._VERTEX_CREDENTIALS_MARKER, True),
+        ("   ", "", True),
+    ],
+)
+def test_vertex_auth_profile_follows_the_effective_key(
+    monkeypatch: pytest.MonkeyPatch, env_key: str, api_key: str, seeded: bool
+) -> None:
+    """A key in the environment counts too; the ADC marker never counts as a key."""
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", env_key)
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex", api_key=api_key), "hi", "operator", "oc"
+    )
+    assert ("paste-api-key --provider google-vertex" in command) is seeded
+
+
+@pytest.mark.parametrize(
+    "host_key,extra_key,seeded",
+    [("", "real-express-key", False), ("real-express-key", "", True)],
+)
+def test_vertex_auth_profile_follows_the_key_extra_env_delivers(
+    monkeypatch: pytest.MonkeyPatch, host_key: str, extra_key: str, seeded: bool
+) -> None:
+    """``extra_env`` outranks the host env in _build_env, so the seed decision follows it too."""
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", host_key)
+    cfg = AgentConfig(provider="google-vertex", extra_env={"GOOGLE_CLOUD_API_KEY": extra_key})
+    assert _build_env(cfg)["GOOGLE_CLOUD_API_KEY"] == extra_key
+    command = oc_mod._build_local_command(cfg, "hi", "operator", "oc")
+    assert ("paste-api-key --provider google-vertex" in command) is seeded
+
+
+def test_a_stray_key_on_a_keyless_vertex_provider_still_seeds_and_starts_the_emulator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """anthropic-vertex declares no key var, so a configured key never reaches oc."""
+    cfg = _sandboxed(tmp_path, provider="anthropic-vertex", api_key="stray-gemini-key")
+    command = oc_mod._build_local_command(cfg, "hi", "operator", "oc")
+    assert "paste-api-key --provider anthropic-vertex" in command
+    calls = _install_fake_emulator(monkeypatch)
+    oc_mod._sandbox_provider_env(cfg, tmp_path)
+    assert calls
+
+
+def test_vertex_auth_profile_skipped_for_a_non_vertex_provider() -> None:
+    command = oc_mod._build_local_command(AgentConfig(provider="google"), "hi", "operator", "oc")
+    assert "paste-api-key" not in command
 
 
 _FAKE_EMULATOR_ENV = {
@@ -1018,6 +1365,73 @@ def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
     overlay = oc_mod._sandbox_provider_env(config, tmp_path)
     assert "GCE_METADATA_HOST" not in overlay
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "env,provider,api_key,expected",
+    [
+        ({}, "google-vertex", "", "global"),
+        ({"GOOGLE_CLOUD_LOCATION": "us-east5"}, "google-vertex", "", "us-east5"),
+        ({"GCP_VERTEX_LOCATION": "europe-west4"}, "google-vertex", "", "europe-west4"),
+        ({}, "google-vertex", "k", "global"),
+        ({}, "google", "k", None),
+    ],
+)
+def test_build_env_pins_a_vertex_location(
+    monkeypatch: pytest.MonkeyPatch,
+    env: dict[str, str],
+    provider: str,
+    api_key: str,
+    expected: str | None,
+) -> None:
+    """oc aborts on Vertex without a location, sandboxed or not; non-Vertex gets none."""
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    overlay = _build_env(AgentConfig(provider=provider, api_key=api_key))
+    assert overlay.get("GOOGLE_CLOUD_LOCATION") == expected
+
+
+@pytest.mark.parametrize(
+    "env_key,emulator",
+    [("real-express-key", False), (oc_mod._VERTEX_CREDENTIALS_MARKER, True)],
+)
+def test_sandbox_overlay_reads_the_key_from_the_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, env_key: str, emulator: bool
+) -> None:
+    """An env key crosses by value and needs no emulator; the env marker is not a key."""
+    monkeypatch.setenv("GOOGLE_CLOUD_API_KEY", env_key)
+    calls = _install_fake_emulator(monkeypatch)
+    overlay = oc_mod._sandbox_provider_env(_sandboxed(tmp_path, provider="google-vertex"), tmp_path)
+    assert ("GCE_METADATA_HOST" in overlay) is emulator
+    assert bool(calls) is emulator
+
+
+def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unsandboxed runs use the host's own ADC; no emulator is started."""
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+
+    def no_emulator(*args: Any, **kwargs: Any) -> NoReturn:
+        pytest.fail("sandbox_credential_env called on an unsandboxed run")
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", no_emulator)
+    monkeypatch.delenv("GOOGLE_CLOUD_API_KEY", raising=False)
+    captured: dict[str, Any] = {}
+
+    def fake_bash(cmd: str, **kwargs: Any) -> SimpleNamespace:
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("extra_env") or {}
+        return _make_subprocess_result(stdout="ok", returncode=0)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+    cfg = AgentConfig(target=str(tmp_path / "oc"), provider="google-vertex")
+    OpenClawAgent(cfg).run("p")
+    # The auth profile and the location are not sandbox concerns: both reach the host run.
+    assert "paste-api-key --provider google-vertex" in captured["cmd"]
+    assert captured["env"]["GOOGLE_CLOUD_LOCATION"]
 
 
 @pytest.mark.parametrize(

@@ -38,7 +38,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict
 
 from devops_bench.core.config import get_env
-from devops_bench.core.errors import ConfigError, SubprocessError
+from devops_bench.core.errors import ConfigError, ImpersonationError, SubprocessError
 from devops_bench.core.logging import get_logger
 from devops_bench.core.subprocess import run
 
@@ -47,6 +47,7 @@ __all__ = [
     "resolve_provider",
     "known_providers",
     "sandbox_credential_env",
+    "mint_impersonated_token",
     "VERTEX_SANDBOX_SA_ENV",
 ]
 
@@ -385,34 +386,47 @@ class _VertexMetadataEmulator:
             return self._token, int(remaining)
 
     def _mint(self) -> str:
-        """Mint a token by impersonating the scoped SA via ``gcloud`` (no SDK import)."""
+        """Mint the scoped SA's token; a failure is a :class:`ConfigError` (the recipe's error)."""
         try:
-            completed = run(
-                [
-                    "gcloud",
-                    "auth",
-                    "print-access-token",
-                    f"--impersonate-service-account={self.service_account}",
-                    f"--scopes={_TOKEN_SCOPE}",
-                    f"--lifetime={_TOKEN_LIFETIME_SEC}s",
-                ],
-                check=False,
-                timeout=_MINT_TIMEOUT_SEC,
-            )
-        except SubprocessError as exc:
-            raise ConfigError(
-                f"could not mint a Vertex access token by impersonating "
-                f"{self.service_account}: {exc} (the mint is bounded at {_MINT_TIMEOUT_SEC}s)"
-            ) from exc
-        token = (completed.stdout or "").strip()
-        if completed.returncode != 0 or not token:
-            raise ConfigError(
-                f"could not mint a Vertex access token by impersonating "
-                f"{self.service_account}: gcloud exited {completed.returncode}: "
-                f"{(completed.stderr or '').strip() or '<no stderr>'}. The host identity "
-                "needs roles/iam.serviceAccountTokenCreator on that service account"
-            )
-        return token
+            return mint_impersonated_token(self.service_account, lifetime_sec=_TOKEN_LIFETIME_SEC)
+        except ImpersonationError as exc:
+            raise ConfigError(str(exc)) from exc
+
+
+def mint_impersonated_token(
+    service_account: str, *, lifetime_sec: int = _TOKEN_LIFETIME_SEC
+) -> str:
+    """Mint a cloud-platform token by impersonating ``service_account`` via ``gcloud``, bounded.
+
+    Raises :class:`ImpersonationError`; ``refused`` tells a gcloud/IAM refusal from a hang.
+    """
+    try:
+        completed = run(
+            [
+                "gcloud",
+                "auth",
+                "print-access-token",
+                f"--impersonate-service-account={service_account}",
+                f"--scopes={_TOKEN_SCOPE}",
+                f"--lifetime={lifetime_sec}s",
+            ],
+            check=False,
+            timeout=_MINT_TIMEOUT_SEC,
+        )
+    except (OSError, SubprocessError) as exc:
+        raise ImpersonationError(
+            service_account, f"{exc} (the mint is bounded at {_MINT_TIMEOUT_SEC}s)", refused=False
+        ) from exc
+    token = (completed.stdout or "").strip()
+    if completed.returncode != 0 or not token:
+        raise ImpersonationError(
+            service_account,
+            f"gcloud exited {completed.returncode}: "
+            f"{(completed.stderr or '').strip() or '<no stderr>'}. The host identity needs "
+            "roles/iam.serviceAccountTokenCreator on that service account",
+            refused=True,
+        )
+    return token
 
 
 def _handler_factory(emulator: _VertexMetadataEmulator) -> type[BaseHTTPRequestHandler]:

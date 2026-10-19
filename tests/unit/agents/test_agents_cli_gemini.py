@@ -455,15 +455,36 @@ def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.metadata.get("returncode") == 2
 
 
-def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_reports_a_timeout_as_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under ``check=False`` the only ``SubprocessError`` is a timeout; name it as one."""
+
     def fake_run(argv, **kwargs):
-        raise SubprocessError(argv, returncode=-1, stdout="", stderr="timeout")
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="killed")
 
     monkeypatch.setattr(gemini_mod, "run", fake_run)
-    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
-    assert result.has_errors()
-    assert "subprocess error" in result.errors[0]
+    result = GeminiCliAgent(AgentConfig(target="gemini", timeout_sec=900)).run("p")
+    assert result.errors == ["gemini timed out after 900s: killed"]
+    assert result.output == "Error: gemini timed out after 900s: killed"
+    assert result.metadata["returncode"] == -1
     assert result.trajectory == []
+
+
+def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stream captured before the kill is the run's work; keep it beside the timeout error."""
+    partial = _stream(
+        {"type": "init", "session_id": "abc", "model": "gemini-x"},
+        {"type": "tool_use", "id": "call-1", "name": "mcp_gke_list_clusters", "input": {}},
+        {"type": "tool_result", "tool_use_id": "call-1", "content": "cluster-a"},
+    )
+
+    def fake_run(argv, **kwargs):
+        raise SubprocessError(argv, returncode=-1, stdout=partial, stderr="")
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini", timeout_sec=30)).run("p")
+    assert result.errors == ["gemini timed out after 30s"]
+    assert [step["name"] for step in result.trajectory] == ["mcp_gke_list_clusters"]
+    assert result.metadata["returncode"] == -1
 
 
 def test_execute_handles_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
