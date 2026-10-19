@@ -40,6 +40,7 @@ from devops_bench.metrics.pipeline import (
     evaluate_metrics_batch,
     extract_checklist_items,
 )
+from devops_bench.metrics.scoring import SCORING_VERSION
 
 # --- pipeline dispatch loop (stub evaluators, no concrete families) -----------
 
@@ -225,7 +226,7 @@ def test_an_unscoreable_run_gets_a_withheld_composite(
     assert "VerificationCorrectness" in scores
     entry = scores[pipeline.OUTCOME_SCORE_KEY]
     assert entry["score"] is None
-    assert entry["version"] == pipeline.SCORING_VERSION
+    assert entry["version"] == SCORING_VERSION
     assert entry["reason"].startswith("withheld: the agent never completed its turn")
 
 
