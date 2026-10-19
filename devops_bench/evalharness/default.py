@@ -247,6 +247,8 @@ class DefaultEvalHarness(Harness):
                     "JUDGE_MODEL and AGENT_MODEL unset; the judge uses the %s adapter's default model",
                     configured["provider"],
                 )
+        # Recorded on the manifest once scoring builds a judge; None when none ran.
+        self._judge_model_name: str | None = None
         self.results_root = results_root
         resolved_agent_type = (
             agent_type
@@ -935,6 +937,7 @@ class DefaultEvalHarness(Harness):
             sandbox_image=sandbox.image if sandbox is not None else None,
             sandbox_image_digest=sandbox.image_digest if sandbox is not None else None,
             reasoning_effort=reasoning_effort,
+            judge_model=self._judge_model_name,
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
@@ -1579,6 +1582,7 @@ class DefaultEvalHarness(Harness):
                 into each in place. Records marked ``status: "failed"`` are
                 skipped, since there is no agent output to judge.
         """
+        self._judge_model_name = None
         scorable = [r for r in detailed_results if r.get("status") != "failed"]
         if not scorable:
             return
@@ -1595,4 +1599,7 @@ class DefaultEvalHarness(Harness):
         judge = describe_judge(judge_model) if judge_model is not None else {}
         for record in scorable:
             record["judge"] = dict(judge)
+        # The manifest names the judge actually built, so the agent-model fallback is recorded too.
+        self._judge_model_name = judge.get("model")
+        _log.info("scoring with judge model %r", self._judge_model_name)
         evaluate_metrics_batch(scorable, judge_model, use_mcp=self.use_mcp)

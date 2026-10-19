@@ -21,7 +21,11 @@ from typing import Any
 
 from deepeval.test_case import LLMTestCase
 
-from devops_bench.core import get_bool, get_logger
+from devops_bench.core import (
+    get_bool,
+    get_logger,
+    is_unscoreable_run,
+)
 
 # Imported for their @METRICS.register side effects.
 from devops_bench.metrics import (
@@ -67,6 +71,7 @@ _BUILTIN_METRIC_KEYS: tuple[str, ...] = (
     "safety",
     "grounding",
     "chaos",
+    "chaos_perf",
     "verification",
     "integrity",
 )
@@ -87,6 +92,17 @@ def _canonical_tool_name(name: str) -> str:
     if not isinstance(name, str):
         return name
     return name.split("__", 1)[1] if "__" in name else name
+
+
+def _unscoreable_reason(res: dict[str, Any]) -> str | None:
+    """Why ``res`` cannot be attributed to the agent, or ``None`` for a completed run."""
+    if not is_unscoreable_run(res):
+        return None
+    return (
+        "the agent never completed its turn "
+        f"(status={res.get('status')!r}, errors={len(res.get('errors') or [])}, "
+        f"trajectory steps={len(res.get('trajectory') or [])})"
+    )
 
 
 def _build_context(res: dict[str, Any], judge_model: Any, use_mcp: bool) -> MetricContext:
@@ -215,10 +231,12 @@ def evaluate_metrics_batch(
     for res in detailed_results:
         ctx = _build_context(res, judge_model, use_mcp)
         scores: dict[str, Any] = {}
+        unscoreable = _unscoreable_reason(res)
         _log.debug("Evaluating metrics for: %s...", res.get("name"))
         for ev in evaluators:
             try:
-                if not ev.applies(ctx):
+                # A dead run gives a judge nothing to read; only the deterministic families run.
+                if (unscoreable and getattr(ev, "needs_judge", False)) or not ev.applies(ctx):
                     continue
                 for ms in ev.evaluate(ctx):
                     scores[ms.name] = ms.to_entry()
@@ -234,7 +252,9 @@ def evaluate_metrics_batch(
         # formula, and must cost this record its composite rather than abort the
         # remaining records in the batch.
         try:
-            _finalize_outcome_score(scores)
+            _finalize_outcome_score(scores, unscoreable=unscoreable)
         except Exception:  # noqa: BLE001 - one record must not abort the batch
             _log.exception("composite outcome score failed for %s", res.get("name"))
+        if unscoreable:
+            _log.warning("unscoreable run %s: %s", res.get("name"), unscoreable)
         res["scores"] = scores
