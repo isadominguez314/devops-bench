@@ -41,23 +41,30 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
-def _join_text(content: object) -> str:
-    """Join the ``text`` parts of an OpenClaw message ``content`` value.
-
-    ``content`` is either a plain string or a list of typed parts
-    (``{"type": "text", "text": ...}`` / ``{"type": "toolCall", ...}``); only
-    text parts contribute, so tool-call blocks embedded in an assistant message
-    are ignored here (they ride on the dedicated ``tool.call`` events instead).
-    """
+def _text_parts(content: object) -> list[str]:
+    """The ``text`` parts of an OpenClaw message ``content`` (a string or a list of typed parts)."""
     if isinstance(content, str):
-        return content
+        return [content]
     if isinstance(content, list):
-        return "".join(
+        return [
             part["text"]
             for part in content
             if isinstance(part, dict) and isinstance(part.get("text"), str)
-        )
-    return ""
+        ]
+    return []
+
+
+def _join_text(content: object) -> str:
+    """Join the text parts of ``content``; tool-call blocks ride on ``tool.call`` events instead."""
+    return "".join(_text_parts(content))
+
+
+def _keep_real(texts: list[str], redacted: list[str]) -> list[str]:
+    """Return ``texts`` minus oc's sanitizer placeholders, which are appended to ``redacted``."""
+    kept: list[str] = []
+    for text in texts:
+        (redacted if is_placeholder_output(text) else kept).append(text)
+    return kept
 
 
 def _accumulate_usage(acc: dict, usage: dict) -> None:
@@ -112,13 +119,11 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     code-mode nested calls (``args`` and ``result.content`` rather than
     ``arguments`` and ``message.content``).
 
-    Redaction placeholders oc's sanitizer stores over a message it refused to
-    keep (``[Malformed diagnostic JSON redacted]``, see
-    :func:`devops_bench.core.is_placeholder_output`) are dropped from both
-    output sources: a placeholder is not an answer, and left in place it would
-    mask the real text this cascade could otherwise recover. When every source
-    is a placeholder, ``output`` comes back ``""`` and the scoring layer's
-    missing-answer rule takes over instead of a judge grading the stand-in.
+    oc's sanitizer placeholders (``[Malformed diagnostic JSON redacted]``, see
+    :func:`devops_bench.core.is_placeholder_output`) are not answers: a redacted
+    turn yields its own ``assistant.message`` text instead, and only when nothing
+    real was recovered does the placeholder come back as ``output`` so the
+    scoring layer withholds the judge.
 
     Args:
         jsonl_text: Raw contents of ``events.jsonl`` inside the export bundle.
@@ -132,7 +137,9 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     tokens: dict = {}
     errors: list[str] = []
     output = ""
-    fallback_output: list[str] = []
+    turn_texts: list[str] = []  # real assistant.message texts of the turn in progress
+    fallback_output: list[str] = []  # the same, session-wide
+    redacted: list[str] = []  # sanitizer placeholders dropped from either source
     pending: dict[str, ToolCall] = {}
     # Per id: the source of the kept call / result, so only the other source's copy is a dup.
     kept_calls: dict[str, tuple[str | None, ToolCall]] = {}
@@ -212,39 +219,28 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
                 _accumulate_usage(tokens, usage)
             texts = data.get("assistantTexts")
             if isinstance(texts, list):
-                # oc's sanitizer sometimes stores a redaction placeholder over
-                # the message it refused to keep. The placeholder is not the
-                # agent's answer, so it must neither become ``output`` nor —
-                # by making ``joined`` truthy — overwrite a real earlier turn
-                # or block the ``assistant.message`` fallback below.
-                strings = [t for t in texts if isinstance(t, str)]
-                kept = [t for t in strings if not is_placeholder_output(t)]
-                if len(kept) < len(strings):
-                    _log.warning(
-                        "events line %d: dropped %d redaction placeholder(s) "
-                        "from model.completed assistantTexts",
-                        lineno,
-                        len(strings) - len(kept),
-                    )
-                joined = "\n".join(kept)
-                if joined:
-                    output = joined
+                seen = len(redacted)
+                kept = _keep_real([t for t in texts if isinstance(t, str)], redacted)
+                if kept:
+                    output = "\n".join(kept)
+                elif len(redacted) > seen and turn_texts:
+                    # The redacted turn's real text still rides on its assistant.message.
+                    output = "\n".join(turn_texts)
+            turn_texts = []
         elif etype == "assistant.message":
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}
-            txt = _join_text(msg.get("content"))
-            if is_placeholder_output(txt):
-                # Same sanitizer, same rule: the fallback exists to recover the
-                # real text, and a placeholder appended here would ride along
-                # with (or stand in for) whatever it recovers.
-                _log.warning(
-                    "events line %d: dropped a redaction placeholder from an assistant.message",
-                    lineno,
-                )
-            elif txt:
+            txt = "".join(_keep_real(_text_parts(msg.get("content")), redacted))
+            if txt:
+                turn_texts.append(txt)
                 fallback_output.append(txt)
 
     if not output and fallback_output:
         output = "\n".join(fallback_output)
+    if redacted:
+        _log.warning("dropped %d redaction placeholder(s) from the export bundle", len(redacted))
+        if not output:
+            # Nothing real to recover: the placeholder stands so the scoring layer withholds it.
+            output = redacted[-1]
 
     return [call.to_dict() for call in trajectory], tokens, output, errors
 
