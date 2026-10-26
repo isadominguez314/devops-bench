@@ -121,9 +121,9 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
 
     oc's sanitizer placeholders (``[Malformed diagnostic JSON redacted]``, see
     :func:`devops_bench.core.is_placeholder_output`) are not answers: a redacted
-    turn yields its own ``assistant.message`` text instead, and only when nothing
-    real was recovered does the placeholder come back as ``output`` so the
-    scoring layer withholds the judge.
+    turn yields its own ``assistant.message`` text instead, and when it has none
+    the placeholder comes back as ``output`` so the scoring layer withholds the
+    judge rather than grading an earlier turn's narration.
 
     Args:
         jsonl_text: Raw contents of ``events.jsonl`` inside the export bundle.
@@ -223,9 +223,9 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
                 kept = _keep_real([t for t in texts if isinstance(t, str)], redacted)
                 if kept:
                     output = "\n".join(kept)
-                elif len(redacted) > seen and turn_texts:
-                    # The redacted turn's real text still rides on its assistant.message.
-                    output = "\n".join(turn_texts)
+                elif len(redacted) > seen:
+                    # A redacted turn's real text rides on its assistant.message; else it is missing.
+                    output = "\n".join(turn_texts) or redacted[-1]
             turn_texts = []
         elif etype == "assistant.message":
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}

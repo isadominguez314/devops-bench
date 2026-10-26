@@ -226,8 +226,8 @@ def test_parse_trajectory_export_redacted_turn_recovers_its_own_message_not_an_e
     assert output == "Deployed hello-app; 3/3 pods Ready."
 
 
-def test_parse_trajectory_export_placeholder_does_not_clobber_an_earlier_turn() -> None:
-    """A redacted last turn with nothing to recover leaves the previous turn's text standing."""
+def test_parse_trajectory_export_redacted_final_turn_does_not_promote_an_earlier_turn() -> None:
+    """A redacted last turn with nothing of its own is missing, not the previous turn's narration."""
     blob = _events(
         {"type": "model.completed", "data": {"assistantTexts": ["Applying the manifest now."]}},
         {
@@ -236,7 +236,19 @@ def test_parse_trajectory_export_placeholder_does_not_clobber_an_earlier_turn() 
         },
     )
     _trajectory, _tokens, output, _errors = parse_trajectory_export(blob)
-    assert output == "Applying the manifest now."
+    assert output == "[Oversized diagnostic JSON redacted]"
+
+
+def test_parse_trajectory_export_real_turn_after_a_redacted_one_wins() -> None:
+    blob = _events(
+        {
+            "type": "model.completed",
+            "data": {"assistantTexts": ["[Oversized diagnostic JSON redacted]"]},
+        },
+        {"type": "model.completed", "data": {"assistantTexts": ["Rollout complete."]}},
+    )
+    _trajectory, _tokens, output, _errors = parse_trajectory_export(blob)
+    assert output == "Rollout complete."
 
 
 def test_parse_trajectory_export_all_placeholders_returns_the_placeholder() -> None:
