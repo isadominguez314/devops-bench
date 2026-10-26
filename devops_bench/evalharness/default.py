@@ -42,8 +42,10 @@ from devops_bench.cheat_detection import (
     annotate_records,
     baseline_from_granted_paths,
     build_inventory_rules,
+    drop_fingerprints_matching_inputs,
     filter_rules_for_prompt,
     load_ruleset,
+    narrow_home_listing_rules,
 )
 from devops_bench.core import (
     ClusterInfo,
@@ -832,7 +834,8 @@ class DefaultEvalHarness(Harness):
             pre_existing = frozenset(rule.source for rule in self._inventory_home() if rule.source)
 
         # One inventory per task iteration, paired positionally with ``detailed_results``.
-        # Ambient rules are scanned before each run; a sandboxed task's come back from _run_one.
+        # _run_one returns the task's rules (ambient, or the sandbox home's) minus its own
+        # delivered inputs, decided before the agent ran.
         created_by: dict[str, str] = {}
         prev_task_name: str | None = None
         task_inventories: list[tuple[SensitiveAccessRule, ...]] = []
@@ -844,22 +847,30 @@ class DefaultEvalHarness(Harness):
                 ambient_rules = self._ambient_inventory_rules(
                     task.name, pre_existing, created_by, prev_task_name
                 )
-            record, sandbox_rules = self._run_one(task, run_dir)
-            task_inventories.append(sandbox_rules if task_sandboxed else ambient_rules)
+            record, inventory_rules = self._run_one(
+                task,
+                run_dir,
+                ambient_rules=ambient_rules,
+                produced_in_batch=frozenset(created_by),
+            )
+            task_inventories.append(inventory_rules)
             detailed_results.append(record)
             prev_task_name = task.name
 
         # Annotated before the first write so both results.json copies carry the
         # report and ``_score`` can read it. A detector failure leaves that record ungated.
         if self.cheat_detect:
-            # A home entry the prompt itself names is authorized for that record;
-            # content fingerprints always apply.
+            # Prompt-driven authorizations: named entries and home listings.
             for record, inventory_rules in zip(detailed_results, task_inventories, strict=True):
                 try:
+                    prompt_text = record.get("input") or ""
                     annotate_records(
                         [record],
-                        self._cheat_rules
-                        + filter_rules_for_prompt(inventory_rules, record.get("input") or ""),
+                        narrow_home_listing_rules(
+                            self._cheat_rules
+                            + filter_rules_for_prompt(inventory_rules, prompt_text),
+                            prompt_text,
+                        ),
                     )
                 except Exception:  # noqa: BLE001 - detection must never sink a completed run
                     _log.exception(
@@ -998,14 +1009,28 @@ class DefaultEvalHarness(Harness):
         return rules
 
     def _run_one(
-        self, task: Task, run_dir: Path
+        self,
+        task: Task,
+        run_dir: Path,
+        *,
+        ambient_rules: tuple[SensitiveAccessRule, ...] = (),
+        produced_in_batch: frozenset[str] = frozenset(),
     ) -> tuple[dict[str, Any], tuple[SensitiveAccessRule, ...]]:
         """Provision, run the agent, collect artifacts, tear down for one task.
 
+        Args:
+            task: The task to run.
+            run_dir: The batch's output directory.
+            ambient_rules: The caller's pre-task inventory of the operator home.
+            produced_in_batch: Home entries earlier tasks of this batch left behind.
+
         Returns:
-            ``(record, sandbox_inventory_rules)``. A failure yields a
-            ``status: "failed"`` record with the same key set as a success. The
-            rules are empty on an ambient run; the caller inventories the home itself.
+            ``(record, inventory_rules)``. On any failure a ``status: "failed"``
+            record is returned instead of being dropped, with the same top-level
+            key set as a success record. The rules are this task's detection
+            inventory (``ambient_rules``, or the sandbox home's when sandboxed)
+            minus fingerprints of its own delivered inputs, decided before the
+            agent ran so nothing it writes can change what authorized it.
         """
         infra_config = task.infrastructure or {}
         if self.no_infra:
@@ -1020,7 +1045,7 @@ class DefaultEvalHarness(Harness):
         workspace_path: Path | None = None
         creds_dir: Path | None = None
         completed_spec: agent_sandbox.SandboxSpec | None = None
-        sandbox_rules: tuple[SensitiveAccessRule, ...] = ()
+        inventory_rules: tuple[SensitiveAccessRule, ...] = ambient_rules
         sandbox_exempt = False
         agent_started = False
         verification_parse_errors: list[dict[str, str]] = []
@@ -1072,7 +1097,7 @@ class DefaultEvalHarness(Harness):
                     with_cluster=infra_config.get("deployer") != "noop",
                     quota_writes=task.agent_quota_writes,
                 )
-                sandbox_rules = self._inventory_sandbox_home(task.name, workspace_path / "home")
+                inventory_rules = self._inventory_sandbox_home(task.name, workspace_path / "home")
             context = self.make_context(task, cluster=cluster_info, workspace_path=workspace_path)
 
             target_dep, ns = self._resolve_deployment_and_namespace(task)
@@ -1084,6 +1109,14 @@ class DefaultEvalHarness(Harness):
                 task.name,
                 home=(workspace_path / "home") if completed_spec is not None else None,
                 mounts=completed_spec.fixture_mounts if completed_spec is not None else None,
+            )
+            # Snapshot now: the agent must not be able to edit what authorizes it.
+            inventory_rules = drop_fingerprints_matching_inputs(
+                inventory_rules,
+                prompt,
+                home=(workspace_path / "home") if completed_spec is not None else None,
+                cluster_name=active_cluster_name,
+                produced_in_batch=produced_in_batch,
             )
             # Resolved before the agent runs so a mid-run failure still records them.
             recoverable_safety = [
@@ -1270,7 +1303,7 @@ class DefaultEvalHarness(Harness):
             if creds_dir is not None:
                 shutil.rmtree(creds_dir, ignore_errors=True)
 
-        return result, sandbox_rules
+        return result, inventory_rules
 
     def _prepare_sandbox_spec(
         self,
