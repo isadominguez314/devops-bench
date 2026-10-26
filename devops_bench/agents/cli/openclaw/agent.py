@@ -586,7 +586,7 @@ class OpenClawAgent(AgentHarness):
         # Bundle text is clean; bash stdout carries debug noise — fall back only if empty.
         # With neither, the agent's own failure is the answer, as in the sibling CLI agents.
         output = bundle_output or stdout_text
-        if not output and failure:
+        if not output.strip() and failure:
             output = f"Error: {failure}"
 
         return AgentResult(
