@@ -35,13 +35,9 @@ __all__ = [
     "tripped_gates",
 ]
 
-# Redaction placeholders openclaw's sanitizer writes over a final message it
-# refused to store ("[Malformed diagnostic JSON redacted]", "[Oversized
-# diagnostic JSON redacted]"). Anchored to the whole string: a real answer that
-# merely *mentions* a redaction never matches, and the bracketed sentence shape
-# keeps a sibling placeholder from a future oc version covered without
-# swallowing arbitrary bracketed text.
-_PLACEHOLDER_OUTPUT = re.compile(r"\[[A-Za-z][A-Za-z ]* redacted\]")
+# Whole-string match for openclaw's sanitizer placeholders, e.g.
+# "[Malformed diagnostic JSON redacted]"; prose that merely mentions one never matches.
+_PLACEHOLDER_OUTPUT = re.compile(r"\[[^\]]* diagnostic JSON redacted\]")
 
 #: Statuses that say outright that the agent did not complete its turn.
 #: Historical records use these; see :func:`is_unscoreable_run` for why the
@@ -92,19 +88,5 @@ def tripped_gates(scores: Mapping[str, Any] | None) -> list[str]:
 
 
 def is_placeholder_output(output: Any) -> bool:
-    """Whether ``output`` is a tool-side redaction placeholder, not an answer.
-
-    openclaw's own sanitizer sometimes replaces the final assistant message in
-    its trajectory store with a bracketed placeholder before the harness ever
-    reads it. The text is truthy, so without this check it flows into the
-    record's ``output`` and gets judged as if the agent had answered with it —
-    which is how a run with a 149-step trajectory and a passing verification
-    report published an ``OutcomeValidity`` of 0.0.
-
-    Args:
-        output: The record's captured final output, of any type.
-
-    Returns:
-        ``True`` when the whole string is one redaction placeholder.
-    """
+    """Whether ``output`` is a tool-side redaction placeholder rather than an answer."""
     return isinstance(output, str) and _PLACEHOLDER_OUTPUT.fullmatch(output.strip()) is not None

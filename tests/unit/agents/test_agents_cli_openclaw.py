@@ -621,6 +621,8 @@ def test_execute_records_a_bash_timeout_with_nothing_to_export(
     assert result.errors[0] == "oc agent timed out after 5.0s"
     assert any("no session key" in e for e in result.errors)
     assert result.trajectory == []
+    # Same shape as the sibling CLI agents: the failure is the answer, so the judge still scores it.
+    assert result.output == "Error: oc agent timed out after 5.0s"
 
 
 def test_execute_passes_timeout_to_bash(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

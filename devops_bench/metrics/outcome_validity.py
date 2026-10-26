@@ -22,7 +22,7 @@ from typing import Any
 from deepeval.metrics import GEval
 from deepeval.test_case import SingleTurnParams
 
-from devops_bench.core import get_logger
+from devops_bench.core import get_logger, is_placeholder_output
 from devops_bench.metrics._skills import load_skill_text
 from devops_bench.metrics.base import (
     GEVAL_PASS_THRESHOLD,
@@ -116,22 +116,15 @@ class OutcomeValidityMetric:
         return True
 
     def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
-        """Score the outcome-validity GEval against the outcome test case.
-
-        Abstains — a ``None`` score with the reason recorded — when the run's
-        final answer was never captured. This metric grades the final text
-        alone, so with the text missing there is nothing real to judge, and a
-        judged 0.0 here would be indistinguishable from the agent actually
-        turning in a bad answer. This key is last in the correctness
-        chain, so a deterministic source still answers first; otherwise the
-        null ends the chain as withheld and the composite is withheld — a null
-        row instead of a confident zero nobody measured.
-        """
+        """Score the outcome-validity GEval, abstaining when no final answer was captured."""
         if ctx.final_output_missing:
-            reason = (
-                "withheld: the run's final answer was not captured "
-                f"(output={ctx.result.get('output')!r}), so there is nothing to judge"
+            output = ctx.result.get("output")
+            cause = (
+                f"a redaction placeholder {output!r}"
+                if is_placeholder_output(output)
+                else f"empty output after {len(ctx.result.get('trajectory') or [])} trajectory steps"
             )
+            reason = f"withheld: the final answer was not captured ({cause}), so there is nothing to judge"
             _log.warning("OutcomeValidity %s for %s", reason, ctx.result.get("name"))
             return [MetricScore(self.name, None, success=None, reason=reason)]
         return run_geval(

@@ -135,11 +135,7 @@ def _build_context(res: dict[str, Any], judge_model: Any, use_mcp: bool) -> Metr
     latency = res.get("latency")
     retrieval_context = res.get("retrieval_context")
 
-    # A redaction placeholder is never an answer, whatever else the run did.
-    # An *empty* output only counts as missing when the trajectory shows the
-    # agent actually worked: there the blank is a capture failure, while a
-    # blank beside an empty trajectory is the agent genuinely producing
-    # nothing — a real zero the judge should still hand out.
+    # Empty output counts as missing only when the trajectory shows the agent did work.
     final_output_missing = is_placeholder_output(actual_output) or (
         not str(actual_output or "").strip() and bool(trajectory)
     )
@@ -178,7 +174,9 @@ def _build_context(res: dict[str, Any], judge_model: Any, use_mcp: bool) -> Metr
     all_context = {
         "tools_used": norm_tools,
         "execution_trace": norm_trajectory,
-        "text_output": actual_output if actual_output else "No response generated",
+        "text_output": "No response generated"
+        if final_output_missing or not actual_output
+        else actual_output,
     }
     all_case = LLMTestCase(
         input=prompt,

@@ -24,6 +24,7 @@ end to end with ``deepeval`` mocked.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -665,8 +666,6 @@ def test_build_context_flags_a_redaction_placeholder_as_missing(mocker: MockerFi
 
 
 def test_build_context_flags_an_empty_output_beside_real_work(mocker: MockerFixture) -> None:
-    # The trajectory shows the agent worked, so the blank is a capture
-    # failure, not the agent turning in nothing.
     mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
     res = _base_result(output="")
     assert pipeline._build_context(res, MagicMock(), True).final_output_missing is True
@@ -675,11 +674,19 @@ def test_build_context_flags_an_empty_output_beside_real_work(mocker: MockerFixt
 def test_build_context_keeps_judging_an_agent_that_produced_nothing(
     mocker: MockerFixture,
 ) -> None:
-    # Empty output AND empty trajectory: the agent genuinely turned in
-    # nothing, and that zero is real — the judge still hands it out.
+    # Empty output and empty trajectory: the agent genuinely turned in nothing.
     mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
     res = _base_result(output="", trajectory=[], tools=[])
     assert pipeline._build_context(res, MagicMock(), True).final_output_missing is False
+
+
+def test_build_context_hides_a_placeholder_from_the_other_judges(mocker: MockerFixture) -> None:
+    # ChecklistScore, safety and grounding read all_case; they must not grade the stand-in.
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    res = _base_result(output="[Malformed diagnostic JSON redacted]")
+    ctx = pipeline._build_context(res, MagicMock(), True)
+    assert json.loads(ctx.all_case.actual_output)["text_output"] == "No response generated"
+    assert "redacted" not in ctx.all_case.actual_output
 
 
 def test_build_context_leaves_a_real_answer_alone(mocker: MockerFixture) -> None:
@@ -690,12 +697,7 @@ def test_build_context_leaves_a_real_answer_alone(mocker: MockerFixture) -> None
 def test_batch_withholds_outcome_validity_for_a_placeholder_output(
     mocker: MockerFixture,
 ) -> None:
-    # The exact run_20260911_172304 shape: status success, no errors, a real
-    # trajectory — but oc's sanitizer replaced the final message before the
-    # harness read it. The judge must never grade the placeholder: the metric
-    # abstains with the reason recorded, and with every correctness source
-    # abstaining the composite is withheld rather than published as a
-    # confident zero nobody measured.
+    # Status success, no errors, a real trajectory, but the final message was redacted.
     _patch_judges(mocker)
     mocker.patch.object(pipeline, "LLMTestCase")
     evaluate = mocker.patch("deepeval.evaluate", side_effect=_evaluate_by_metric_name())
@@ -712,7 +714,7 @@ def test_batch_withholds_outcome_validity_for_a_placeholder_output(
 
     entry = results[0]["scores"]["OutcomeValidity"]
     assert entry["score"] is None
-    assert "withheld" in entry["reason"]
+    assert "withheld" in entry["reason"] and "placeholder" in entry["reason"]
     evaluate.assert_not_called()
     assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
 
